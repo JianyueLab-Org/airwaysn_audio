@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
+excludes=['torch']
 a = Analysis(
     ['gui.py'],
     pathex=[],

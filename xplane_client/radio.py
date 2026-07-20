@@ -1,23 +1,37 @@
+"""
+radio.py — X-Plane 版本的 MumbleRadioClient
+
+用 X-Plane UDP 协议替代 SimConnect 读取 COM1 频率。
+其余功能（Mumble 连接、PTT、音频设备）与 SimConnect 版本一致。
+"""
+
 import os
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 os.environ['SDL_AUDIODRIVER'] = 'dummy'
 
-from SimConnect import *
+import socket
+import struct
+import sys
 import pymumble_py3 as pymumble
 import threading
 import time
 import keyboard
 import pyaudio
-import wave
-import numpy as np  # 确保numpy被导入
-import sys
+import numpy as np
 import functools
-import pygame  # pygame导入必须在设置环境变量之后
+import pygame
 
-# 配置服务器信息
-SERVER_HOST = "hjdczy.top"  # Mumble服务器地址
-USERNAME = ""    # 用户名
-PASSWORD = ""             # 密码（如果需要）
+# ---------- 配置 ----------
+SERVER_HOST = "hjdczy.top"
+USERNAME = ""
+PASSWORD = ""
+
+# ---------- X-Plane UDP 协议常量 ----------
+MCAST_GRP = "239.255.1.1"
+MCAST_PORT = 49707
+DISCOVER_TIMEOUT = 10
+RESPONSE_TIMEOUT = 3
+
 
 def suppress_mumble_errors(func):
     @functools.wraps(func)
@@ -25,19 +39,133 @@ def suppress_mumble_errors(func):
         try:
             return func(*args, **kwargs)
         except Exception:
-            # 抑制异常输出
             sys.stderr = open('nul', 'w')
             raise
     return wrapper
 
+
+class XPlaneRadio:
+    """负责通过 X-Plane UDP 协议读取 COM1 频率。"""
+
+    def __init__(self):
+        self._addr = None
+        self._sock = None
+
+    def discover(self):
+        """通过多播信标发现 X-Plane，返回可用的数据地址列表。"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", MCAST_PORT))
+        mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.settimeout(DISCOVER_TIMEOUT)
+
+        print(f"[XPlane] 正在搜索 X-Plane（超时 {DISCOVER_TIMEOUT}s）...", file=sys.stderr)
+
+        try:
+            data, addr = sock.recvfrom(1500)
+        except socket.timeout:
+            print(
+                "[XPlane] 未发现 X-Plane。\n"
+                "  请确认：\n"
+                "  1. X-Plane 正在运行且已进入飞行\n"
+                "  2. 设置 → Data Output → IPs for UDP network 中已添加本机 IP",
+                file=sys.stderr,
+            )
+            sock.close()
+            return []
+        finally:
+            sock.close()
+
+        if data[:5] != b"BECN\x00":
+            print(f"[XPlane] 收到未知信标 {data[:5]!r}", file=sys.stderr)
+            return []
+
+        _, main_ver, minor_ver, _, _, _, _port = struct.unpack_from("=5sBBiiIH", data)
+        sender_ip = addr[0]
+
+        print(f"[XPlane] 发现 X-Plane v{main_ver}.{minor_ver} @ {sender_ip}:{_port}", file=sys.stderr)
+
+        candidates = set()
+        for ip in {sender_ip, "127.0.0.1"}:
+            for p in {_port, 49000}:
+                candidates.add((ip, p))
+        return sorted(candidates, key=lambda x: (x[1] != 49000 or x[0] != "127.0.0.1"))
+
+    def _send_rref(self, addr, dataref, index=0, freq=1):
+        """发送 RREF 请求，成功返回 (index, value)，失败返回 None。"""
+        packet = struct.pack("=5sii", b"RREF\x00", freq, index)
+        packet += dataref.encode() + b"\x00"
+        packet = packet.ljust(413, b"\x00")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", 0))
+        sock.settimeout(RESPONSE_TIMEOUT)
+
+        try:
+            sock.sendto(packet, addr)
+        except OSError:
+            sock.close()
+            return None
+
+        try:
+            while True:
+                try:
+                    data, _ = sock.recvfrom(1500)
+                except ConnectionResetError:
+                    continue
+                if len(data) < 12 or data[:4] != b"RREF":
+                    continue
+                remaining = len(data) - 5
+                if remaining % 8 != 0:
+                    continue
+                for i in range(remaining // 8):
+                    off = 5 + i * 8
+                    ridx, rval = struct.unpack_from("=if", data, off)
+                    if ridx == index:
+                        sock.close()
+                        return (ridx, rval)
+        except socket.timeout:
+            sock.close()
+            return None
+
+    def read_com1_freq(self, addr):
+        """读取 COM1 频率，返回 MHz 值；失败返回 None。"""
+        result = self._send_rref(addr, "sim/cockpit/radios/com1_freq_hz", index=0)
+        if result is None:
+            return None
+        _, value = result
+        return value / 100.0
+
+    def find_and_read(self):
+        """发现 X-Plane 并读取一次 COM1 频率。成功返回 (addr, freq_mhz)。"""
+        candidates = self.discover()
+        for addr in candidates:
+            freq = self.read_com1_freq(addr)
+            if freq is not None:
+                self._addr = addr
+                return (addr, freq)
+        return (None, None)
+
+    @property
+    def addr(self):
+        return self._addr
+
+
 class MumbleRadioClient:
+    """X-Plane 版本的 Mumble 无线电客户端。
+
+    与 SimConnect 版本的区别仅在于：
+    - 不依赖 SimConnect，改用 XPlaneRadio 读取频率
+    - 频率读取通过 X-Plane UDP 协议完成
+    """
+
     def __init__(self, server_host, username, password="", settings=None):
-        # SimConnect 初始化
-        self.simconnect = SimConnect()
-        self.aq = AircraftRequests(self.simconnect, _time=2000)
-        
+        # X-Plane 通信
+        self.xplane = XPlaneRadio()
+
         # 音频配置
-        self.CHUNK = 960  # 20ms @ 48000Hz
+        self.CHUNK = 960
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
         self.RATE = 48000
@@ -46,68 +174,58 @@ class MumbleRadioClient:
         self.is_receiving = False
         self.on_rx_change = None
         self._last_rx_time = 0
-        
-        # 添加设置支持（改为可注入同一份 Settings）
+
+        # 设置
         if settings is not None:
             self.settings = settings
         else:
             from settings import Settings
             self.settings = Settings()
-        # 同步当前登录账号和密码到设置
         try:
             self.settings.username = username or ""
             self.settings.password = password or ""
         except Exception as e:
             print(f"[DEBUG] 同步账号到设置失败: {e}")
 
-        # 确保音量在合理范围内
         self.settings.mic_volume = max(0, min(200, self.settings.mic_volume))
         self.settings.speaker_volume = max(0, min(200, self.settings.speaker_volume))
-        
-        # 初始化音频设备
+
+        # 音频设备
         self.audio = pyaudio.PyAudio()
         self.stream = self.audio.open(
-            format=self.FORMAT,
-            channels=self.CHANNELS,
-            rate=self.RATE,
-            input=True,
-            frames_per_buffer=self.CHUNK,
-            input_device_index=self.settings.input_device_index
+            format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
+            input=True, frames_per_buffer=self.CHUNK,
+            input_device_index=self.settings.input_device_index,
         )
         self.output_stream = self.audio.open(
-            format=self.FORMAT,
-            channels=self.CHANNELS,
-            rate=self.RATE,
-            output=True,
-            frames_per_buffer=self.CHUNK,
-            output_device_index=self.settings.output_device_index
+            format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
+            output=True, frames_per_buffer=self.CHUNK,
+            output_device_index=self.settings.output_device_index,
         )
 
-        # 初始化 Mumble 客户端
+        # Mumble 客户端
         self.mumble = pymumble.Mumble(
-            server_host, 
-            username,
-            password=password,
-            reconnect=True
+            server_host, username, password=password, reconnect=True,
         )
-        
         self.mumble.set_receive_sound(True)
-        self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED, self.handle_incoming_audio)
+        self.mumble.callbacks.set_callback(
+            pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED,
+            self.handle_incoming_audio,
+        )
         self.current_channel = None
-        
-        # 初始应用音量设置
+
         self.update_volumes()
-        
+
         # 线程管理
         self.monitor_thread = None
         self.voice_thread = None
         self.running = True
 
-        self.pygame_lock = threading.Lock()  # 添加pygame锁
+        # 摇杆
+        self.pygame_lock = threading.Lock()
         self.pygame_initialized = False
         try:
             with self.pygame_lock:
-                print("[DEBUG] 开始初始化 pygame 子系统")
                 if not pygame.get_init():
                     pygame.init()
                 if not pygame.display.get_init():
@@ -116,7 +234,7 @@ class MumbleRadioClient:
                     pygame.joystick.init()
                 self.pygame_initialized = True
                 print(f"[DEBUG] pygame初始化完成，检测到 {pygame.joystick.get_count()} 个摇杆")
-                
+
                 self.joystick = None
                 if pygame.joystick.get_count() > 0:
                     self.joystick = pygame.joystick.Joystick(0)
@@ -127,53 +245,50 @@ class MumbleRadioClient:
             self.pygame_initialized = False
             self.joystick = None
 
-    def convert_frequency(self, frequency):
-        """将频率转换为标准格式"""
+    # ---------- 频率 / 频道 ----------
+    @staticmethod
+    def convert_frequency(frequency):
         return int(round(frequency * 1000))
-    
-    def get_channel_name(self, frequency):
-        """根据频率生成频道名称"""
-        freq = self.convert_frequency(frequency)
+
+    @staticmethod
+    def get_channel_name(frequency):
+        freq = MumbleRadioClient.convert_frequency(frequency)
         return f"FREQ_{str(freq).zfill(6)}"
-    
+
     def switch_channel(self, frequency):
-        """切换到对应频率的频道"""
         channel_name = self.get_channel_name(frequency)
         try:
             channel = self.mumble.channels.find_by_name(channel_name)
         except pymumble.errors.UnknownChannelError:
-            # 如果频道不存在则创建
-            self.mumble.channels.new_channel(0, channel_name,temporary=True)
+            self.mumble.channels.new_channel(0, channel_name, temporary=True)
             channel = self.mumble.channels.find_by_name(channel_name)
-        
+
         if channel and self.current_channel != channel["channel_id"]:
             self.mumble.users.myself.move_in(channel["channel_id"])
             self.current_channel = channel["channel_id"]
             print(f"已切换到频率: {frequency:.3f} MHz")
-    
+
     def monitor_frequency(self):
-        """监控COM1频率变化"""
+        """监控 X-Plane COM1 频率变化（通过 UDP 轮询）。"""
         last_frequency = None
         while self.running:
             try:
-                if self.mumble.connected:  # 只在连接成功时监控频率
-                    com1_active = self.aq.get("COM_ACTIVE_FREQUENCY:1")
-                    if com1_active is not None and com1_active != last_frequency:
-                        self.switch_channel(com1_active)
-                        last_frequency = com1_active
+                if self.mumble.connected:
+                    freq = self.xplane.read_com1_freq(self.xplane.addr)
+                    if freq is not None and freq != last_frequency:
+                        self.switch_channel(freq)
+                        last_frequency = freq
             except Exception as e:
-                if self.running:  # 只在正常运行时打印错误
+                if self.running:
                     print(f"频率监控错误: {e}")
-            time.sleep(1)  # 增加检查间隔，减少错误日志
-    
+            time.sleep(1)
+
+    # ---------- 音量 ----------
     def update_volumes(self):
-        """更新麦克风和扬声器音量"""
         try:
             if self.mumble and self.mumble.connected:
-                # 麦克风音量 0-200% 映射到 0-2.0
                 self.mumble.sound_output.volume = self.settings.mic_volume / 100.0
             if hasattr(self, 'output_stream'):
-                # 扬声器音量 0-200% 映射到音频数据缩放
                 volume_scale = self.settings.speaker_volume / 100.0
                 def volume_modifier(audio_data):
                     return (np.frombuffer(audio_data, dtype=np.int16) * volume_scale).astype(np.int16).tobytes()
@@ -181,50 +296,41 @@ class MumbleRadioClient:
         except Exception as e:
             print(f"更新音量设置时出错: {e}")
 
+    # ---------- pygame / 摇杆 ----------
     def ensure_pygame_initialized(self):
-        """确保pygame在当前线程中正确初始化"""
         with self.pygame_lock:
             try:
                 if not pygame.get_init():
-                    print("[DEBUG] 重新初始化pygame")
                     pygame.init()
                 if not pygame.display.get_init():
                     pygame.display.init()
                 if not pygame.joystick.get_init():
                     pygame.joystick.init()
-                
                 if pygame.joystick.get_count() > 0:
                     if not self.joystick or not self.joystick.get_init():
                         self.joystick = pygame.joystick.Joystick(0)
                         self.joystick.init()
-                        print(f"[DEBUG] 摇杆重新初始化: {self.joystick.get_name()}")
                 return True
             except Exception as e:
                 print(f"[DEBUG] pygame重新初始化失败: {e}")
                 return False
 
     def reinitialize_joystick(self):
-        """重新初始化摇杆"""
         print("[DEBUG] 尝试重新初始化摇杆")
         with self.pygame_lock:
             try:
-                # 关闭现有摇杆
                 if self.joystick:
                     try:
                         self.joystick.quit()
-                    except:
+                    except Exception:
                         pass
                     self.joystick = None
-
-                # 确保pygame已初始化
                 if not pygame.get_init():
                     pygame.init()
                 if not pygame.display.get_init():
                     pygame.display.init()
                 if not pygame.joystick.get_init():
                     pygame.joystick.init()
-
-                # 重新初始化摇杆
                 if pygame.joystick.get_count() > 0:
                     self.joystick = pygame.joystick.Joystick(0)
                     self.joystick.init()
@@ -234,12 +340,12 @@ class MumbleRadioClient:
                 print(f"[DEBUG] 摇杆重新初始化失败: {e}")
                 return False
 
+    # ---------- 音频处理 ----------
     def handle_voice(self):
-        """处理按键说话功能"""
         print("[DEBUG] 开始语音处理线程")
         self.ensure_pygame_initialized()
         last_ptt_state = False
-        
+
         while self.running:
             try:
                 # RX 超时检查：超过 0.5 秒无接收则灭灯
@@ -248,72 +354,55 @@ class MumbleRadioClient:
                     if self.on_rx_change:
                         self.on_rx_change(False)
 
-                # 检查键盘和摇杆PTT状态
                 keyboard_ptt = keyboard.is_pressed(self.settings.ptt_key)
                 joystick_ptt = False
-                
+
                 if self.settings.joystick_ptt is not None:
                     try:
                         with self.pygame_lock:
                             if not pygame.get_init() or not pygame.joystick.get_init():
                                 self.ensure_pygame_initialized()
                             pygame.event.pump()
-                            if (self.joystick and self.joystick.get_init() and 
-                                self.settings.joystick_ptt < self.joystick.get_numbuttons()):
+                            if (self.joystick and self.joystick.get_init()
+                                    and self.settings.joystick_ptt < self.joystick.get_numbuttons()):
                                 joystick_ptt = self.joystick.get_button(self.settings.joystick_ptt)
                     except Exception as e:
                         print(f"[DEBUG] 摇杆读取错误: {e}")
-                
+
                 is_speaking = keyboard_ptt or joystick_ptt
-                
-                # 状态改变时更新和打印
+
                 if is_speaking != last_ptt_state:
-                    print(f"[DEBUG] PTT状态改变: {is_speaking} (键盘: {keyboard_ptt}, 摇杆: {joystick_ptt})")
                     last_ptt_state = is_speaking
                     self.is_talking = is_speaking
                     if self.on_ptt_change:
                         self.on_ptt_change(self.is_talking)
-                
-                # 如果PTT被按下，检查是否可以发送音频
+
                 if self.is_talking:
                     if not self.stream or not self.mumble:
-                        print("[DEBUG] 音频发送失败：设备未就绪")
                         continue
-                    
                     try:
-                        # 通过检查mumble连接状态和channel来判断是否就绪
                         if not self.mumble.connected > 0:
-                            print("[DEBUG] Mumble未连接")
                             continue
-                            
                         if not self.mumble.channels:
-                            print("[DEBUG] Mumble频道列表为空")
                             continue
-                            
                         if not self.mumble.users.myself or not self.mumble.users.myself["channel_id"]:
-                            print("[DEBUG] 未加入任何频道")
                             continue
-                            
+
                         data = self.stream.read(self.CHUNK, exception_on_overflow=False)
                         if data:
                             audio_data = np.frombuffer(data, dtype=np.int16)
                             audio_data = (audio_data * (self.settings.mic_volume / 100.0)).astype(np.int16)
-                            if not any(audio_data):  # 检查是否全是静音
-                                print("[DEBUG] 检测到静音数据")
-                            else:
-                                self.mumble.sound_output.add_sound(audio_data.tobytes())
-                                
+                            self.mumble.sound_output.add_sound(audio_data.tobytes())
                     except Exception as e:
                         print(f"[DEBUG] 音频处理错误: {e}")
-                
+
                 time.sleep(0.01)
             except Exception as e:
                 print(f"[DEBUG] 语音处理错误: {e}")
                 time.sleep(0.1)
 
     def handle_incoming_audio(self, user, soundchunk):
-        """处理接收到的音频"""
-        if user["name"] != self.mumble.users.myself["name"]:  # 不播放自己的声音
+        if user["name"] != self.mumble.users.myself["name"]:
             try:
                 # 标记正在接收
                 self._last_rx_time = time.time()
@@ -322,7 +411,6 @@ class MumbleRadioClient:
                     if self.on_rx_change:
                         self.on_rx_change(True)
 
-                # 调整收听音量
                 audio_data = np.frombuffer(soundchunk.pcm, dtype=np.int16)
                 audio_data = (audio_data * (self.settings.speaker_volume / 100.0)).astype(np.int16)
                 self.output_stream.write(audio_data.tobytes())
@@ -330,115 +418,60 @@ class MumbleRadioClient:
                 print(f"音频输出错误: {e}")
 
     def reinitialize_audio(self):
-        """重新初始化音频设备"""
         try:
-            # 关闭现有的音频流
             if hasattr(self, 'stream') and self.stream:
                 self.stream.stop_stream()
                 self.stream.close()
             if hasattr(self, 'output_stream') and self.output_stream:
                 self.output_stream.stop_stream()
                 self.output_stream.close()
-            
-            # 重新创建音频流
+
             self.stream = self.audio.open(
-                format=self.FORMAT,
-                channels=self.CHANNELS,
-                rate=self.RATE,
-                input=True,
-                frames_per_buffer=self.CHUNK,
-                input_device_index=self.settings.input_device_index
+                format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
+                input=True, frames_per_buffer=self.CHUNK,
+                input_device_index=self.settings.input_device_index,
             )
             self.output_stream = self.audio.open(
-                format=self.FORMAT,
-                channels=self.CHANNELS,
-                rate=self.RATE,
-                output=True,
-                frames_per_buffer=self.CHUNK,
-                output_device_index=self.settings.output_device_index
+                format=self.FORMAT, channels=self.CHANNELS, rate=self.RATE,
+                output=True, frames_per_buffer=self.CHUNK,
+                output_device_index=self.settings.output_device_index,
             )
-            
-            # 更新音量设置
             self.update_volumes()
             print("音频设备重新初始化完成")
         except Exception as e:
             print(f"重新初始化音频设备失败: {e}")
             raise
 
-    def show_settings(self):
-        """显示设置对话框"""
-        from settings import SettingsDialog
-        dialog = SettingsDialog(self.settings)
-        if dialog.exec():
-            # 如果用户点击了保存，则重新初始化音频设备
-            self.reinitialize_audio()
-
-    @suppress_mumble_errors
-    def run(self):
-        """启动客户端主循环"""
-        try:
-            self.mumble.start()
-            time.sleep(1)  # 给予足够时间让连接完成或失败
-            
-            # 尝试执行一个操作来检查连接状态
-            try:
-                self.mumble.is_ready()
-            except pymumble.errors.ConnectionRejectedError:
-                raise pymumble.errors.ConnectionRejectedError("用户名或密码错误")
-                
-            while self.running:
-                try:
-                    self.mumble.is_ready()
-                    time.sleep(1)
-                except:
-                    break
-        except Exception as e:
-            raise e from None
-        finally:
-            self.cleanup()
-    
+    # ---------- 清理 ----------
     def cleanup(self):
-        """清理资源"""
-        self.running = False  # 停止所有线程的运行
-        
+        self.running = False
         try:
             if hasattr(self, 'stream') and self.stream:
                 self.stream.stop_stream()
                 self.stream.close()
-                
             if hasattr(self, 'output_stream') and self.output_stream:
                 self.output_stream.stop_stream()
                 self.output_stream.close()
-                
             if hasattr(self, 'audio') and self.audio:
                 self.audio.terminate()
-                
             if hasattr(self, 'mumble') and self.mumble:
                 try:
                     self.mumble.connected = 0
-                except:
+                except Exception:
                     pass
                 self.mumble.stop()
-                
-            if hasattr(self, 'simconnect') and self.simconnect:
-                self.simconnect.exit()
-                
-            # 等待线程结束
             if self.monitor_thread and self.monitor_thread.is_alive():
                 self.monitor_thread.join(timeout=1.0)
             if self.voice_thread and self.voice_thread.is_alive():
                 self.voice_thread.join(timeout=1.0)
-                
             if hasattr(self, 'joystick') and self.joystick:
                 try:
                     self.joystick.quit()
-                except:
+                except Exception:
                     pass
             pygame.quit()
-                
         except Exception as e:
             print(f"清理资源时出错: {e}")
-            pass  # 确保清理过程中的错误不会影响程序
 
 
 if __name__ == "__main__":
@@ -456,7 +489,5 @@ if __name__ == "__main__":
         print("\n按回车键退出...")
         try:
             input()
-        except:
-            # 如果input()失败，使用time.sleep作为备选
-            import time
+        except Exception:
             time.sleep(5)

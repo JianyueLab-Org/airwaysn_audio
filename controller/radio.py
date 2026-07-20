@@ -1,5 +1,4 @@
 import pymumble_py3 as pymumble
-import keyboard
 import pyaudio
 import threading
 import time
@@ -7,7 +6,7 @@ import numpy as np
 from contextlib import contextmanager
 from pymumble_py3.errors import ConnectionRejectedError
 
-server = "118.153.226.153"
+server = "hjdczy.top"
 
 class AudioStreamError(Exception):
     pass

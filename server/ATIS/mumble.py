@@ -47,7 +47,7 @@ class ATISBroadcaster(threading.Thread):
                 print("跳过创建频道 FREQ_199998")
                 return False
                 
-            self.mumble = pymumble.Mumble("118.153.226.153", self.user, password=self.password, reconnect=True)
+            self.mumble = pymumble.Mumble("hjdczy.top", self.user, password=self.password, reconnect=True)
             self.mumble.set_receive_sound(True)
             self.mumble.start()
             time.sleep(1)  # 等待连接建立
