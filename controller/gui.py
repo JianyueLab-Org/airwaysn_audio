@@ -12,16 +12,24 @@ from PyQt6.QtGui import QIcon
 
 icon_path = r".\favicon.ico"
 
-class PTTIndicator(QFrame):
-    def __init__(self, parent=None):
+class CircleIndicator(QFrame):
+    """圆形状态指示灯，支持自定义颜色。"""
+    def __init__(self, active_color="#ff0000", parent=None):
         super().__init__(parent)
         self.setFixedSize(20, 20)
-        self.active = False
-        self.setStyleSheet("background-color: #808080; border-radius: 10px;")
+        self._active_color = active_color
+        self._active = False
+        self._update_style()
 
-    def setPTTActive(self, active):
-        self.active = active
-        self.setStyleSheet(f"background-color: {'#ff0000' if active else '#808080'}; border-radius: 10px;")
+    def setActive(self, active):
+        self._active = active
+        self._update_style()
+
+    def _update_style(self):
+        color = self._active_color if self._active else "#808080"
+        self.setStyleSheet(f"background-color: {color}; border-radius: 10px;")
+
+PTTIndicator = CircleIndicator
 
 class ATISDialog(QDialog):
     def __init__(self, atis_id, parent=None):
@@ -183,13 +191,22 @@ class ATCWindow(QMainWindow):
         top_bar.addWidget(self.freq_display)
         top_bar.addWidget(settings_btn)
         
-        # PTT状态显示
-        ptt_layout = QHBoxLayout()
-        self.ptt_indicator = PTTIndicator()
-        ptt_label = QLabel("PTT状态")
-        ptt_layout.addWidget(self.ptt_indicator)
-        ptt_layout.addWidget(ptt_label)
-        ptt_layout.addStretch()
+        # 状态指示灯：PTT（红）和 RX（绿）
+        indicator_layout = QHBoxLayout()
+        
+        self.ptt_indicator = CircleIndicator(active_color="#ff0000")
+        ptt_label = QLabel("PTT")
+        indicator_layout.addWidget(self.ptt_indicator)
+        indicator_layout.addWidget(ptt_label)
+        
+        indicator_layout.addSpacing(15)
+        
+        self.rx_indicator = CircleIndicator(active_color="#00cc00")
+        rx_label = QLabel("RX")
+        indicator_layout.addWidget(self.rx_indicator)
+        indicator_layout.addWidget(rx_label)
+        
+        indicator_layout.addStretch()
         
         # PTT按钮
         self.ptt_button = QPushButton('按住说话 (PTT)')
@@ -215,7 +232,7 @@ class ATCWindow(QMainWindow):
         
         # 添加所有部件
         layout.addLayout(top_bar)
-        layout.addLayout(ptt_layout)
+        layout.addLayout(indicator_layout)
         layout.addWidget(self.ptt_button)
         layout.addWidget(self.comm_status_label)
         layout.addLayout(atis_layout)  # 添加ATIS按钮
@@ -289,6 +306,15 @@ class ATCWindow(QMainWindow):
                 self.settings.input_device_index,
                 self.settings.output_device_index
             )
+            # 设置发射/接收状态回调
+            def on_ptt_change(is_talking):
+                self.ptt_indicator.setActive(is_talking)
+            self.radio_client.on_ptt_change = on_ptt_change
+
+            def on_rx_change(is_receiving):
+                self.rx_indicator.setActive(is_receiving)
+            self.radio_client.on_rx_change = on_rx_change
+
             # 设置初始音量
             self.radio_client.set_mic_volume(self.settings.mic_volume)
             self.radio_client.set_speaker_volume(self.settings.speaker_volume)
@@ -317,13 +343,13 @@ class ATCWindow(QMainWindow):
         if self.radio_client:
             self.radio_client.start_speaking()
             self.comm_status_label.setText('正在发送...')
-            self.ptt_indicator.setPTTActive(True)
+            self.ptt_indicator.setActive(True)
 
     def ptt_released(self):
         if self.radio_client:
             self.radio_client.stop_speaking()
             self.comm_status_label.setText('就绪')
-            self.ptt_indicator.setPTTActive(False)
+            self.ptt_indicator.setActive(False)
 
     def update_mic_volume(self, value):
         if self.radio_client:

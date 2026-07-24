@@ -19,6 +19,10 @@ SERVER_HOST = "hjdczy.top"  # Mumble服务器地址
 USERNAME = ""    # 用户名
 PASSWORD = ""             # 密码（如果需要）
 
+# ---------- 音频采样率候选列表 ----------
+# 按优先级排序，自动检测设备支持的采样率
+SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
+
 def suppress_mumble_errors(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -66,6 +70,9 @@ class MumbleRadioClient:
         
         # 初始化音频设备
         self.audio = pyaudio.PyAudio()
+        self.RATE = self._find_best_sample_rate()
+        self.CHUNK = int(self.RATE * 0.02)
+        print(f"[Audio] 使用采样率: {self.RATE} Hz, CHUNK: {self.CHUNK}")
         self.stream = self.audio.open(
             format=self.FORMAT,
             channels=self.CHANNELS,
@@ -126,6 +133,46 @@ class MumbleRadioClient:
             print(f"[DEBUG] 摇杆初始化失败: {e}")
             self.pygame_initialized = False
             self.joystick = None
+
+    def _find_best_sample_rate(self):
+        """自动检测音频设备支持的最佳采样率。"""
+        candidates = list(SUPPORTED_SAMPLE_RATES)
+
+        def _test_rate(rate, device_idx, is_input):
+            try:
+                test = self.audio.open(
+                    format=self.FORMAT, channels=self.CHANNELS, rate=rate,
+                    input=is_input, output=not is_input,
+                    input_device_index=device_idx if is_input else None,
+                    output_device_index=device_idx if not is_input else None,
+                    frames_per_buffer=960,
+                    start=False,
+                )
+                test.close()
+                return True
+            except Exception:
+                return False
+
+        input_idx = self.settings.input_device_index
+        output_idx = self.settings.output_device_index
+
+        for rate in candidates:
+            input_ok = True
+            output_ok = True
+            if input_idx is not None:
+                input_ok = _test_rate(rate, input_idx, True)
+                if not input_ok:
+                    input_ok = _test_rate(rate, None, True)
+            if output_idx is not None:
+                output_ok = _test_rate(rate, output_idx, False)
+                if not output_ok:
+                    output_ok = _test_rate(rate, None, False)
+            if input_ok and output_ok:
+                print(f"[Audio] 使用采样率: {rate} Hz")
+                return rate
+
+        print(f"[Audio] 所有候选采样率均失败，使用 48000 Hz")
+        return 48000
 
     def convert_frequency(self, frequency):
         """将频率转换为标准格式"""
@@ -340,6 +387,11 @@ class MumbleRadioClient:
                 self.output_stream.stop_stream()
                 self.output_stream.close()
             
+            # 重新检测采样率（设备可能已更改）
+            self.RATE = self._find_best_sample_rate()
+            self.CHUNK = int(self.RATE * 0.02)
+            print(f"[Audio] 重新初始化使用采样率: {self.RATE} Hz, CHUNK: {self.CHUNK}")
+
             # 重新创建音频流
             self.stream = self.audio.open(
                 format=self.FORMAT,

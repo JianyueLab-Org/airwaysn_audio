@@ -8,6 +8,9 @@ from pymumble_py3.errors import ConnectionRejectedError
 
 server = "hjdczy.top"
 
+# ---------- 音频采样率候选列表 ----------
+SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
+
 class AudioStreamError(Exception):
     pass
 
@@ -31,14 +34,46 @@ class ATCRadioClient:
         self.input_stream = None
         self.output_stream = None
         self.speaking = False
+        self.is_receiving = False
+        self.on_ptt_change = None
+        self.on_rx_change = None
+        self._last_rx_time = 0
         self.current_channel = None  # 添加初始化
         self.CHUNK = 960  # 20ms @ 48000Hz
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 48000
+        self.RATE = self._find_best_sample_rate()
+        self.CHUNK = int(self.RATE * 0.02)
         self.mic_volume = 1.0
         self.speaker_volume = 1.0
         self._stream_lock = threading.Lock()
+
+    def _find_best_sample_rate(self):
+        """自动检测音频设备支持的最佳采样率。"""
+        candidates = list(SUPPORTED_SAMPLE_RATES)
+
+        def _test_rate(rate, device_idx, is_input):
+            try:
+                test = self.audio.open(
+                    format=self.FORMAT, channels=self.CHANNELS, rate=rate,
+                    input=is_input, output=not is_input,
+                    input_device_index=device_idx if is_input else None,
+                    output_device_index=device_idx if not is_input else None,
+                    frames_per_buffer=960,
+                    start=False,
+                )
+                test.close()
+                return True
+            except Exception:
+                return False
+
+        for rate in candidates:
+            if _test_rate(rate, None, True) and _test_rate(rate, None, False):
+                print(f"[Audio] 使用采样率: {rate} Hz")
+                return rate
+
+        print(f"[Audio] 所有候选采样率均失败，使用 48000 Hz")
+        return 48000
 
     @contextmanager
     def _safe_audio_stream(self, stream):
@@ -77,12 +112,27 @@ class ATCRadioClient:
                 raise Exception("连接超时，可能是用户名或密码错误")
                 
             self.setup_audio()
+            # 启动 RX 状态监控线程
+            self._rx_thread = threading.Thread(target=self._rx_monitor, daemon=True)
+            self._rx_thread.start()
         except ConnectionRejectedError as e:
             self.stop()
             raise ConnectionRejectedError(str(e))
         except Exception as e:
             self.stop()
             raise Exception(f"连接失败: {str(e)}")
+
+    def _rx_monitor(self):
+        """监控 RX 接收状态，超时后关闭指示灯。"""
+        while self.connected or self.speaking:
+            try:
+                if self.is_receiving and time.time() - self._last_rx_time > 0.5:
+                    self.is_receiving = False
+                    if self.on_rx_change:
+                        self.on_rx_change(False)
+            except Exception:
+                pass
+            time.sleep(0.1)
 
     def on_connected(self):
         """当连接成功时被调用"""
@@ -117,6 +167,11 @@ class ATCRadioClient:
                 self.output_stream.stop_stream()
                 self.output_stream.close()
 
+            # 重新检测采样率（设备可能已更改）
+            self.RATE = self._find_best_sample_rate()
+            self.CHUNK = int(self.RATE * 0.02)
+            print(f"[Audio] 重新初始化使用采样率: {self.RATE} Hz, CHUNK: {self.CHUNK}")
+
             try:
                 self.input_stream = self.audio.open(
                     input=True,
@@ -142,10 +197,14 @@ class ATCRadioClient:
     def start_speaking(self):
         if not self.speaking:
             self.speaking = True
+            if self.on_ptt_change:
+                self.on_ptt_change(True)
             threading.Thread(target=self._audio_thread).start()
 
     def stop_speaking(self):
         self.speaking = False
+        if self.on_ptt_change:
+            self.on_ptt_change(False)
 
     def set_mic_volume(self, volume_percent):
         """设置麦克风音量 (0-200)"""
@@ -185,6 +244,13 @@ class ATCRadioClient:
         if not soundchunk or not hasattr(soundchunk, 'pcm') or soundchunk.pcm is None:
             return  # 忽略无效的音频数据
 
+        # 标记正在接收，触发 RX 指示灯
+        self._last_rx_time = time.time()
+        if not self.is_receiving:
+            self.is_receiving = True
+            if self.on_rx_change:
+                self.on_rx_change(True)
+
         try:
             with self._safe_audio_stream(self.output_stream) as stream:
                 # 使用numpy处理接收到的音频
@@ -202,6 +268,7 @@ class ATCRadioClient:
             print(f"处理接收音频时出错: {e}")
 
     def stop(self):
+        self.speaking = False
         if self.input_stream:
             self.input_stream.stop_stream()
             self.input_stream.close()
