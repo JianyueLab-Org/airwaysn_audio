@@ -132,12 +132,29 @@ class XPlaneRadio:
             return None
 
     def read_com1_freq(self, addr):
-        """读取 COM1 频率，返回 MHz 值；失败返回 None。"""
-        result = self._send_rref(addr, "sim/cockpit/radios/com1_freq_hz", index=0)
+        """读取 COM1 频率，返回 MHz 值；失败返回 None。
+
+        使用 sim/cockpit2/radios/actuators/com1_frequency_hz_833，
+        raw/1000 = MHz，精度 0.001 MHz（1 kHz），支持 8.33 kHz 步进。
+
+        若该 dataref 不可用，回退到 sim/cockpit/radios/com1_freq_hz
+        （精度 0.01 MHz）。
+        """
+        # 首选：_833 dataref（高精度，raw/1000 = MHz）
+        result = self._send_rref(addr,
+            "sim/cockpit2/radios/actuators/com1_frequency_hz_833", index=0)
+        if result is not None:
+            _, value = result
+            if value > 0:
+                return round(value / 1000.0, 3)
+
+        # 回退：原始 dataref（0.01 MHz 精度）
+        result = self._send_rref(addr,
+            "sim/cockpit/radios/com1_freq_hz", index=0)
         if result is None:
             return None
         _, value = result
-        return value / 100.0
+        return round(value / 100.0, 3)
 
     def find_and_read(self):
         """发现 X-Plane 并读取一次 COM1 频率。成功返回 (addr, freq_mhz)。"""
