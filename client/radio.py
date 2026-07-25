@@ -49,6 +49,7 @@ class MumbleRadioClient:
         self.on_ptt_change = None
         self.is_receiving = False
         self.on_rx_change = None
+        self.on_connection_change = None
         self._last_rx_time = 0
         
         # 添加设置支持（改为可注入同一份 Settings）
@@ -101,10 +102,23 @@ class MumbleRadioClient:
         self.mumble.set_receive_sound(True)
         self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED, self.handle_incoming_audio)
         self.current_channel = None
+
+        # 预初始化 connected 属性（pymumble 的 init_connection 在 start() 后才设置此属性）
+        self.mumble.connected = 0
         
         # 初始应用音量设置
         self.update_volumes()
         
+        # 将 pymumble 内部 ping 间隔从默认 10 秒改为 1 秒
+        # 注意：from .constants import * 是值拷贝，不能只改 constants，要改 mumble 模块的命名空间
+        pymumble.mumble.PYMUMBLE_PING_DELAY = 1
+        # 重连间隔从默认 10 秒改为 2 秒
+        pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
+        
+        # 心跳：记录最后一次收到 ping 回复的时间
+        # 初始化为当前时间，避免启动时误报
+        self._last_ping_rcv = time.time()
+
         # 线程管理
         self.monitor_thread = None
         self.voice_thread = None
@@ -190,28 +204,134 @@ class MumbleRadioClient:
             channel = self.mumble.channels.find_by_name(channel_name)
         except pymumble.errors.UnknownChannelError:
             # 如果频道不存在则创建
-            self.mumble.channels.new_channel(0, channel_name,temporary=True)
+            self.mumble.channels.new_channel(0, channel_name, temporary=True)
             channel = self.mumble.channels.find_by_name(channel_name)
-        
-        if channel and self.current_channel != channel["channel_id"]:
-            self.mumble.users.myself.move_in(channel["channel_id"])
-            self.current_channel = channel["channel_id"]
-            print(f"已切换到频率: {frequency:.3f} MHz")
+
+        if channel:
+            # 检查实际所在频道（而非缓存），避免被踢出频道后无法重新加入
+            current_id = self.mumble.users.myself["channel_id"] if self.mumble.users.myself else None
+            if current_id != channel["channel_id"]:
+                self.mumble.users.myself.move_in(channel["channel_id"])
+                self.current_channel = channel["channel_id"]
+                print(f"已切换到频率: {frequency:.3f} MHz")
     
+    def _sync_ping_heartbeat(self):
+        """读取 pymumble 内部 ping_stats['last_rcv'] 刷新心跳。
+        
+        不主动发 ping（避免多线程 socket 竞态），而是靠 pymumble 内部自动 ping。
+        在 __init__ 中将 PYMUMBLE_PING_DELAY 置为 1 秒，使自动 ping 每秒一次。
+        PING_TIMEOUT=3 意味着最多 3 秒即可发现断连。
+        """
+        try:
+            # ping_stats['last_rcv'] 是毫秒级时间戳，由 ping_response() 在 pymumble 线程中更新
+            last_rcv = self.mumble.ping_stats.get('last_rcv', 0)
+            if last_rcv > 0:
+                self._last_ping_rcv = last_rcv / 1000.0
+        except Exception:
+            pass
+
+    def _ensure_in_correct_channel(self, frequency):
+        """确保用户在正确的频道中，如果不在则重新加入"""
+        try:
+            if not self.mumble.connected:
+                return
+            if not self.mumble.users.myself:
+                return
+
+            channel_name = self.get_channel_name(frequency)
+            current_channel_id = self.mumble.users.myself["channel_id"]
+
+            # 未加入任何频道
+            if not current_channel_id:
+                print(f"[频道检查] 未加入任何频道，重新加入 {channel_name}")
+                self.switch_channel(frequency)
+                return
+
+            # 检查是否在正确的频道中
+            try:
+                current_channel = self.mumble.channels[current_channel_id]
+                if current_channel["name"] != channel_name:
+                    print(f"[频道检查] 频道不匹配 ({current_channel['name']} -> {channel_name})，重新加入")
+                    self.switch_channel(frequency)
+            except (KeyError, Exception):
+                print(f"[频道检查] 频道 ID {current_channel_id} 无效，重新加入 {channel_name}")
+                self.switch_channel(frequency)
+        except Exception as e:
+            print(f"[频道检查] 错误: {e}")
+
     def monitor_frequency(self):
-        """监控COM1频率变化"""
+        """监控COM1频率变化和连接/频道状态
+        
+        双重断连检测：
+        1. pymumble 的 connected 标志（底层 TCP 状态，被踢时约 28s 延迟）
+        2. ping 回复心跳（pymumble 每 10s 自动 ping 服务器，无回复即为断连）
+        """
         last_frequency = None
+        last_connected = False
+        PING_TIMEOUT = 3       # 超过 3 秒没收到 ping 回复，认为死亡（pymumble 每 10s ping 一次，但我们每秒主动触发）
+        tick = 0
+        first_loop = True
+
         while self.running:
             try:
-                if self.mumble.connected:  # 只在连接成功时监控频率
+                tick += 1
+
+                # ── 从 pymumble 内部 ping_stats 同步心跳 ──
+                self._sync_ping_heartbeat()
+
+                mumble_connected = bool(self.mumble.connected)
+                myself = self.mumble.users.myself
+                my_channel_id = myself["channel_id"] if myself else None
+                chan_name = ""
+                if my_channel_id:
+                    try:
+                        chan_name = self.mumble.channels[my_channel_id]["name"]
+                    except:
+                        chan_name = "<无效ID>"
+
+                # 额外检测：thread 是否存话
+                thread_alive = self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else True
+
+                ping_ago = time.time() - self._last_ping_rcv
+                ping_timeout = ping_ago > PING_TIMEOUT
+
+                print(f"[监控 T{tick}] connected={mumble_connected}"
+                      f" | thread_alive={thread_alive}"
+                      f" | channel_id={my_channel_id}"
+                      f" | channel_name={chan_name}"
+                      f" | ping_ago={ping_ago:.1f}s"
+                      f"{' ⚠️PING_TIMEOUT' if ping_timeout else ''}")
+
+                # 三条件任意成立则视为断连
+                if not thread_alive or (mumble_connected and ping_timeout):
+                    if mumble_connected:
+                        mumble_connected = False
+                        print(f"[监控 T{tick}] 主动标记断连（thread={thread_alive}, ping_ago={ping_ago:.1f}s）")
+                    elif not first_loop:  # 避免首次循环误判
+                        pass  # 已断连，正常
+
+                # 连接状态变化检测
+                if mumble_connected != last_connected:
+                    last_connected = mumble_connected
+                    print(f"[监控 T{tick}] 连接状态变化: {not mumble_connected} -> {mumble_connected}")
+                    if self.on_connection_change:
+                        self.on_connection_change(mumble_connected)
+
+                if mumble_connected:
                     com1_active = self.aq.get("COM_ACTIVE_FREQUENCY:1")
-                    if com1_active is not None and com1_active != last_frequency:
-                        self.switch_channel(com1_active)
-                        last_frequency = com1_active
+                    if com1_active is not None:
+                        if com1_active != last_frequency:
+                            print(f"[监控 T{tick}] 频率变化: {last_frequency} -> {com1_active}")
+                            self.switch_channel(com1_active)
+                            last_frequency = com1_active
+                        else:
+                            self._ensure_in_correct_channel(com1_active)
+
+                first_loop = False
             except Exception as e:
-                if self.running:  # 只在正常运行时打印错误
-                    print(f"频率监控错误: {e}")
-            time.sleep(1)  # 增加检查间隔，减少错误日志
+                if self.running:
+                    print(f"[监控] 频率监控错误: {e}")
+            time.sleep(1)
     
     def update_volumes(self):
         """更新麦克风和扬声器音量"""

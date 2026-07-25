@@ -182,12 +182,18 @@ class ATCWindow(QMainWindow):
     def setup_comm_page(self):
         layout = QVBoxLayout(self.comm_page)
         
-        # 顶部工具栏（频率显示和设置按钮）
+        # 顶部工具栏（连接状态、频率显示和设置按钮）
         top_bar = QHBoxLayout()
+        self.conn_indicator = CircleIndicator(active_color="#00cc00")
+        self.conn_label = QLabel("已连接")
+        self.conn_label.setStyleSheet("color: green")
         self.freq_display = QLabel()
         self.freq_display.setAlignment(Qt.AlignmentFlag.AlignLeft)
         settings_btn = QPushButton("设置")
         settings_btn.clicked.connect(self.open_settings)
+        top_bar.addWidget(self.conn_indicator)
+        top_bar.addWidget(self.conn_label)
+        top_bar.addStretch()
         top_bar.addWidget(self.freq_display)
         top_bar.addWidget(settings_btn)
         
@@ -319,6 +325,10 @@ class ATCWindow(QMainWindow):
             self.radio_client.set_mic_volume(self.settings.mic_volume)
             self.radio_client.set_speaker_volume(self.settings.speaker_volume)
             self.radio_client.start()
+            # 点亮连接状态指示灯
+            self.conn_indicator.setActive(True)
+            self.conn_label.setText("已连接")
+            self.conn_label.setStyleSheet("color: green")
             self.freq_display.setText(f'当前频率: {frequency}')
             self.stacked_widget.setCurrentIndex(1)
             
@@ -326,6 +336,17 @@ class ATCWindow(QMainWindow):
             self.settings.last_username = username
             self.settings.last_frequency = frequency
             self.settings.save_settings()
+
+            # 设置连接状态回调（用于检测意外断线）
+            def on_connection_change(connected):
+                self.conn_indicator.setActive(connected)
+                if connected:
+                    self.conn_label.setText("已连接")
+                    self.conn_label.setStyleSheet("color: green")
+                else:
+                    self.conn_label.setText("已断开")
+                    self.conn_label.setStyleSheet("color: red")
+            self.radio_client.on_connection_change = on_connection_change
             
         except Exception as e:
             error_message = str(e)
@@ -336,6 +357,10 @@ class ATCWindow(QMainWindow):
         if self.radio_client:
             self.radio_client.stop()
             self.radio_client = None
+        # 重置连接状态指示灯
+        self.conn_indicator.setActive(False)
+        self.conn_label.setText("已断开")
+        self.conn_label.setStyleSheet("color: red")
         self.stacked_widget.setCurrentIndex(0)  # 返回登录页面
         self.login_status_label.setText('未连接')
 

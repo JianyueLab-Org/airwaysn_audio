@@ -26,10 +26,17 @@ class ATCRadioClient:
             user = f"{base_user}_atis{str(freq_value).zfill(6)}"
         
         self.mumble = pymumble.Mumble(server, user, password=password, reconnect=True)
+        # 将 pymumble 内部 ping 间隔从默认 10 秒改为 1 秒
+        pymumble.mumble.PYMUMBLE_PING_DELAY = 1
+        # 重连间隔从默认 10 秒改为 2 秒
+        pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
         self.mumble.set_receive_sound(True)  # 启用音频接收
         self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED, self.sound_received)  # 设置音频接收回调
         self.mumble.callbacks.set_callback("connected", self.on_connected)
+        self.mumble.callbacks.set_callback(pymumble.constants.PYMUMBLE_CLBK_DISCONNECTED, self.on_disconnected)
         self.connected = False  # 初始化连接状态
+        self.last_connected = False
+        self.on_connection_change = None
         self.audio = pyaudio.PyAudio()
         self.input_stream = None
         self.output_stream = None
@@ -47,6 +54,8 @@ class ATCRadioClient:
         self.mic_volume = 1.0
         self.speaker_volume = 1.0
         self._stream_lock = threading.Lock()
+        self._running = True
+        self._last_ping_rcv = time.time()
 
     def _find_best_sample_rate(self):
         """自动检测音频设备支持的最佳采样率。"""
@@ -111,10 +120,16 @@ class ATCRadioClient:
             if not self.connected:
                 raise Exception("连接超时，可能是用户名或密码错误")
                 
+            # 同步连接监控的初始状态，避免首次循环时重复触发回调
+            self.last_connected = self.connected
+
             self.setup_audio()
             # 启动 RX 状态监控线程
             self._rx_thread = threading.Thread(target=self._rx_monitor, daemon=True)
             self._rx_thread.start()
+            # 启动连接状态监控线程
+            self._monitor_thread = threading.Thread(target=self._connection_monitor, daemon=True)
+            self._monitor_thread.start()
         except ConnectionRejectedError as e:
             self.stop()
             raise ConnectionRejectedError(str(e))
@@ -124,7 +139,7 @@ class ATCRadioClient:
 
     def _rx_monitor(self):
         """监控 RX 接收状态，超时后关闭指示灯。"""
-        while self.connected or self.speaking:
+        while self._running and (self.connected or self.speaking):
             try:
                 if self.is_receiving and time.time() - self._last_rx_time > 0.5:
                     self.is_receiving = False
@@ -156,6 +171,57 @@ class ATCRadioClient:
             if not hasattr(self, 'current_channel') or self.current_channel != channel["channel_id"]:
                 self.mumble.users.myself.move_in(channel["channel_id"])
                 self.current_channel = channel["channel_id"]
+
+        # 通知UI连接状态
+        if self.on_connection_change:
+            self.on_connection_change(True)
+
+    def on_disconnected(self):
+        """当连接断开时被调用"""
+        self.connected = False
+        print("[ATCRadioClient] 连接已断开")
+        if self.on_connection_change:
+            self.on_connection_change(False)
+
+    def _sync_ping_heartbeat(self):
+        """从 pymumble 内部 ping_stats 同步心跳"""
+        try:
+            last_rcv = self.mumble.ping_stats.get('last_rcv', 0)
+            if last_rcv > 0:
+                self._last_ping_rcv = last_rcv / 1000.0
+        except Exception:
+            pass
+
+    def _connection_monitor(self):
+        """监控连接状态，检测断线"""
+        PING_TIMEOUT = 5  # 超过5秒无ping回复认为断线
+        tick = 0
+        while self._running:
+            try:
+                tick += 1
+                self._sync_ping_heartbeat()
+
+                mumble_connected = bool(self.mumble.connected)
+                ping_ago = time.time() - self._last_ping_rcv
+                ping_timeout = ping_ago > PING_TIMEOUT
+
+                # ping超时且mumble还标记为已连接 → 认为断线
+                if mumble_connected and ping_timeout:
+                    mumble_connected = False
+                    print(f"[连接监控 T{tick}] ping超时({ping_ago:.1f}s)，标记断线")
+
+                # 连接状态变化时通知
+                if mumble_connected != self.last_connected:
+                    self.last_connected = mumble_connected
+                    self.connected = mumble_connected
+                    print(f"[连接监控 T{tick}] 连接状态变化: {not mumble_connected} -> {mumble_connected}")
+                    if self.on_connection_change:
+                        self.on_connection_change(mumble_connected)
+
+            except Exception as e:
+                if self._running:
+                    print(f"[连接监控] 错误: {e}")
+            time.sleep(1)
 
     def setup_audio(self, input_device=None, output_device=None):
         """设置音频设备"""
@@ -268,7 +334,9 @@ class ATCRadioClient:
             print(f"处理接收音频时出错: {e}")
 
     def stop(self):
+        self._running = False
         self.speaking = False
+        self.connected = False
         if self.input_stream:
             self.input_stream.stop_stream()
             self.input_stream.close()
