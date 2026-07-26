@@ -1,10 +1,16 @@
 import json
+import logging
 import os
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                             QPushButton, QSlider, QLineEdit, QComboBox)
+                             QPushButton, QSlider, QLineEdit, QComboBox,
+                             QCheckBox)
 from PyQt6.QtCore import Qt
 from pynput import keyboard
+
+import applog
+
+log = logging.getLogger("设置")
 
 
 class Settings:
@@ -18,6 +24,7 @@ class Settings:
         self.last_username = ""
         # 电台栈：上次用的那组频率，下次启动接着用
         self.radios = []
+        self.debug = False
         self.load_settings()
 
     def load_settings(self):
@@ -32,8 +39,9 @@ class Settings:
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
                     self.radios = data.get("radios", [])
+                    self.debug = bool(data.get("debug", False))
         except Exception as e:
-            print(f"加载设置失败: {e}")
+            log.warning(f"加载设置失败: {e}")
 
     def save_settings(self):
         try:
@@ -45,11 +53,12 @@ class Settings:
                 "output_device_index": self.output_device_index,
                 "last_username": self.last_username,
                 "radios": self.radios,
+                "debug": self.debug,
             }
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
-            print(f"保存设置失败: {e}")
+            log.warning(f"保存设置失败: {e}")
 
 
 class SettingsDialog(QDialog):
@@ -113,6 +122,18 @@ class SettingsDialog(QDialog):
         output_layout.addWidget(QLabel("输出设备:"))
         output_layout.addWidget(self.output_combo)
         layout.addLayout(output_layout)
+
+        # 日志：出问题时让用户能一键找到文件，而不是去解释路径
+        log_layout = QHBoxLayout()
+        self.debug_checkbox = QCheckBox("记录调试信息（重启后生效）")
+        self.debug_checkbox.setChecked(self.settings.debug)
+        self.debug_checkbox.setToolTip(
+            "打开后会把协议细节也写进日志，排查连不上、听不到时用")
+        open_log = QPushButton("打开日志")
+        open_log.clicked.connect(lambda: applog.open_log_folder())
+        log_layout.addWidget(self.debug_checkbox)
+        log_layout.addWidget(open_log)
+        layout.addLayout(log_layout)
 
         button_layout = QHBoxLayout()
         save_button = QPushButton("保存")
@@ -178,5 +199,6 @@ class SettingsDialog(QDialog):
         self.settings.speaker_volume = self.speaker_slider.value()
         self.settings.input_device_index = self.input_combo.currentData()
         self.settings.output_device_index = self.output_combo.currentData()
+        self.settings.debug = self.debug_checkbox.isChecked()
         self.settings.save_settings()
         self.accept()

@@ -13,6 +13,13 @@ import socket
 import struct
 import sys
 import pymumble_py3 as pymumble
+
+import mumblecompat
+
+# pymumble 建 TLS 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，
+# 不补上的话连接线程一起来就抛 AttributeError，界面只会显示成
+# "连接被拒绝"，而实际上 TLS 握手根本没开始
+mumblecompat.install()
 import threading
 import time
 import keyboard
@@ -653,18 +660,25 @@ class MumbleRadioClient:
                         self.on_ptt_change(self.is_talking)
 
                 if self.is_talking:
+                    # 下面这些 continue 会跳过循环末尾的 sleep：按住 PTT 而连接
+                    # 还没就绪时，整个循环满速空转烧掉一个核，所以每处都要等一下
                     if not self.stream or not self.mumble:
+                        time.sleep(0.05)
                         continue
                     try:
                         # ★ 先检查独立连接标记（比 mumble.connected 更可靠）
                         if not self._connection_established.is_set():
                             print("[DEBUG] 连接标记已清除，跳过音频发送")
+                            time.sleep(0.05)
                             continue
                         if not self.mumble.connected > 0:
+                            time.sleep(0.05)
                             continue
                         if not self.mumble.channels:
+                            time.sleep(0.05)
                             continue
                         if not self.mumble.users.myself or not self.mumble.users.myself["channel_id"]:
+                            time.sleep(0.05)
                             continue
 
                         data = self._safe_stream_read(self.CHUNK)
@@ -746,6 +760,15 @@ class MumbleRadioClient:
     # ---------- 清理 ----------
     def cleanup(self):
         self.running = False
+
+        # 先把工作线程收掉，再动音频设备。反过来的话，语音线程可能正卡在
+        # stream.read() 里，而 PyAudio 在别的线程读的时候被 terminate 是 C 层
+        # 崩溃，Python 的 try/except 接不住。
+        for thread in (getattr(self, 'monitor_thread', None),
+                       getattr(self, 'voice_thread', None)):
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+
         try:
             if hasattr(self, 'stream') and self.stream:
                 self.stream.stop_stream()
@@ -761,10 +784,6 @@ class MumbleRadioClient:
                 except Exception:
                     pass
                 self.mumble.stop()
-            if self.monitor_thread and self.monitor_thread.is_alive():
-                self.monitor_thread.join(timeout=1.0)
-            if self.voice_thread and self.voice_thread.is_alive():
-                self.voice_thread.join(timeout=1.0)
             if hasattr(self, 'joystick') and self.joystick:
                 try:
                     self.joystick.quit()
