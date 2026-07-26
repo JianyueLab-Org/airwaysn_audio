@@ -103,6 +103,14 @@ def main():
     check("PTT 熄灭", lambda: window.on_voice_tx(False))
     check("连接状态回报", lambda: window.on_voice_state("online", "测试"))
 
+    def disconnect_indicator():
+        window.on_voice_rx(118000, True, "CES2345")     # 先弄成"正在通话"
+        window.on_connection_change(False)
+        assert "断开" in window.conn_label.text()
+        assert not window.stack.get(118000).currently_rx, "掉线后不该还停在正在通话"
+    check("掉线指示并清掉收发状态", disconnect_indicator)
+    check("恢复连接", lambda: window.on_connection_change(True))
+
     print("持久化：")
     check("电台栈已写进设置", lambda: (_ for _ in ()).throw(AssertionError(
         window.settings.radios)) if len(window.settings.radios) != 2 else None)

@@ -1,10 +1,15 @@
 import request
 import process
+import os
+import sys
+# 将 opus.dll 所在目录（Python 安装目录）加入 PATH，确保 opuslib 能找到原生 Opus 库
+_python_dir = os.path.dirname(sys.executable)
+os.environ['PATH'] = _python_dir + os.pathsep + os.environ.get('PATH', '')
+
 import pymumble_py3 as pymumble
 import threading
 import numpy as np
 import time
-import os
 import wave
 import subprocess
 import io

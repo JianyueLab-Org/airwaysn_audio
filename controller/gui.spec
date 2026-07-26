@@ -3,7 +3,7 @@
 import ctypes.util
 import os
 
-excludes=['torch']
+excludes = ['torch', 'transformers']
 
 
 def find_opus():
@@ -44,6 +44,8 @@ a = Analysis(
     pathex=[],
     binaries=opus_binaries,
     datas=[],
+    # scipy 的那几条隐式导入是给 ATIS 的语音合成用的，ATIS 删掉之后管制端不再
+    # 依赖 scipy，就不用再打进来了
     hiddenimports=[
         'pymumble_py3',
         'google.protobuf',
@@ -51,7 +53,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )

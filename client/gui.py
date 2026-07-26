@@ -106,10 +106,16 @@ class MainWindow(QWidget):
     def setup_ui(self):
         layout = QVBoxLayout()
         
-        # 顶部栏：COM1频率显示
+        # 顶部栏：连接状态 + COM1频率显示
         top_layout = QHBoxLayout()
+        self.connection_indicator = CircleIndicator(active_color=QColor(0, 255, 0))
+        self.connection_label = QLabel("已连接")
+        self.connection_label.setStyleSheet("color: green")
         self.freq_label = QLabel("COM1: -.--- MHz")
         self.settings_button = QPushButton("设置")
+        top_layout.addWidget(self.connection_indicator)
+        top_layout.addWidget(self.connection_label)
+        top_layout.addStretch()
         top_layout.addWidget(self.freq_label)
         top_layout.addWidget(self.settings_button)
         
@@ -139,6 +145,17 @@ class MainWindow(QWidget):
         except:
             self.freq_label.setText("COM1: -.--- MHz")
 
+    def update_connection_status(self, connected):
+        """更新连接状态显示"""
+        if connected:
+            self.connection_indicator.setActive(True)
+            self.connection_label.setText("已连接")
+            self.connection_label.setStyleSheet("color: green")
+        else:
+            self.connection_indicator.setActive(False)
+            self.connection_label.setText("已断开")
+            self.connection_label.setStyleSheet("color: red")
+
     def update_ptt_status(self, is_talking):
         self.ptt_indicator.setActive(is_talking)
 
@@ -155,8 +172,9 @@ class MainWindow(QWidget):
 class ErrorSignal(QObject):
     error = pyqtSignal(str)
 
-class ConnectSignal(QObject):
+class ConnectionSignal(QObject):
     connected = pyqtSignal()
+    disconnected = pyqtSignal()
 
 class RadioGUI(QMainWindow):
     def __init__(self):
@@ -216,17 +234,20 @@ class RadioGUI(QMainWindow):
         self.main_window = None
         self.client_thread = None
         
-        # 错误和连接成功信号处理
-        
+        # 错误信号处理（仅用于登录阶段错误，跨线程安全）
         self.error_signal = ErrorSignal()
         self.error_signal.error.connect(self.show_error)
-        self.connect_signal = ConnectSignal()
-        self.connect_signal.connected.connect(self.on_connected)
+        
+        # 连接状态信号处理
+        self.connection_signal = ConnectionSignal()
+        self.connection_signal.connected.connect(self.on_connected)
+        self.connection_signal.disconnected.connect(self.on_disconnected)
 
     def show_error(self, message):
-        print(f"显示错误对话框: {message}")
-        QMessageBox.critical(self, "登录错误", message)
-        sys.stderr = sys.__stderr__
+        print(f"显示错误: {message}")
+        # 如果已经有主窗口（即登录成功后断连），不弹模态对话框
+        if not self.main_window:
+            QMessageBox.critical(self, "登录错误", message)
 
     def cleanup_client(self):
         """完全清理客户端及其资源"""
@@ -254,23 +275,37 @@ class RadioGUI(QMainWindow):
         print("客户端资源清理完成")
 
     def on_connected(self):
-        """在主线程中处理连接成功"""
+        """在主线程中处理连接成功（首次连接或重连）"""
         try:
             print("连接成功，正在初始化主窗口...")
             self.login_window.clear_error()
-            # 新增：登录成功后保存账号与密码到设置文件
+            # 保存账号与密码到设置文件
             try:
                 if self.radio_client and self.radio_client.settings:
                     self.radio_client.settings.save_settings()
             except Exception as e:
                 print(f"[DEBUG-GUI] 登录后保存设置失败: {e}")
 
-            # 创建主窗口
+            if self.main_window:
+                # 重连情况：只更新连接状态，不创建新窗口
+                print("重连成功，更新主窗口状态")
+                self.main_window.update_connection_status(True)
+                # 重连时也切一次频道
+                if self.radio_client and self.radio_client._initial_freq is not None:
+                    try:
+                        self.radio_client.switch_channel(
+                            self.radio_client._initial_freq, caller="GUI-重连")
+                    except Exception as e:
+                        print(f"[DEBUG-GUI] 重连频道切换失败: {e}")
+                return
+
+            # 首次连接：创建主窗口
             self.main_window = MainWindow(self.radio_client)
             self.stacked_widget.addWidget(self.main_window)
-            # 切换到主窗口
             self.stacked_widget.setCurrentWidget(self.main_window)
             print("主窗口初始化完成")
+            # 立即点亮连接指示灯，不等 monitor_frequency 首次循环
+            self.main_window.update_connection_status(True)
             
             # 设置 PTT 状态监听函数
             def on_ptt_change(is_talking):
@@ -284,6 +319,24 @@ class RadioGUI(QMainWindow):
                     self.main_window.update_rx_status(is_receiving)
             self.radio_client.on_rx_change = on_rx_change
             
+            # 设置连接状态监听函数（从 monitor_frequency 中回调）
+            def on_connection_change(connected):
+                if self.main_window:
+                    self.main_window.update_connection_status(connected)
+            self.radio_client.on_connection_change = on_connection_change
+
+            # ★ 连接后立即读取频率并切频道（不等 monitor 线程首次循环）
+            try:
+                initial_freq = self.radio_client.aq.get("COM_ACTIVE_FREQUENCY:1")
+                if initial_freq is not None:
+                    print(f"[DEBUG-GUI] 连接成功，初始频率 {initial_freq:.3f} MHz，立即切换到频道")
+                    self.radio_client.switch_channel(initial_freq, caller="GUI-on_connected")
+                    self.radio_client._initial_freq = initial_freq
+                else:
+                    print(f"[DEBUG-GUI] 连接后无法读取 SimConnect 频率")
+            except Exception as e:
+                print(f"[DEBUG-GUI] 初始频率读取/切换异常: {e}")
+
             # 启动监控和语音线程
             self.radio_client.monitor_thread = threading.Thread(target=self.radio_client.monitor_frequency)
             self.radio_client.voice_thread = threading.Thread(target=self.radio_client.handle_voice)
@@ -296,6 +349,12 @@ class RadioGUI(QMainWindow):
             print(f"主窗口初始化失败: {e}")
             self.login_window.show_error(f"初始化失败: {str(e)}")
             self.cleanup_client()
+
+    def on_disconnected(self):
+        """在主线程中处理连接断开（不弹窗，仅更新UI）"""
+        print("Mumble 连接断开")
+        if self.main_window:
+            self.main_window.update_connection_status(False)
 
     def handle_login(self):
         print("开始登录流程")
@@ -317,20 +376,21 @@ class RadioGUI(QMainWindow):
             self.radio_client = MumbleRadioClient("hjdczy.top", username, password, settings=self.settings)
             print("MumbleRadioClient 初始化完成")
             
-            # 设置连接成功回调
+            # Mumble 连接回调：同步更新 radio_client 的独立连接标记
             self.radio_client.mumble.callbacks.set_callback(
                 pymumble.constants.PYMUMBLE_CLBK_CONNECTED, 
-                lambda: self.connect_signal.connected.emit()
+                lambda: (
+                    self.radio_client.set_connection_state(True),
+                    self.connection_signal.connected.emit(),
+                ),
             )
 
-            # 添加连接错误回调
-            def on_reject(error):
-                print(f"连接被拒绝: {error}")
-                self.error_signal.error.emit(str(error))
-            
             self.radio_client.mumble.callbacks.set_callback(
                 pymumble.constants.PYMUMBLE_CLBK_DISCONNECTED,
-                lambda: self.error_signal.error.emit("连接断开")
+                lambda: (
+                    self.radio_client.set_connection_state(False),
+                    self.connection_signal.disconnected.emit(),
+                ),
             )
             
             def run_client():

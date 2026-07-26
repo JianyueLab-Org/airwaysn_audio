@@ -29,6 +29,7 @@ class VoiceSignals(QObject):
     state = pyqtSignal(str, str)
     rx = pyqtSignal(int, bool, str)
     tx = pyqtSignal(bool)
+    connection = pyqtSignal(bool)
 
 
 class RadioRow(QFrame):
@@ -158,6 +159,7 @@ class ControllerWindow(QMainWindow):
         self.signals.state.connect(self.on_voice_state)
         self.signals.rx.connect(self.on_voice_rx)
         self.signals.tx.connect(self.on_voice_tx)
+        self.signals.connection.connect(self.on_connection_change)
 
         self.setup_ui()
         self.setup_ptt()
@@ -205,6 +207,15 @@ class ControllerWindow(QMainWindow):
         layout = QVBoxLayout(page)
 
         top = QHBoxLayout()
+        # 连接状态指示灯：掉线要能一眼看出来，不然管制员会对着死掉的连接一直喊
+        self.conn_indicator = QLabel()
+        self.conn_indicator.setFixedSize(14, 14)
+        self.conn_label = QLabel('已连接')
+        self._set_connection_style(True)
+        top.addWidget(self.conn_indicator)
+        top.addWidget(self.conn_label)
+        top.addSpacing(12)
+
         self.session_label = QLabel('未连接')
         self.session_label.setStyleSheet("font-weight: bold;")
         top.addWidget(self.session_label)
@@ -256,6 +267,13 @@ class ControllerWindow(QMainWindow):
         bottom.addStretch()
         layout.addLayout(bottom)
         return page
+
+    def _set_connection_style(self, connected):
+        color = "#00cc00" if connected else "#cc0000"
+        self.conn_indicator.setStyleSheet(
+            f"background-color: {color}; border-radius: 7px;")
+        self.conn_label.setText('已连接' if connected else '已断开')
+        self.conn_label.setStyleSheet(f"color: {color};")
 
     def _set_ptt_style(self, active):
         color = "#ff3b30" if active else "#808080"
@@ -337,7 +355,8 @@ class ControllerWindow(QMainWindow):
             SERVER, username, password,
             on_state=self.signals.state.emit,
             on_rx=self.signals.rx.emit,
-            on_tx=self.signals.tx.emit)
+            on_tx=self.signals.tx.emit,
+            on_connection_change=self.signals.connection.emit)
         self.voice.set_mic_volume(self.settings.mic_volume)
         self.voice.set_speaker_volume(self.settings.speaker_volume)
         self.voice._input_device = self.settings.input_device_index
@@ -405,6 +424,15 @@ class ControllerWindow(QMainWindow):
     def on_voice_tx(self, active):
         self._set_ptt_style(active)
         self.stack.set_currently_tx(active)
+
+    def on_connection_change(self, connected):
+        self._set_connection_style(connected)
+        if not connected:
+            # 掉线时把所有频率的收发状态灭掉，免得停在"正在通话"上
+            for radio in self.stack:
+                radio.currently_rx = False
+                radio.currently_tx = False
+            self.rebuild_rows()
 
     # ---------- PTT ----------
     def setup_ptt(self):

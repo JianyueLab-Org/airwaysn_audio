@@ -35,6 +35,12 @@ SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
 WHISPER_TARGET_ID = 1          # VoiceTarget 的编号，1-30 任选
 RX_TIMEOUT = 0.5               # 多久没收到话音就认为对方松开了
 CONNECT_TIMEOUT = 15.0
+PING_TIMEOUT = 5.0             # 超过这么久没有 ping 回复就认为断线
+
+# pymumble 默认 10 秒 ping 一次、断线后 10 秒才重连，掉线要很久才能被发现。
+# 调快之后配合下面的 _connection_monitor，断线基本能在几秒内反映到界面上。
+pymumble.mumble.PYMUMBLE_PING_DELAY = 1
+pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
 
 
 class VoiceClient:
@@ -46,13 +52,15 @@ class VoiceClient:
         on_tx(active)
     """
 
-    def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None):
+    def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None,
+                 on_connection_change=None):
         self.server = server
         self.cid = str(cid).strip()
         self.password = password
         self.on_state = on_state
         self.on_rx = on_rx
         self.on_tx = on_tx
+        self.on_connection_change = on_connection_change
 
         self.mumble = None
         self.connected = False
@@ -89,6 +97,9 @@ class VoiceClient:
 
         self._tx_thread = None
         self._rx_monitor = None
+        self._connection_thread = None
+        self._last_connected = False
+        self._last_ping_rcv = time.time()
 
     # ---------- 状态回报 ----------
     def _state(self, state, message):
@@ -139,9 +150,18 @@ class VoiceClient:
             return False
 
         self.running = True
+        # 同步初始状态，避免监控线程第一圈就误报一次状态变化
+        self._last_connected = True
+        self._last_ping_rcv = time.time()
+
         self._rx_monitor = threading.Thread(target=self._rx_monitor_loop, daemon=True)
         self._rx_monitor.start()
+        self._connection_thread = threading.Thread(target=self._connection_monitor, daemon=True)
+        self._connection_thread.start()
+
         self._state('online', f"已连接，账号 {self.cid}")
+        if self.on_connection_change:
+            self.on_connection_change(True)
         return True
 
     def _on_connected(self):
@@ -151,6 +171,40 @@ class VoiceClient:
         if self.running:
             self._state('error', "与语音服务器的连接已断开")
         self.connected = False
+        if self.on_connection_change:
+            self.on_connection_change(False)
+
+    def _connection_monitor(self):
+        """盯着连接是否还活着。
+
+        光看 pymumble 的 connected 标志不够——网线拔掉之后它还会长时间停在
+        "已连接"。所以同时看 ping_stats 里最后一次收到 ping 回复的时间，超过
+        PING_TIMEOUT 就判定断线。
+        """
+        while self.running:
+            try:
+                try:
+                    last_rcv = self.mumble.ping_stats.get('last_rcv', 0)
+                    if last_rcv:
+                        self._last_ping_rcv = last_rcv / 1000.0
+                except Exception:
+                    pass
+
+                alive = bool(self.mumble and self.mumble.connected)
+                if alive and time.time() - self._last_ping_rcv > PING_TIMEOUT:
+                    alive = False
+                    print(f"[语音] ping 超时 {time.time() - self._last_ping_rcv:.1f}s，判定断线")
+
+                if alive != self._last_connected:
+                    self._last_connected = alive
+                    self.connected = alive
+                    print(f"[语音] 连接状态变化: {alive}")
+                    if self.on_connection_change:
+                        self.on_connection_change(alive)
+            except Exception as e:
+                if self.running:
+                    print(f"[语音] 连接监控出错: {e}")
+            time.sleep(1)
 
     def _on_permission_denied(self, event):
         """服务器拒绝某个动作时说明白原因。
@@ -180,11 +234,12 @@ class VoiceClient:
         self.transmitting = False
         self.connected = False
 
-        for thread in (self._tx_thread, self._rx_monitor):
+        for thread in (self._tx_thread, self._rx_monitor, self._connection_thread):
             if thread and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2)
         self._tx_thread = None
         self._rx_monitor = None
+        self._connection_thread = None
 
         self._close_streams()
         if self.audio:
@@ -363,6 +418,9 @@ class VoiceClient:
 
     # ---------- 收 ----------
     def _on_sound(self, user, soundchunk):
+        # 断线重连的空档里 myself 可能还没建立，早期版本在这里崩过
+        if not self.mumble or not self.mumble.users.myself:
+            return
         try:
             if user["name"] == self.mumble.users.myself["name"]:
                 return
@@ -475,6 +533,9 @@ class VoiceClient:
                     audio = np.clip(audio * (self.mic_volume / 100.0),
                                     np.iinfo(np.int16).min,
                                     np.iinfo(np.int16).max).astype(np.int16)
+                    # 断线期间不要往外灌音频，否则会在缓冲里堆积
+                    if not self.connected:
+                        continue
                     self.mumble.sound_output.add_sound(audio.tobytes())
             except Exception as e:
                 print(f"[语音] 录音出错: {e}")
