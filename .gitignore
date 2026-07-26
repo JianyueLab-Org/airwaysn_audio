@@ -4,3 +4,7 @@ tools
 .vscode
 xplane_radio_settings.json
 .venv*
+atis_profile.json
+atis_settings.json
+release/
+*.log

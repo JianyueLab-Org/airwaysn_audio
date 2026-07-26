@@ -1,0 +1,800 @@
+"""通播的测试：METAR 解析、模板渲染、席位模型。
+
+    python -m unittest test_atis -v      （在 atis 目录下运行）
+
+重点在两处容易出错的地方：
+- 每个气象要素的 text / voice 两种形态（对应 vATIS 的 :VOX）
+- 情报字母的推进和范围限制
+"""
+
+import json
+import os
+import tempfile
+import unittest
+
+import metar as metar_module
+import profile as profile_module
+import template as template_module
+import weather
+from metar import Metar
+from profile import Preset, Profile, Station
+
+ZSPD = "ZSPD 251300Z 09004MPS 9999 FEW030 SCT100 25/18 Q1013 NOSIG"
+
+
+class MetarTest(unittest.TestCase):
+
+    def setUp(self):
+        self.metar = Metar(ZSPD)
+
+    def test_station_and_time(self):
+        self.assertEqual(self.metar.station, "ZSPD")
+        self.assertEqual(self.metar.observation_time.text, "251300Z")
+        self.assertEqual(self.metar.observation_time.voice, "time one three zero zero")
+
+    def test_wind_has_both_forms(self):
+        # 文字通播照抄电码，语音要念得出来——这就是 :VOX 的意义
+        self.assertEqual(self.metar.wind.text, "09004MPS")
+        self.assertEqual(self.metar.wind.voice,
+                         "wind zero niner zero at four meters per second")
+
+    def test_visibility_and_clouds(self):
+        self.assertEqual(self.metar.visibility.voice,
+                         "visibility one zero kilometers or more")
+        self.assertEqual(self.metar.clouds.text, "FEW030 SCT100")
+        self.assertEqual(self.metar.clouds.voice, "few three thousand, scattered one zero thousand")
+
+    def test_temperature_and_pressure(self):
+        self.assertEqual(self.metar.temperature.voice, "temperature two five")
+        self.assertEqual(self.metar.dew_point.voice, "dew point one eight")
+        self.assertEqual(self.metar.pressure.voice, "QNH one zero one three hectopascals")
+
+    def test_calm_and_variable_wind(self):
+        self.assertEqual(Metar("ZBAA 251300Z 00000MPS 9999 25/18 Q1013").wind.voice,
+                         "wind calm")
+        self.assertEqual(Metar("ZBAA 251300Z VRB02MPS 9999 25/18 Q1013").wind.voice,
+                         "wind variable at two meters per second")
+
+    def test_gust_and_variation(self):
+        wind = Metar("KLAX 251300Z 26015G25KT 220V300 10SM 25/18 A2992").wind
+        self.assertIn("gusting two five knots", wind.voice)
+        self.assertIn("variable between two two zero and three zero zero", wind.voice)
+
+    def test_negative_temperature(self):
+        parsed = Metar("ZYTX 251300Z 09004MPS 9999 M03/M07 A2992")
+        self.assertEqual(parsed.temperature.voice, "temperature minus three")
+        self.assertIn("altimeter two niner point niner two", parsed.pressure.voice)
+
+    def test_weather_and_rvr(self):
+        parsed = Metar("ZSPD 251300Z 09004MPS 3000 -SHRA R35L/1200 BKN010 25/18 Q1013")
+        self.assertEqual(parsed.present_weather.voice, "light showers of rain")
+        self.assertIn("runway three five", parsed.rvr.voice)
+        self.assertEqual(parsed.visibility.voice, "visibility three kilometers")
+
+    def test_cavok_and_cb(self):
+        self.assertTrue(Metar("ZSPD 251300Z 09004MPS CAVOK 25/18 Q1013").cavok)
+        parsed = Metar("ZSPD 251300Z 09004MPS 9999 BKN020CB 25/18 Q1013")
+        self.assertEqual(parsed.clouds.voice, "broken two thousand cumulonimbus")
+
+    def test_trend_is_separated(self):
+        # NOSIG 之后的内容不该混进气象要素里
+        self.assertEqual(self.metar.trend.text, "NOSIG")
+        self.assertNotIn("NOSIG", self.metar.full_wx().text)
+
+    def test_full_wx_order(self):
+        full = self.metar.full_wx()
+        self.assertEqual(full.text, "09004MPS 9999 FEW030 SCT100 25/18 Q1013")
+        self.assertLess(full.voice.index("wind"), full.voice.index("visibility"))
+        self.assertLess(full.voice.index("visibility"), full.voice.index("QNH"))
+
+    def test_garbage_does_not_explode(self):
+        parsed = Metar("ZSPD 251300Z 09004MPS 9999 XYZZY123 25/18 Q1013")
+        self.assertTrue(parsed.is_valid())
+        self.assertEqual(parsed.temperature.voice, "temperature two five")
+
+    def test_metar_prefix_and_empty(self):
+        self.assertEqual(Metar("METAR " + ZSPD).station, "ZSPD")
+        self.assertFalse(Metar("").is_valid())
+
+
+class TemplateTest(unittest.TestCase):
+
+    def setUp(self):
+        self.metar = Metar(ZSPD)
+        self.context = template_module.build_context(
+            self.metar, facility="ZSPD", letter="B",
+            airport_conditions="跑道 35L 使用中", notams="无")
+
+    def render(self, template):
+        return template_module.render(template, self.context)
+
+    def test_text_uses_raw_and_voice_uses_spoken(self):
+        text, voice = self.render("[WIND]")
+        self.assertEqual(text, "09004MPS")
+        self.assertEqual(voice, "wind zero niner zero at four meters per second")
+
+    def test_vox_suffix_forces_spoken_form_in_text(self):
+        text, _ = self.render("[WIND:VOX]")
+        self.assertEqual(text, "wind zero niner zero at four meters per second")
+
+    def test_aliases_point_at_the_same_value(self):
+        for name in ("[ATIS_LETTER]", "[ATIS_CODE]", "[LETTER]", "[ID]"):
+            self.assertEqual(self.render(name)[0], "B", name)
+        self.assertEqual(self.render("[VIS]")[0], self.render("[PREVAILING_VISIBILITY]")[0])
+
+    def test_free_text_variables(self):
+        self.assertEqual(self.render("[ARPT_COND]")[0], "跑道 35L 使用中")
+        self.assertEqual(self.render("[NOTAMS]")[0], "无")
+
+    def test_closing_can_reference_the_letter(self):
+        _, voice = self.render("[CLOSING]")
+        self.assertIn("information B", voice)
+
+    def test_unknown_variable_is_left_alone(self):
+        text, _ = self.render("[NOPE]")
+        self.assertEqual(text, "[NOPE]", "认不出的变量要留着，方便发现拼错")
+        self.assertEqual(template_module.unknown_variables("[NOPE] [WIND]"), ["NOPE"])
+
+    def test_empty_variables_do_not_leave_debris(self):
+        # 没有 RVR 时不该留下多余的空格和标点
+        text, _ = self.render("[WIND]. [RVR]. [PRESSURE]")
+        self.assertNotIn("  ", text)
+        self.assertNotIn("..", text)
+
+    def test_default_template_renders(self):
+        text, voice = self.render(template_module.DEFAULT_TEMPLATE)
+        self.assertTrue(text.startswith("ZSPD ATIS B"))
+        self.assertIn("跑道 35L 使用中", text)
+        self.assertIn("wind zero niner zero", voice)
+        self.assertIn("information B", voice)
+
+
+class StationTest(unittest.TestCase):
+
+    def test_callsign_by_type(self):
+        self.assertEqual(Station("zspd").callsign, "ZSPD_ATIS")
+        self.assertEqual(Station("ZSPD", atis_type=profile_module.TYPE_DEPARTURE).callsign,
+                         "ZSPD_D_ATIS")
+        self.assertEqual(Station("ZSPD", atis_type=profile_module.TYPE_ARRIVAL).callsign,
+                         "ZSPD_A_ATIS")
+
+    def test_channel_matches_the_network_convention(self):
+        station = Station("ZSPD", frequency="127.850")
+        self.assertEqual(station.frequency_khz, 127850)
+        self.assertEqual(station.channel, "FREQ_127850")
+
+    def test_letter_advances_and_wraps(self):
+        station = Station("ZSPD")
+        self.assertEqual(station.letter, "A")
+        self.assertEqual(station.advance_letter(), "B")
+        station.set_letter("Z")
+        self.assertEqual(station.advance_letter(), "A")
+
+    def test_code_range_limits_the_letters(self):
+        station = Station("ZSPD", code_range=("A", "C"))
+        self.assertEqual(station.letters_in_range(), ["A", "B", "C"])
+        station.letter = "C"
+        self.assertEqual(station.advance_letter(), "A")
+        self.assertFalse(station.set_letter("M"), "范围外的字母不该被接受")
+
+    def test_code_range_can_wrap_past_z(self):
+        station = Station("ZSPD", code_range=("Y", "B"))
+        self.assertEqual(station.letters_in_range(), ["Y", "Z", "A", "B"])
+        station.letter = "Z"
+        self.assertEqual(station.advance_letter(), "A")
+
+
+class ProfileTest(unittest.TestCase):
+
+    def setUp(self):
+        handle, self.path = tempfile.mkstemp(suffix=".json")
+        os.close(handle)
+        os.remove(self.path)
+        self.profile = Profile(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_add_and_reject_duplicates(self):
+        self.profile.add(Station("ZSPD"))
+        with self.assertRaises(ValueError):
+            self.profile.add(Station("ZSPD"))
+        # 类型不同就是不同席位，可以共存
+        self.profile.add(Station("ZSPD", atis_type=profile_module.TYPE_DEPARTURE))
+        self.assertEqual(len(self.profile), 2)
+
+    def test_round_trip(self):
+        station = Station("ZSPD", "浦东", "127.850", code_range=("A", "M"))
+        station.presets = [Preset("白天", "[FACILITY] [ATIS_LETTER]", "跑道 35L")]
+        station.advance_letter()
+        self.profile.add(station)
+        self.profile.save()
+
+        restored = Profile(self.path)
+        self.assertEqual(len(restored), 1)
+        loaded = restored.get("ZSPD_ATIS")
+        self.assertEqual(loaded.name, "浦东")
+        self.assertEqual(loaded.frequency, "127.850")
+        self.assertEqual(loaded.letter, "B")
+        self.assertEqual(loaded.code_range, ("A", "M"))
+        self.assertEqual(loaded.presets[0].airport_conditions, "跑道 35L")
+
+    def test_bad_entries_are_skipped(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"stations": [{"identifier": "ZSPD"}, {"nope": 1}]}, f)
+        restored = Profile(self.path)
+        self.assertEqual(len(restored), 1)
+
+
+VATIS_PROFILE = {
+    "name": "測試配置",
+    "id": "9d1f5c3a-0000-4000-8000-000000000001",
+    "stations": [
+        {
+            "id": "s1",
+            "identifier": "KLAX",
+            "name": "Los Angeles Intl",
+            "atisType": "Combined",
+            "codeRange": {"low": "A", "high": "M"},
+            "frequency": 133800000,
+            "idsEndpoint": "https://ids.example/api",
+            "atisFormat": {"surfaceWind": {"speakLeadingZero": True}},
+            "presets": [
+                {"id": "p2", "ordinal": 1, "name": "夜间",
+                 "template": "[FACILITY] ATIS [ATIS_LETTER]. [WX]. @RWY_CLOSED",
+                 "airportConditions": "", "notams": "TWY B CLOSED"},
+                {"id": "p1", "ordinal": 0, "name": "白天",
+                 "template": "[FACILITY] ATIS [ATIS_LETTER]. [WX]. [ARPT_COND]",
+                 "airportConditions": "RWY 25L IN USE", "notams": ""},
+            ],
+            "contractions": [
+                {"variableName": "RWY_CLOSED", "text": "RWY 07L CLSD",
+                 "voice": "runway zero seven left closed"},
+            ],
+        },
+        {
+            "id": "s2",
+            "identifier": "KLAX",
+            "name": "Los Angeles Departure",
+            "atisType": "Departure",
+            "codeRange": {"low": "N", "high": "Z"},
+            "frequency": 135650000,
+            "presets": [{"name": "默认", "template": "[FACILITY] [ATIS_LETTER]"}],
+        },
+    ],
+}
+
+
+class VatisImportTest(unittest.TestCase):
+
+    def setUp(self):
+        import vatis_import
+        self.module = vatis_import
+        handle, self.path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(handle, "w", encoding="utf-8") as f:
+            json.dump(VATIS_PROFILE, f)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_frequency_is_hertz(self):
+        # vATIS 存的是赫兹，133800000 就是 133.800
+        self.assertEqual(self.module.parse_frequency(133800000), "133.800")
+        self.assertEqual(self.module.parse_frequency(118000), "118.000")   # 千赫
+        self.assertEqual(self.module.parse_frequency(127.85), "127.850")   # 兆赫
+
+    def test_frequency_out_of_range_is_rejected(self):
+        for bad in (99000000, 250000000, "abc"):
+            with self.assertRaises(self.module.ImportError_, msg=str(bad)):
+                self.module.parse_frequency(bad)
+
+    def test_imports_stations(self):
+        name, stations, _ = self.module.load_profile(self.path)
+        self.assertEqual(name, "測試配置")
+        self.assertEqual([s.callsign for s in stations],
+                         ["KLAX_ATIS", "KLAX_D_ATIS"])
+        self.assertEqual(stations[0].frequency, "133.800")
+        self.assertEqual(stations[0].code_range, ("A", "M"))
+        self.assertEqual(stations[1].code_range, ("N", "Z"))
+
+    def test_presets_keep_order_and_content(self):
+        _, stations, _ = self.module.load_profile(self.path)
+        presets = stations[0].presets
+        self.assertEqual([p.name for p in presets], ["白天", "夜间"],
+                         "应当按 ordinal 排序")
+        self.assertEqual(presets[0].airport_conditions, "RWY 25L IN USE")
+        self.assertEqual(presets[1].notams, "TWY B CLOSED")
+
+    def test_contractions_are_imported_and_expand(self):
+        _, stations, _ = self.module.load_profile(self.path)
+        station = stations[0]
+        self.assertEqual(station.contractions["RWY_CLOSED"][1],
+                         "runway zero seven left closed")
+
+        context = template_module.build_context(Metar(ZSPD), "KLAX", "A")
+        text, voice = template_module.render(
+            station.presets[1].template, context, station.contractions)
+        self.assertIn("RWY 07L CLSD", text, "文字形态")
+        self.assertIn("runway zero seven left closed", voice, "语音形态")
+
+    def test_unsupported_settings_are_reported(self):
+        _, _, notes = self.module.load_profile(self.path)
+        joined = " ".join(notes)
+        self.assertIn("IDS", joined, "没有对应功能的设置要说出来，别让人以为全导进来了")
+
+    def test_old_profiles_use_composites(self):
+        self.write({"name": "旧版", "composites": VATIS_PROFILE["stations"][:1]})
+        _, stations, _ = self.module.load_profile(self.path)
+        self.assertEqual(stations[0].callsign, "KLAX_ATIS")
+
+    def test_numeric_atis_type(self):
+        entry = dict(VATIS_PROFILE["stations"][0], atisType=1)
+        self.write({"stations": [entry]})
+        _, stations, _ = self.module.load_profile(self.path)
+        self.assertEqual(stations[0].atis_type, profile_module.TYPE_DEPARTURE)
+
+    def test_bad_station_is_skipped_not_fatal(self):
+        entry = dict(VATIS_PROFILE["stations"][0])
+        self.write({"stations": [{"identifier": ""}, entry]})
+        _, stations, notes = self.module.load_profile(self.path)
+        self.assertEqual(len(stations), 1)
+        self.assertTrue(any("无法导入" in n for n in notes))
+
+    def test_helpful_errors(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        with self.assertRaises(self.module.ImportError_):
+            self.module.load_profile(self.path)
+
+        self.write({"name": "空的"})
+        with self.assertRaises(self.module.ImportError_):
+            self.module.load_profile(self.path)
+
+
+class FsdCallsignTest(unittest.TestCase):
+    """呼号规则来自 can-fsd 的 IsValidCallsign / IsATISCallsign。"""
+
+    def setUp(self):
+        import fsdclient
+        self.module = fsdclient
+
+    def test_combined_callsign_is_accepted(self):
+        self.assertIsNone(self.module.callsign_problem("ZSPD_ATIS"))
+
+    def test_departure_callsign_is_too_long(self):
+        # ZSPD_D_ATIS 有 11 个字符，服务端上限是 10 —— 会被直接拒登
+        problem = self.module.callsign_problem("ZSPD_D_ATIS")
+        self.assertIsNotNone(problem)
+        self.assertIn("11", problem)
+
+    def test_must_end_with_atis(self):
+        self.assertIn("_ATIS", self.module.callsign_problem("ZSPD_TWR"))
+
+    def test_bad_characters(self):
+        self.assertIsNotNone(self.module.callsign_problem("ZS PD_ATIS"))
+
+
+class FsdProtocolTest(unittest.TestCase):
+    """对着按 can-fsd 包格式应答的假服务端跑一遍，验的是"能不能和真服务端对上"。"""
+
+    def setUp(self):
+        import fsdclient
+        self.module = fsdclient
+
+    def make_server(self, reject=False):
+        import socket
+        import threading
+
+        class FakeServer(threading.Thread):
+            def __init__(self):
+                super().__init__(daemon=True)
+                self.listener = socket.socket()
+                self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.listener.bind(("127.0.0.1", 0))
+                self.listener.listen(1)
+                self.port = self.listener.getsockname()[1]
+                self.received = []
+                self.position_seen = threading.Event()
+                self.running = True
+                self._conn = None
+
+            def send(self, packet):
+                if self._conn:
+                    self._conn.sendall((packet + "\r\n").encode())
+
+            def run(self):
+                try:
+                    conn, _ = self.listener.accept()
+                except OSError:
+                    return
+                self._conn = conn
+                conn.settimeout(0.5)
+                self.send("$DISERVER:CLIENT:VATSIM FSD V3.41b:abc123")
+                buffer = b""
+                while self.running:
+                    try:
+                        chunk = conn.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        packet = line.decode().strip()
+                        if packet:
+                            self.handle(packet)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+            def handle(self, packet):
+                self.received.append(packet)
+                fields = packet.split(":")
+                if packet.startswith("#AA") and reject:
+                    self.send("$ERSERVER:unknown:006::Invalid CID/password.")
+                    return
+                if packet.startswith("$CQ") and len(fields) >= 3 and fields[2] == "CAPS":
+                    self.send(f"$CRSERVER:{packet[3:].split(':')[0]}:CAPS:ATCINFO=1")
+                    return
+                if packet.startswith("$AX") and len(fields) >= 4 and fields[2] == "METAR":
+                    callsign = packet[3:].split(":")[0]
+                    self.send(f"$ARserver:{callsign}:METAR:{fields[3]} 251300Z "
+                              f"09004MPS 9999 25/18 Q1013")
+                    return
+                if packet.startswith("%"):
+                    self.position_seen.set()
+
+            def stop(self):
+                self.running = False
+                try:
+                    self.listener.close()
+                except OSError:
+                    pass
+
+            def packets(self, prefix):
+                return [p for p in self.received if p.startswith(prefix)]
+
+        server = FakeServer()
+        server.start()
+        self.addCleanup(server.stop)
+        return server
+
+    def make_client(self, server, **kwargs):
+        client = self.module.FSDClient(
+            "127.0.0.1", "ZSPD_ATIS", "1005", "secret", "127.850",
+            real_name="Test", port=server.port,
+            latitude=31.1434, longitude=121.805,
+            atis_lines=["ZSPD ATIS A", "WIND CALM"], **kwargs)
+        self.addCleanup(client.stop)
+        client.start()
+        return client
+
+    def wait(self, predicate, timeout=10):
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_frequency_wire_encoding(self):
+        # can-fsd 的 formatFrequency 反过来：包里 "27850" → 显示 127.850
+        self.assertEqual(self.module.encode_frequency("127.850"), "27850")
+        self.assertEqual(self.module.encode_frequency("118.000"), "18000")
+
+    def test_login_packets(self):
+        server = self.make_server()
+        client = self.make_client(server)
+        self.assertTrue(server.position_seen.wait(10), "没有等到位置包")
+
+        ident = server.packets("$ID")[0].split(":")
+        self.assertEqual(ident[0], "$IDZSPD_ATIS")
+        self.assertEqual(ident[6], "1005")
+        self.assertEqual(len(ident), 8, "第 9 个字段（质询）必须留空，否则服务端会发 $ZC")
+
+        add = server.packets("#AA")[0].split(":")
+        self.assertEqual(add[3], "1005")
+        self.assertEqual(add[4], "secret")
+        self.assertEqual(add[5], str(self.module.RATING_OBSERVER))
+
+    def test_position_layout(self):
+        server = self.make_server()
+        self.make_client(server)
+        self.assertTrue(server.position_seen.wait(10))
+
+        # %callsign:frequency:facility:visRange:rating:lat:lon:0
+        position = server.packets("%")[0].split(":")
+        self.assertEqual(position[1], "27850")
+        self.assertEqual(position[2], str(self.module.FACILITY_ATIS))
+        self.assertAlmostEqual(float(position[5]), 31.1434, places=4)
+        self.assertEqual(position[7], "0")
+
+    def test_answers_pilot_atis_query(self):
+        server = self.make_server()
+        self.make_client(server)
+        self.assertTrue(server.position_seen.wait(10))
+
+        server.send("$CQCES2345:ZSPD_ATIS:ATIS")
+        self.assertTrue(self.wait(lambda: server.packets("$CRZSPD_ATIS:CES2345")))
+        replies = server.packets("$CRZSPD_ATIS:CES2345")
+        self.assertEqual(replies[0], "$CRZSPD_ATIS:CES2345:ATIS:T:ZSPD ATIS A")
+        self.assertEqual(replies[-1], "$CRZSPD_ATIS:CES2345:ATIS:E:2")
+
+    def test_metar_round_trip(self):
+        server = self.make_server()
+        client = self.make_client(server)
+        self.assertTrue(self.wait(lambda: client.connected))
+
+        report = client.request_metar("ZSPD", timeout=10)
+        self.assertIsNotNone(report, "没有拿到 $AR 回来的报文")
+        self.assertTrue(report.startswith("ZSPD 251300Z"))
+
+    def test_error_after_login_does_not_drop_connection(self):
+        server = self.make_server()
+        client = self.make_client(server)
+        self.assertTrue(server.position_seen.wait(10))
+
+        server.send("$ERserver:ZSPD_ATIS:012::No METAR available for ZZZZ")
+        import time
+        time.sleep(1)
+        self.assertTrue(client.thread.is_alive(), "登录后的 $ER 不该把连接拆掉")
+
+    def test_rejected_login_reports_reason(self):
+        server = self.make_server(reject=True)
+        states = []
+        self.make_client(server, on_status=lambda s, m: states.append((s, m)))
+        self.assertTrue(self.wait(lambda: any(s == 'error' for s, _ in states)))
+        self.assertIn("Invalid CID/password", [m for s, m in states if s == 'error'][0])
+
+    def test_logoff_packet(self):
+        server = self.make_server()
+        client = self.make_client(server)
+        self.assertTrue(server.position_seen.wait(10))
+        client.stop()
+        self.assertTrue(self.wait(lambda: server.packets("#DA")))
+        self.assertEqual(server.packets("#DA")[0], "#DAZSPD_ATIS:1005")
+
+
+DATAFEED = {
+    "controllers": [
+        {"cid": "1000", "callsign": "RJTT_TWR", "rating": 5},
+        {"cid": "1007", "callsign": "ZSPD_APP", "rating": 4},
+    ],
+    "atis": [
+        {"cid": "1009", "callsign": "ZBAA_ATIS", "rating": 2},
+    ],
+}
+
+
+class RatingLookupTest(unittest.TestCase):
+    """通播的等级要跟本人此刻的管制席位一致，写死 OBS 会显示成观察员。"""
+
+    def setUp(self):
+        import datafeed
+        self.module = datafeed
+
+    def test_finds_the_rating_of_a_controller(self):
+        self.assertEqual(self.module.rating_for("1000", data=DATAFEED), 5)
+
+    def test_also_looks_in_atis_stations(self):
+        self.assertEqual(self.module.rating_for("1009", data=DATAFEED), 2)
+
+    def test_absent_cid_returns_none(self):
+        # 人不在线时查不到，调用方退回配置里的值
+        self.assertIsNone(self.module.rating_for("9999", data=DATAFEED))
+
+    def test_blank_cid(self):
+        self.assertIsNone(self.module.rating_for("", data=DATAFEED))
+
+    def test_bad_rating_is_ignored(self):
+        data = {"controllers": [{"cid": "1000", "rating": "abc"},
+                                {"cid": "1000", "callsign": "X_TWR", "rating": 3}]}
+        self.assertEqual(self.module.rating_for("1000", data=data), 3)
+
+    def test_empty_datafeed(self):
+        self.assertIsNone(self.module.rating_for("1000", data={}))
+        self.assertIsNone(self.module.rating_for("1000", data=None, url="http://0.0.0.0:1"))
+
+
+class ControllerGateTest(unittest.TestCase):
+    """没在管制就不该挂通播，否则会留下无人值守的通播席位。"""
+
+    def setUp(self):
+        import datafeed
+        self.module = datafeed
+
+    def feed(self, **kwargs):
+        data = {"controllers": [], "atis": []}
+        data.update(kwargs)
+        return data
+
+    def test_active_controller_passes(self):
+        data = self.feed(controllers=[
+            {"cid": "1000", "callsign": "RJTT_TWR", "facility": 4, "rating": 5}])
+        entry = self.module.controller_for("1000", data=data)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["callsign"], "RJTT_TWR")
+
+    def test_observer_does_not_count(self):
+        # 判定和 can-fsd 的 handleQueryATC 一致：facility 要高于观察员
+        data = self.feed(controllers=[
+            {"cid": "1000", "callsign": "RJTT_OBS", "facility": 0, "rating": 1}])
+        self.assertIsNone(self.module.controller_for("1000", data=data))
+
+    def test_an_existing_atis_does_not_count(self):
+        data = self.feed(atis=[
+            {"cid": "1000", "callsign": "RJAA_ATIS", "facility": 7, "rating": 5}])
+        self.assertIsNone(self.module.controller_for("1000", data=data),
+                          "已经开着的通播不能当作在管制")
+
+    def test_someone_else_controlling_does_not_count(self):
+        data = self.feed(controllers=[
+            {"cid": "1007", "callsign": "RJTT_TWR", "facility": 4, "rating": 5}])
+        self.assertIsNone(self.module.controller_for("1000", data=data))
+
+    def test_missing_facility_is_treated_as_observer(self):
+        data = self.feed(controllers=[{"cid": "1000", "callsign": "X"}])
+        self.assertIsNone(self.module.controller_for("1000", data=data))
+
+    def test_no_data_returns_none(self):
+        self.assertIsNone(self.module.controller_for("1000", data={}))
+
+
+class AutoRatingTest(unittest.TestCase):
+    """FSDClient 的 rating=None 表示自动，登录前查一次。"""
+
+    def setUp(self):
+        import fsdclient
+        self.module = fsdclient
+
+    def test_explicit_rating_is_kept(self):
+        client = self.module.FSDClient("h", "ZSPD_ATIS", "1", "p", "118.000", rating=5)
+        self.assertEqual(client.rating, 5)
+
+    def test_auto_defers_until_connect(self):
+        client = self.module.FSDClient("h", "ZSPD_ATIS", "1", "p", "118.000",
+                                       rating=0, rating_lookup=lambda: 5)
+        self.assertIsNone(client.rating, "连接之前不该定下来")
+
+    def test_lookup_failure_falls_back_to_observer(self):
+        def explode():
+            raise RuntimeError("数据源挂了")
+        client = self.module.FSDClient("h", "ZSPD_ATIS", "1", "p", "118.000",
+                                       rating=None, rating_lookup=explode)
+        client.running = True
+        client._connect()          # 连不上，但等级应当已经定好
+        self.assertEqual(client.rating, self.module.RATING_OBSERVER,
+                         "查不到就退回 OBS，不能让播出起不来")
+
+
+class AirportPositionTest(unittest.TestCase):
+    """席位不填坐标就会落在 0/0——几内亚湾外海。"""
+
+    def setUp(self):
+        import airports
+        self.airports = airports
+
+    def test_known_airports(self):
+        self.assertEqual(self.airports.coordinates("RJAA"), (35.76694, 140.38778))
+        self.assertEqual(self.airports.coordinates("zspd"), (31.14233, 121.79084))
+
+    def test_unknown_airport(self):
+        self.assertIsNone(self.airports.coordinates("XXXX"))
+        self.assertIsNone(self.airports.coordinates(""))
+
+    def test_station_fills_its_position_from_the_icao(self):
+        station = Station("RJAA", frequency="128.250")
+        self.assertAlmostEqual(station.latitude, 35.76694, places=4)
+        self.assertAlmostEqual(station.longitude, 140.38778, places=4)
+
+    def test_manual_position_wins(self):
+        station = Station("RJAA", frequency="128.250",
+                          latitude=35.5, longitude=140.1)
+        self.assertEqual(station.latitude, 35.5)
+
+    def test_unknown_airport_leaves_zero(self):
+        station = Station("XXXX", frequency="128.250")
+        self.assertEqual((station.latitude, station.longitude), (0.0, 0.0))
+
+    def test_position_survives_a_round_trip(self):
+        station = Station("RJAA", frequency="128.250")
+        restored = Station.from_dict(station.to_dict())
+        self.assertAlmostEqual(restored.latitude, 35.76694, places=4)
+
+
+class SettingsTest(unittest.TestCase):
+    """FSD 和语音是两台不同的服务器，配错了会一直连不上。"""
+
+    def setUp(self):
+        import settings as settings_module
+        self.module = settings_module
+        self.previous_cwd = os.getcwd()
+        self.temp = tempfile.mkdtemp(prefix="atis_settings_")
+        os.chdir(self.temp)
+        self.addCleanup(lambda: os.chdir(self.previous_cwd))
+
+    def write(self, data):
+        with open("atis_settings.json", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_default_fsd_host(self):
+        self.assertEqual(self.module.Settings().fsd_host, "fsd.airwaysn.org")
+        self.assertEqual(self.module.Settings().fsd_port, 6809)
+
+    def test_migrates_the_voice_host_away(self):
+        # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD
+        self.write({"fsd_host": "hjdczy.top"})
+        self.assertEqual(self.module.Settings().fsd_host, "fsd.airwaysn.org")
+
+    def test_keeps_a_deliberate_override(self):
+        self.write({"fsd_host": "127.0.0.1", "fsd_port": 16809})
+        settings = self.module.Settings()
+        self.assertEqual(settings.fsd_host, "127.0.0.1")
+        self.assertEqual(settings.fsd_port, 16809)
+
+
+class ResampleTest(unittest.TestCase):
+    """语音合成出来的采样率不一定是 48kHz，送进 Mumble 前要转换。"""
+
+    def setUp(self):
+        # broadcast 会拉起 pymumble，缺 opus 原生库时用替身放行
+        import sys
+        from unittest import mock
+        try:
+            import opuslib  # noqa: F401
+        except Exception:
+            for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                         "opuslib.api.encoder", "opuslib.api.info",
+                         "opuslib.exceptions"):
+                sys.modules.setdefault(name, mock.MagicMock())
+        global broadcast
+        import broadcast
+
+    def test_length_scales_with_rate(self):
+        import numpy as np
+        audio = np.zeros(22050, dtype=np.int16)
+        out = broadcast.resample(audio, 22050, 48000)
+        self.assertEqual(len(out), 48000, "1 秒的音频重采样后还该是 1 秒")
+
+    def test_same_rate_is_untouched(self):
+        import numpy as np
+        audio = np.arange(10, dtype=np.int16)
+        self.assertIs(broadcast.resample(audio, 48000, 48000), audio)
+
+    def test_signal_shape_is_preserved(self):
+        import numpy as np
+        source = np.linspace(0, 1000, 1000)
+        out = broadcast.resample(source, 8000, 16000)
+        self.assertAlmostEqual(out[0], source[0], places=3)
+        self.assertAlmostEqual(out[-1], source[-1], places=3)
+        self.assertTrue(np.all(np.diff(out) >= 0), "单调上升的信号不该出现回折")
+
+    def test_empty_input(self):
+        import numpy as np
+        self.assertEqual(len(broadcast.resample(np.zeros(0), 22050, 48000)), 0)
+
+
+class WeatherFetchTest(unittest.TestCase):
+
+    def test_normalize_strips_prefix_and_checks_station(self):
+        self.assertEqual(weather.normalize("METAR " + ZSPD, "ZSPD"), ZSPD)
+        self.assertIsNone(weather.normalize("ZBAA 251300Z", "ZSPD"))
+
+    def test_bad_icao_is_rejected_before_any_request(self):
+        with self.assertRaises(weather.WeatherError):
+            weather.fetch_metar("ZS")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

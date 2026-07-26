@@ -1,0 +1,173 @@
+import logging
+import json
+import os
+
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QLineEdit, QCheckBox, QComboBox)
+
+import applog
+import datafeed
+import weather
+
+log = logging.getLogger("设置")
+
+DEFAULT_FSD_HOST = "fsd.airwaysn.org"
+DEFAULT_FSD_PORT = 6809
+
+# 早期版本把 FSD 主机错填成了语音服务器的地址。那台机器上没有 FSD，
+# 留着只会一直连不上，所以读配置时直接换掉。
+WRONG_FSD_HOSTS = {"hjdczy.top"}
+
+
+class Settings:
+    def __init__(self):
+        self.config_file = "atis_settings.json"
+        self.cid = ""
+        self.metar_url = weather.DEFAULT_METAR_URL
+        # FSD 服务端：席位靠它出现在网络上，气象也从它那里要。
+        # 和语音服务器（hjdczy.top:64738）不是同一台。
+        self.fsd_host = DEFAULT_FSD_HOST
+        self.fsd_port = DEFAULT_FSD_PORT
+        self.real_name = ""
+        self.connect_fsd = True
+        # FSD 登录用的等级。0 表示自动：登录前从数据源查本人此刻的等级，
+        # 这样通播和管制席位显示的等级一致；查不到就退回 OBS。
+        self.rating = 0
+        self.datafeed_url = datafeed.DEFAULT_DATAFEED_URL
+        self.debug = False
+        self.load_settings()
+
+    def load_settings(self):
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.cid = data.get("cid", "")
+                self.metar_url = data.get("metar_url") or weather.DEFAULT_METAR_URL
+                self.fsd_host = data.get("fsd_host") or DEFAULT_FSD_HOST
+                if self.fsd_host in WRONG_FSD_HOSTS:
+                    log.warning("配置里的 FSD 地址 %s 是语音服务器，已改为 %s",
+                                self.fsd_host, DEFAULT_FSD_HOST)
+                    self.fsd_host = DEFAULT_FSD_HOST
+                self.fsd_port = int(data.get("fsd_port") or DEFAULT_FSD_PORT)
+                self.real_name = data.get("real_name", "")
+                self.connect_fsd = bool(data.get("connect_fsd", True))
+                self.rating = int(data.get("rating") or 0)
+                self.datafeed_url = (data.get("datafeed_url")
+                                     or datafeed.DEFAULT_DATAFEED_URL)
+                self.debug = bool(data.get("debug", False))
+        except Exception as e:
+            log.warning(f"加载设置失败: {e}")
+
+    def save_settings(self):
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "cid": self.cid,
+                    "metar_url": self.metar_url,
+                    "fsd_host": self.fsd_host,
+                    "fsd_port": self.fsd_port,
+                    "real_name": self.real_name,
+                    "connect_fsd": self.connect_fsd,
+                    "rating": self.rating,
+                    "datafeed_url": self.datafeed_url,
+                    "debug": self.debug,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"保存设置失败: {e}")
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(460)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.connect_fsd = QCheckBox("播出时同时登录 FSD"
+                                     "（席位出现在在线列表，并回答文字通播查询）")
+        self.connect_fsd.setChecked(self.settings.connect_fsd)
+        layout.addWidget(self.connect_fsd)
+
+        fsd_row = QHBoxLayout()
+        self.fsd_host_input = QLineEdit(self.settings.fsd_host)
+        self.fsd_port_input = QLineEdit(str(self.settings.fsd_port))
+        self.fsd_port_input.setFixedWidth(70)
+        fsd_row.addWidget(QLabel("FSD 服务器:"))
+        fsd_row.addWidget(self.fsd_host_input)
+        fsd_row.addWidget(QLabel("端口:"))
+        fsd_row.addWidget(self.fsd_port_input)
+        layout.addLayout(fsd_row)
+
+        rating_row = QHBoxLayout()
+        self.rating_input = QComboBox()
+        for value, label in ((0, "自动（按 CID 从数据源获取）"),
+                             (1, "OBS 观察员"), (2, "S1"), (3, "S2"), (4, "S3"),
+                             (5, "C1"), (7, "C3"), (8, "I1"), (10, "I3")):
+            self.rating_input.addItem(label if value == 0 else f"{value}  {label}",
+                                      value)
+        index = self.rating_input.findData(self.settings.rating)
+        self.rating_input.setCurrentIndex(index if index >= 0 else 0)
+        rating_row.addWidget(QLabel("登录等级:"))
+        rating_row.addWidget(self.rating_input)
+        rating_row.addWidget(QLabel("（不能高于本人实际等级）"))
+        layout.addLayout(rating_row)
+
+        name_row = QHBoxLayout()
+        self.real_name_input = QLineEdit(self.settings.real_name)
+        self.real_name_input.setPlaceholderText("登录 FSD 时显示的姓名")
+        name_row.addWidget(QLabel("真实姓名:"))
+        name_row.addWidget(self.real_name_input)
+        layout.addLayout(name_row)
+
+        row = QHBoxLayout()
+        self.metar_input = QLineEdit(self.settings.metar_url)
+        self.metar_input.setPlaceholderText(weather.DEFAULT_METAR_URL)
+        row.addWidget(QLabel("备用气象源:"))
+        row.addWidget(self.metar_input)
+        layout.addLayout(row)
+
+        hint = QLabel("登录 FSD 之后天气直接向自己的服务器要（$AX）；这个地址只在"
+                      "还没连上 FSD 时用来预览，机场代码会直接拼在后面。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #777777;")
+        layout.addWidget(hint)
+
+        # 日志：出问题时让用户能一键找到文件，而不是去解释路径
+        log_row = QHBoxLayout()
+        self.debug_checkbox = QCheckBox("记录调试信息（重启后生效）")
+        self.debug_checkbox.setChecked(self.settings.debug)
+        self.debug_checkbox.setToolTip("打开后连 FSD 收发的每个包都会记下来")
+        open_log = QPushButton("打开日志")
+        open_log.clicked.connect(lambda: applog.open_log_folder())
+        log_row.addWidget(self.debug_checkbox)
+        log_row.addWidget(open_log)
+        layout.addLayout(log_row)
+
+        buttons = QHBoxLayout()
+        save = QPushButton("保存")
+        save.clicked.connect(self.save_and_close)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+    def save_and_close(self):
+        self.settings.metar_url = (self.metar_input.text().strip()
+                                   or weather.DEFAULT_METAR_URL)
+        self.settings.connect_fsd = self.connect_fsd.isChecked()
+        self.settings.fsd_host = self.fsd_host_input.text().strip() or DEFAULT_FSD_HOST
+        try:
+            self.settings.fsd_port = int(self.fsd_port_input.text().strip())
+        except ValueError:
+            self.settings.fsd_port = DEFAULT_FSD_PORT
+        self.settings.real_name = self.real_name_input.text().strip()
+        self.settings.rating = self.rating_input.currentData()
+        self.settings.debug = self.debug_checkbox.isChecked()
+        self.settings.save_settings()
+        self.accept()

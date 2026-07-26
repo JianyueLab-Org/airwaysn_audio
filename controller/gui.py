@@ -4,7 +4,10 @@
 有 RX / TX / XC 开关和音量，按住 PTT 时对所有开了 TX 的频率一起发话。
 """
 
+import logging
+import os
 import sys
+import threading
 import time
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
@@ -15,13 +18,29 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QScrollArea, QSizePolicy)
 from pynput import keyboard
 
+import applog
 import radiostack
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
 from voice import VoiceClient
 
-icon_path = r".\favicon.ico"
+log = logging.getLogger("界面")
+
 SERVER = "hjdczy.top"
+
+
+def resource_path(name):
+    """找随程序一起分发的资源。
+
+    打包之后当前目录是用户双击时所在的目录，不是程序目录，用相对路径取图标
+    会取不到（Qt 不会报错，只是默默用默认图标）。PyInstaller 把 datas 解到
+    sys._MEIPASS。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+icon_path = resource_path("favicon.ico")
 
 
 class VoiceSignals(QObject):
@@ -285,7 +304,10 @@ class ControllerWindow(QMainWindow):
         """栈变了：重画界面、推给服务器、存盘。"""
         self.rebuild_rows()
         if self.voice:
-            self.voice.sync(self.stack)
+            # sync 要建频道、发协议消息，新频道那里还有 0.2 秒等待——放在界面
+            # 线程里做的话，每加一个频率界面就会卡一下
+            threading.Thread(target=self.voice.sync, args=(self.stack,),
+                             daemon=True).start()
         self.settings.radios = self.stack.to_list()
         self.settings.save_settings()
 
@@ -363,6 +385,10 @@ class ControllerWindow(QMainWindow):
         self.voice._output_device = self.settings.output_device_index
 
         if not self.voice.connect():
+            # 必须显式收尾：connect 失败时 PyAudio 已经建好了，pymumble 线程也
+            # 可能还在（reconnect=True 会一直重试）。只把引用置空的话，每失败
+            # 一次就多一条后台重连线程和一个没释放的音频设备。
+            self.voice.disconnect()
             self.voice = None
             self.connect_button.setEnabled(True)
             return
@@ -372,7 +398,8 @@ class ControllerWindow(QMainWindow):
         self.settings.save_settings()
         self.session_label.setText(f'{username} · {SERVER}')
         self.pages.setCurrentIndex(1)
-        self.voice.sync(self.stack)
+        threading.Thread(target=self.voice.sync, args=(self.stack,),
+                         daemon=True).start()
         self.update_hint()
 
     def update_hint(self):
@@ -481,12 +508,18 @@ class ControllerWindow(QMainWindow):
             if self.voice:
                 self.voice.disconnect()
         except Exception as e:
-            print(f"关闭时出错: {e}")
+            log.warning(f"关闭时出错: {e}")
         finally:
             event.accept()
 
 
 if __name__ == '__main__':
+    # --debug 会把协议层面的细节也记进日志（进出的频道、发话目标、断线判定）。
+    # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
+    debug = '--debug' in sys.argv or Settings().debug
+    applog.setup(debug=debug)
+    log.info("管制语音客户端启动")
+
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))
     window = ControllerWindow()

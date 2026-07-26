@@ -14,6 +14,10 @@ XC（cross couple，交叉耦合）指把这个频率和其它同样开了 XC �
 这里只有状态，没有任何 I/O —— 语音那一侧在 voice.py。
 """
 
+import logging
+
+log = logging.getLogger("电台栈")
+
 
 def parse_frequency(text):
     """把 "118.000" 这样的频率解析成整数千赫（118000）。"""
@@ -261,7 +265,7 @@ class RadioStack:
             try:
                 self._radios.append(Radio.from_dict(entry))
             except (KeyError, TypeError, ValueError) as e:
-                print(f"[电台栈] 跳过一条无法识别的记录: {e}")
+                log.warning(f"跳过一条无法识别的记录: {e}")
         self._radios.sort(key=lambda r: r.frequency_khz)
         active = [r for r in self._radios if r.rx]
         self.selected_khz = (active or self._radios)[0].frequency_khz if self._radios else None

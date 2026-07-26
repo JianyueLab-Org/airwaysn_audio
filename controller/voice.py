@@ -13,6 +13,7 @@ whisper 那边 `id==1` 时只取第一个频道（mumble.py 里写死的），�
 那个频道）能听到声音，靠 listeners_confirmed 暴露给界面提示用户。
 """
 
+import logging
 import threading
 import time
 
@@ -25,14 +26,82 @@ from pymumble_py3.constants import (
     PYMUMBLE_CLBK_DISCONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
     PYMUMBLE_CLBK_SOUNDRECEIVED,
+    PYMUMBLE_MSG_TYPES_REJECT,
     PYMUMBLE_MSG_TYPES_USERSTATE,
     PYMUMBLE_MSG_TYPES_VOICETARGET,
 )
 
+import mumblecompat
 import radiostack
 
+# pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
+# 否则连接线程一起来就抛 AttributeError
+mumblecompat.install()
+
+log = logging.getLogger("语音")
+
+# Mumble 服务器拒绝时给的类型，逐条翻译成人能看懂的原因。
+# 全都笼统说成"用户名或密码"会把人引到错误的方向——比如认证器挂了的时候，
+# 用户会一直去改密码。
+REJECT_REASONS = {
+    "WrongUserPW": "密码错误",
+    "WrongServerPW": "服务器密码错误",
+    "InvalidUsername": "用户名不符合服务器的规则",
+    "UsernameInUse": "这个用户名已经在线了",
+    "ServerFull": "服务器已满",
+    "NoCertificate": "服务器要求证书",
+    "AuthenticatorFail": "服务端认证器故障（服务器上的 login.py 可能没在运行）",
+    "WrongVersion": "客户端版本不被服务器接受",
+}
+
+class RejectAwareMumble(pymumble.Mumble):
+    """截下服务器的 Reject 消息，把拒绝类型留下来。
+
+    pymumble 处理 Reject 时只把 reason 字段带进异常（mumble.py 的
+    dispatch_control_message），而 Murmur 经常只填 type 不填 reason——于是外面
+    拿到一个空字符串，只能说"没有给出原因"。这里在分发之前先把整条消息读出来，
+    type 才是真正有用的那个字段。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reject_type = None
+        self.reject_reason = None
+
+    def dispatch_control_message(self, type, message):
+        if type == PYMUMBLE_MSG_TYPES_REJECT:
+            try:
+                reject = mumble_pb2.Reject()
+                reject.ParseFromString(message)
+                self.reject_type = mumble_pb2.Reject.RejectType.Name(reject.type)
+                self.reject_reason = reject.reason or ""
+                log.warning("服务器拒绝连接: type=%s reason=%r",
+                            self.reject_type, self.reject_reason)
+            except Exception as e:
+                log.warning("解析 Reject 消息失败: %s", e)
+        return super().dispatch_control_message(type, message)
+
+    def rejection(self):
+        """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
+        if not self.reject_type and not self.reject_reason:
+            return None
+        reason = REJECT_REASONS.get(self.reject_type)
+        if reason and self.reject_reason:
+            return f"{reason}（服务器附言：{self.reject_reason}）"
+        if reason:
+            return reason
+        if self.reject_reason:
+            return self.reject_reason
+        return self.reject_type
+
+
 SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
-WHISPER_TARGET_ID = 1          # VoiceTarget 的编号，1-30 任选
+
+# VoiceTarget 的编号（协议允许 1-30）。PTT 和交叉耦合各用各的：
+# 共用一个编号的话，转发时重编目标会把 PTT 的目标一起改掉，管制员的话音就
+# 发到错误的频率上去了。
+PTT_TARGET_ID = 1
+XC_TARGET_BASE = 10            # 每个 XC 频率一个编号，从这里往后排
 RX_TIMEOUT = 0.5               # 多久没收到话音就认为对方松开了
 CONNECT_TIMEOUT = 15.0
 PING_TIMEOUT = 5.0             # 超过这么久没有 ping 回复就认为断线
@@ -92,6 +161,10 @@ class VoiceClient:
         self._tx_channels = []
         self._xc_channels = []
         self._sent_target = None         # 上次发出去的发话目标，避免重复发
+        self._xc_targets = {}            # 频道 id -> 交叉耦合用的 VoiceTarget 编号
+        # sound_output.target 是全局的一个字段，PTT 和交叉耦合都要改，
+        # 不串起来的话话音会发到错误的频率上
+        self._audio_lock = threading.Lock()
         self._volumes = {}               # frequency_khz -> 0-100
         self._last_rx = {}               # frequency_khz -> 最后收到话音的时间
 
@@ -103,23 +176,23 @@ class VoiceClient:
 
     # ---------- 状态回报 ----------
     def _state(self, state, message):
-        print(f"[语音] {state}: {message}")
+        log.info(f"{state}: {message}")
         if self.on_state:
             try:
                 self.on_state(state, message)
             except Exception as e:
-                print(f"[语音] 状态回调出错: {e}")
+                log.warning(f"状态回调出错: {e}")
 
     # ---------- 连接 ----------
     def connect(self):
         """阻塞式连接。成功返回 True。"""
-        self._state('connecting', f"正在连接 {self.server} …")
+        self._state('connecting', f"正在以 {self.cid} 连接 {self.server} …")
         try:
             self.audio = pyaudio.PyAudio()
             self.RATE = self._find_best_sample_rate()
             self.CHUNK = int(self.RATE * 0.02)
 
-            self.mumble = pymumble.Mumble(self.server, self.cid,
+            self.mumble = RejectAwareMumble(self.server, self.cid,
                                           password=self.password, reconnect=True)
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED, self._on_connected)
@@ -135,12 +208,19 @@ class VoiceClient:
         deadline = time.time() + CONNECT_TIMEOUT
         while not self.connected and time.time() < deadline:
             if not self.mumble.is_alive():
-                self._state('error', "连接被拒绝，请检查用户名或密码")
+                # 线程死了说明服务器主动拒绝了，把真实原因说出来
+                reason = self.mumble.rejection()
+                self._state('error',
+                            f"语音服务器拒绝了 {self.cid}：{reason}" if reason else
+                            f"到 {self.server} 的连接意外中断，"
+                            f"服务器没有说明原因（详见日志）")
                 return False
             time.sleep(0.1)
 
         if not self.connected:
-            self._state('error', "连接超时，可能是用户名或密码错误")
+            reason = self.mumble.rejection()
+            self._state('error', f"连接 {self.server} 超时" +
+                        (f"：{reason}" if reason else "，服务器没有响应"))
             return False
 
         try:
@@ -193,17 +273,17 @@ class VoiceClient:
                 alive = bool(self.mumble and self.mumble.connected)
                 if alive and time.time() - self._last_ping_rcv > PING_TIMEOUT:
                     alive = False
-                    print(f"[语音] ping 超时 {time.time() - self._last_ping_rcv:.1f}s，判定断线")
+                    log.info(f"ping 超时 {time.time() - self._last_ping_rcv:.1f}s，判定断线")
 
                 if alive != self._last_connected:
                     self._last_connected = alive
                     self.connected = alive
-                    print(f"[语音] 连接状态变化: {alive}")
+                    log.info(f"连接状态变化: {alive}")
                     if self.on_connection_change:
                         self.on_connection_change(alive)
             except Exception as e:
                 if self.running:
-                    print(f"[语音] 连接监控出错: {e}")
+                    log.warning(f"连接监控出错: {e}")
             time.sleep(1)
 
     def _on_permission_denied(self, event):
@@ -246,13 +326,13 @@ class VoiceClient:
             try:
                 self.audio.terminate()
             except Exception as e:
-                print(f"[语音] 释放音频设备出错: {e}")
+                log.warning(f"释放音频设备出错: {e}")
             self.audio = None
         if self.mumble:
             try:
                 self.mumble.stop()
             except Exception as e:
-                print(f"[语音] 断开连接出错: {e}")
+                log.warning(f"断开连接出错: {e}")
             self.mumble = None
         self._state('stopped', "已断开")
 
@@ -272,7 +352,7 @@ class VoiceClient:
         for rate in SUPPORTED_SAMPLE_RATES:
             if works(rate):
                 if rate != 48000:
-                    print(f"[语音] 设备不支持 48kHz，退到 {rate} Hz（音调会有偏差）")
+                    log.warning(f"设备不支持 48kHz，退到 {rate} Hz（音调会有偏差）")
                 return rate
         return 48000
 
@@ -306,7 +386,7 @@ class VoiceClient:
                     stream.stop_stream()
                     stream.close()
                 except Exception as e:
-                    print(f"[语音] 关闭{name}出错: {e}")
+                    log.warning(f"关闭{name}出错: {e}")
                 setattr(self, name, None)
 
     def set_mic_volume(self, percent):
@@ -330,10 +410,12 @@ class VoiceClient:
                 time.sleep(0.2)
                 channel = self.mumble.channels.find_by_name(name)
             except Exception as e:
-                print(f"[语音] 无法创建频道 {name}: {e}")
+                log.warning(f"无法创建频道 {name}: {e}")
                 return None
 
         channel_id = channel["channel_id"]
+        log.debug("频率 %s 对应频道 %s (id %s)",
+                  radiostack.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
         return channel_id
@@ -368,13 +450,19 @@ class VoiceClient:
         self._xc_channels = [self._resolve_channel(khz) for khz in stack.xc_frequencies()]
         self._xc_channels = [c for c in self._xc_channels if c is not None]
         self._set_voice_target(self._tx_channels)
+        self._program_cross_couple_targets()
+        log.debug("同步电台栈: 主频率 %s，RX %s，TX %s，XC %s",
+                  radiostack.format_frequency(primary) if primary else "无",
+                  [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
+                  [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
+                  [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
 
     def _join(self, channel_id):
         try:
             if self.mumble.users.myself.get("channel_id") != channel_id:
                 self.mumble.users.myself.move_in(channel_id)
         except Exception as e:
-            print(f"[语音] 进入频道失败: {e}")
+            log.warning(f"进入频道失败: {e}")
 
     def _set_listening(self, channel_ids):
         """频道监听。pymumble 没封装，直接发 UserState。"""
@@ -391,9 +479,41 @@ class VoiceClient:
             for channel_id in remove:
                 state.listening_channel_remove.append(channel_id)
             self.mumble.send_message(PYMUMBLE_MSG_TYPES_USERSTATE, state)
+            log.debug("频道监听 +%s -%s，当前监听 %s",
+                      sorted(add), sorted(remove), sorted(channel_ids))
             self._listening = set(channel_ids)
         except Exception as e:
-            print(f"[语音] 设置频道监听失败: {e}")
+            log.warning(f"设置频道监听失败: {e}")
+
+    def _program_target(self, target_id, channel_ids):
+        """把一组频道编成某个编号的 VoiceTarget。"""
+        if not self.mumble:
+            return
+        try:
+            target = mumble_pb2.VoiceTarget()
+            target.id = target_id
+            for channel_id in channel_ids:
+                entry = target.targets.add()
+                entry.channel_id = channel_id
+            self.mumble.send_message(PYMUMBLE_MSG_TYPES_VOICETARGET, target)
+            log.debug("VoiceTarget %s 设为频道 %s", target_id, list(channel_ids))
+        except Exception as e:
+            log.warning(f"设置发话目标失败: {e}")
+
+    def _program_cross_couple_targets(self):
+        """给每个 XC 频率编一个"发给其它 XC 频率"的目标。
+
+        每个来源一个编号，转发时只要切 target 编号就行，不用重编——否则会和
+        PTT 抢同一个编号。
+        """
+        self._xc_targets = {}
+        if len(self._xc_channels) < 2:
+            return
+        for index, source in enumerate(self._xc_channels):
+            others = [c for c in self._xc_channels if c != source]
+            target_id = XC_TARGET_BASE + index
+            self._program_target(target_id, others)
+            self._xc_targets[source] = target_id
 
     def _set_voice_target(self, channel_ids, force=False):
         """VoiceTarget：一次带上所有要发话的频道。
@@ -406,15 +526,7 @@ class VoiceClient:
         if not force and key == self._sent_target:
             return
         self._sent_target = key
-        try:
-            target = mumble_pb2.VoiceTarget()
-            target.id = WHISPER_TARGET_ID
-            for channel_id in channel_ids:
-                entry = target.targets.add()
-                entry.channel_id = channel_id
-            self.mumble.send_message(PYMUMBLE_MSG_TYPES_VOICETARGET, target)
-        except Exception as e:
-            print(f"[语音] 设置发话目标失败: {e}")
+        self._program_target(PTT_TARGET_ID, channel_ids)
 
     # ---------- 收 ----------
     def _on_sound(self, user, soundchunk):
@@ -444,7 +556,7 @@ class VoiceClient:
             try:
                 self.on_rx(khz, True, user["name"])
             except Exception as e:
-                print(f"[语音] RX 回调出错: {e}")
+                log.warning(f"RX 回调出错: {e}")
 
         try:
             audio = np.frombuffer(soundchunk.pcm, dtype=np.int16)
@@ -457,43 +569,48 @@ class VoiceClient:
                 if self.output_stream:
                     self.output_stream.write(audio.tobytes())
         except Exception as e:
-            print(f"[语音] 播放收到的话音出错: {e}")
+            log.warning(f"播放收到的话音出错: {e}")
 
         self._forward_cross_couple(khz, soundchunk)
 
     def _forward_cross_couple(self, khz, soundchunk):
         """交叉耦合：在一个 XC 频率上收到的话音，转发到其它 XC 频率。"""
-        if len(self._xc_channels) < 2:
+        # 管制员正在讲话时不转发：一条连接只有一个发送队列，两股音频挤进去
+        # 只会互相打断，而且此刻管制员的话音才是要紧的
+        if self.transmitting:
             return
         source = self._channel_ids.get(khz)
-        if source not in self._xc_channels:
+        target_id = self._xc_targets.get(source)
+        if target_id is None:
             return
-        others = [c for c in self._xc_channels if c != source]
-        if not others:
-            return
-        try:
-            self._set_voice_target(others, force=True)
-            self.mumble.sound_output.target = WHISPER_TARGET_ID
-            self.mumble.sound_output.add_sound(soundchunk.pcm)
-        except Exception as e:
-            print(f"[语音] 交叉耦合转发失败: {e}")
-        finally:
-            # 必须恢复，否则管制员下一次 PTT 会发到错误的频率上
-            self._set_voice_target(self._tx_channels, force=True)
-            if not self.transmitting:
+
+        # 目标编号是 sync 时就编好的，这里只切换，不重编——所以不会动到 PTT
+        with self._audio_lock:
+            if self.transmitting:
+                return
+            try:
+                self.mumble.sound_output.target = target_id
+                self.mumble.sound_output.add_sound(soundchunk.pcm)
+            except Exception as e:
+                log.warning(f"交叉耦合转发失败: {e}")
+            finally:
                 self.mumble.sound_output.target = 0
 
     def _rx_monitor_loop(self):
         while self.running:
             now = time.time()
             for khz, last in list(self._last_rx.items()):
+                # 用 pop 比对，而不是无条件 del：回调线程可能刚刚更新过这个
+                # 时间戳，直接删会让指示灯灭一下又亮
                 if now - last > RX_TIMEOUT:
-                    del self._last_rx[khz]
+                    if self._last_rx.get(khz) != last:
+                        continue
+                    self._last_rx.pop(khz, None)
                     if self.on_rx:
                         try:
                             self.on_rx(khz, False, "")
                         except Exception as e:
-                            print(f"[语音] RX 回调出错: {e}")
+                            log.warning(f"RX 回调出错: {e}")
             time.sleep(0.1)
 
     # ---------- 发 ----------
@@ -502,6 +619,14 @@ class VoiceClient:
             return
         if not self._tx_channels:
             return                       # 没有任何频率开了 TX
+
+        # 等上一条发话线程收完尾再起新的。连按 PTT 时旧线程可能还在退出途中，
+        # 它退出时会把 target 清零——那会正好落在新线程开讲之后，话音就发到
+        # 当前所在频道而不是 TX 集合去了。
+        previous = self._tx_thread
+        if previous and previous.is_alive() and previous is not threading.current_thread():
+            previous.join(timeout=1)
+
         self.transmitting = True
         if self.on_tx:
             self.on_tx(True)
@@ -517,9 +642,10 @@ class VoiceClient:
 
     def _transmit_loop(self):
         try:
-            self.mumble.sound_output.target = WHISPER_TARGET_ID
+            with self._audio_lock:
+                self.mumble.sound_output.target = PTT_TARGET_ID
         except Exception as e:
-            print(f"[语音] 切换发话目标失败: {e}")
+            log.warning(f"切换发话目标失败: {e}")
 
         while self.transmitting and self.running:
             try:
@@ -536,13 +662,17 @@ class VoiceClient:
                     # 断线期间不要往外灌音频，否则会在缓冲里堆积
                     if not self.connected:
                         continue
-                    self.mumble.sound_output.add_sound(audio.tobytes())
+                    with self._audio_lock:
+                        # 交叉耦合可能刚把 target 切走，每次都重新确认
+                        self.mumble.sound_output.target = PTT_TARGET_ID
+                        self.mumble.sound_output.add_sound(audio.tobytes())
             except Exception as e:
-                print(f"[语音] 录音出错: {e}")
+                log.warning(f"录音出错: {e}")
                 time.sleep(0.1)
             time.sleep(0.001)
 
         try:
-            self.mumble.sound_output.target = 0
+            with self._audio_lock:
+                self.mumble.sound_output.target = 0
         except Exception:
             pass

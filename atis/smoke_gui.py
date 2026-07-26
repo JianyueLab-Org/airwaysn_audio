@@ -1,0 +1,220 @@
+"""GUI 冒烟测试：离屏把窗口和对话框都建起来，不连服务器、不取天气。
+
+    python smoke_gui.py        （在 atis 目录下运行）
+
+天气获取被换成固定报文，避免测试依赖外网。
+"""
+
+import os
+import sys
+from unittest import mock
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# pymumble 需要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
+try:
+    import opuslib  # noqa: F401
+except Exception:
+    for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                  "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
+        sys.modules.setdefault(_name, mock.MagicMock())
+    print("提示: 未找到 opus 原生库，已用替身放行（不影响本测试）\n")
+
+from PyQt6.QtWidgets import QApplication, QMessageBox
+
+# 模态对话框在离屏模式下同样会一直等人点，测试里换成记录调用。
+# question 也必须换掉——它会等一个按钮，漏了就整个测试挂死。
+_dialogs = []
+for _name in ("warning", "critical", "information"):
+    setattr(QMessageBox, _name,
+            staticmethod(lambda *args, _n=_name: _dialogs.append(
+                (_n, args[2] if len(args) > 2 else ""))))
+
+
+def _question(*args, **kwargs):
+    _dialogs.append(("question", args[2] if len(args) > 2 else ""))
+    return QMessageBox.StandardButton.No      # 测试里一律选"否"
+
+
+QMessageBox.question = staticmethod(_question)
+
+import gui
+import weather
+from profile import Station
+
+ZSPD = "ZSPD 251300Z 09004MPS 9999 FEW030 SCT100 25/18 Q1013 NOSIG"
+
+
+def main():
+    app = QApplication(sys.argv)
+    failures = []
+
+    # 不要在冒烟测试里真的去取天气
+    weather.fetch_metar = lambda icao, url=None, timeout=15: ZSPD
+
+    def check(name, fn):
+        try:
+            fn()
+            print(f"  ok   {name}")
+        except Exception as e:
+            failures.append((name, e))
+            print(f"  FAIL {name}: {type(e).__name__}: {e}")
+
+    # 用临时配置，别动开发机上真实的 atis_profile.json
+    import profile as profile_module
+    profile_module.Profile.save = lambda self: None
+
+    print("主窗口：")
+    window = gui.AtisWindow()
+    window.profile.path = os.devnull
+    check("建立主窗口", lambda: window)
+
+    print("席位：")
+
+    def add_stations():
+        window.profile.add(Station("ZSPD", "浦东", "127.850"))
+        window.profile.add(Station("ZSPD", "浦东离场", "127.900",
+                                   atis_type=profile_module.TYPE_DEPARTURE))
+        window.refresh_stations()
+        assert window.station_list.count() == 2
+    check("添加两个席位", add_stations)
+
+    check("呼号按类型区分", lambda: (_ for _ in ()).throw(AssertionError(
+        [s.callsign for s in window.profile]))
+        if {s.callsign for s in window.profile} != {"ZSPD_ATIS", "ZSPD_D_ATIS"} else None)
+
+    check("选中第一个", lambda: window.station_list.setCurrentRow(0))
+
+    def feed_metar():
+        import metar as metar_module
+        station = window.current_station()
+        window.on_metar(station.callsign, metar_module.Metar(ZSPD), "")
+    check("喂一份天气进去", feed_metar)
+
+    def preview_generated():
+        text = window.text_preview.toPlainText()
+        voice = window.voice_preview.toPlainText()
+        assert "ZSPD ATIS" in text, text
+        assert "09004MPS" in text, "文字通播应当照抄电码"
+        assert "wind zero niner zero" in voice, "语音稿应当念出来"
+    check("生成文字通播和语音稿", preview_generated)
+
+    def letter_advances_on_new_metar():
+        import metar as metar_module
+        station = window.current_station()
+        before = station.letter
+        window.on_metar(station.callsign,
+                        metar_module.Metar(ZSPD.replace("25/18", "26/19")), "")
+        assert station.letter != before, "报文变了就该换情报字母"
+    check("天气变化推进情报字母", letter_advances_on_new_metar)
+
+    check("手动推进字母", lambda: window.advance_letter())
+
+    print("对话框：")
+    station_dialog = gui.StationDialog(window.current_station(), parent=window)
+    check("建立席位对话框", lambda: station_dialog)
+
+    def reject_bad_input():
+        _dialogs.clear()
+        station_dialog.identifier.setText("ZS")
+        station_dialog.validate_and_accept()
+        assert _dialogs, "非法机场代码应当被拦下"
+    check("席位输入校验", reject_bad_input)
+
+    preset_dialog = gui.PresetDialog(window.current_station().presets[0], parent=window)
+    check("建立预设对话框", lambda: preset_dialog)
+    check("预设可保存", lambda: preset_dialog.apply())
+
+    settings_dialog = gui.SettingsDialog(window.settings, window)
+    check("建立设置对话框", lambda: settings_dialog)
+
+    print("导入 vATIS 配置：")
+
+    def import_vatis_profile():
+        import json
+        import tempfile
+        from PyQt6.QtWidgets import QFileDialog
+
+        profile = {
+            "name": "vATIS 测试",
+            "stations": [{
+                "identifier": "ZGGG", "name": "白云", "atisType": "Arrival",
+                "codeRange": {"low": "A", "high": "F"}, "frequency": 127250000,
+                "idsEndpoint": "https://ids.example",
+                "presets": [{"name": "白天", "template": "[FACILITY] [ATIS_LETTER] @RWY"}],
+                "contractions": [{"variableName": "RWY", "text": "RWY 01",
+                                  "voice": "runway zero one"}],
+            }],
+        }
+        handle, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(handle, "w", encoding="utf-8") as f:
+            json.dump(profile, f)
+
+        # 文件选择框是模态的，测试里直接给定路径
+        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (path, ""))
+        _dialogs.clear()
+        try:
+            window.import_vatis()
+        finally:
+            os.remove(path)
+
+        station = window.profile.get("ZGGG_A_ATIS")
+        assert station is not None, "应当导入 ZGGG_A_ATIS"
+        assert station.frequency == "127.250", station.frequency
+        assert station.code_range == ("A", "F"), station.code_range
+        assert station.contractions["RWY"][1] == "runway zero one"
+        assert _dialogs, "应当给出导入结果说明"
+    check("导入并落到席位列表", import_vatis_profile)
+
+    check("导入后能选中新席位", lambda: window.station_list.setCurrentRow(
+        window.station_list.count() - 1))
+
+    print("开播前的管制席位核对：")
+
+    def refuse_without_controller():
+        _dialogs.clear()
+        window.on_precheck("ZSPD_ATIS", "1000", "pw", True, {}, 0)
+        assert _dialogs, "没在管制就该拦下来"
+        assert "ZSPD_ATIS" not in window.broadcasters, "不该建立任何连接"
+    check("没在管制则拒绝开播", refuse_without_controller)
+
+    def ask_when_datafeed_unreachable():
+        _dialogs.clear()
+        window.on_precheck("ZSPD_ATIS", "1000", "pw", False, {}, 0)
+        assert _dialogs, "数据源连不上时应当询问而不是直接放行"
+    check("数据源不可达时询问", ask_when_datafeed_unreachable)
+
+    check("核对后按钮恢复可用", lambda: (_ for _ in ()).throw(
+        AssertionError("按钮仍然禁用"))
+        if not window.broadcast_button.isEnabled() else None)
+
+    print("错误隔离：")
+
+    def fsd_error_keeps_voice():
+        # FSD 只是附加能力，登录失败不该把频率上的语音通播一起停掉
+        window.broadcasters["ZSPD_ATIS"] = object()
+        window.fsd_clients["ZSPD_ATIS"] = type("F", (), {"stop": lambda s: None})()
+        _dialogs.clear()
+        window.on_broadcast_state("ZSPD_ATIS", "fsd-error", "[FSD] 拒绝登录")
+        assert "ZSPD_ATIS" in window.broadcasters, "语音不该被停掉"
+        assert "ZSPD_ATIS" not in window.fsd_clients, "FSD 那条应当收掉"
+        assert not _dialogs, "不该弹错误框打断播出"
+        window.broadcasters.pop("ZSPD_ATIS")
+    check("FSD 失败时语音继续", fsd_error_keeps_voice)
+
+    print("播出状态回调：")
+    check("状态回报", lambda: window.on_broadcast_state("ZSPD_ATIS", "online", "测试"))
+    check("未播出时删除席位", lambda: window.remove_station())
+
+    window.timer.stop()
+
+    print()
+    if failures:
+        print(f"{len(failures)} 项失败")
+        return 1
+    print("全部通过")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

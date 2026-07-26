@@ -43,9 +43,9 @@ a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=opus_binaries,
-    datas=[],
-    # scipy 的那几条隐式导入是给 ATIS 的语音合成用的，ATIS 删掉之后管制端不再
-    # 依赖 scipy，就不用再打进来了
+    # 窗口图标要随程序分发，否则打包后运行时取不到
+    datas=[('favicon.ico', '.')],
+    # 管制端不做语音合成，不需要 scipy / pyttsx3 的隐式导入
     hiddenimports=[
         'pymumble_py3',
         'google.protobuf',
@@ -64,7 +64,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='gui',
+    name='airwaysn-controller',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -84,5 +84,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='gui',
+    name='airwaysn-controller',
 )

@@ -15,9 +15,14 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 | `client/` | `gui.py` | Pilot client for MSFS — reads COM1 via **SimConnect** (`AircraftRequests.get("COM_ACTIVE_FREQUENCY:1")`) |
 | `xplane_client/` | `gui.py` | Pilot client for X-Plane — reads COM1 via **X-Plane UDP** (`XPlaneRadio` in `radio.py`) |
 | `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
+| `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
-`client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic usually has to be applied to both. `controller/` no longer shares that shape: it was restructured around the radio stack (`radiostack.py` + `voice.py`) and has no `radio.py`.
+`client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/` and `atis/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, and `profile.py` + `broadcast.py`) and have no `radio.py`.
+
+There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
+
+Two things the pilot clients still lack that the controller and ATIS have: **logging** (they still `print`, which goes nowhere in a `console=False` build) and any tests.
 
 ## Commands
 
@@ -27,29 +32,45 @@ Run each app **from inside its own directory** — icon paths (`.\favicon.ico`) 
 cd client;        python gui.py     # MSFS pilot client (needs MSFS running)
 cd xplane_client; python gui.py     # X-Plane pilot client (needs X-Plane in a flight)
 cd controller;    python gui.py     # ATC client
+cd atis;          python gui.py     # ATIS client
 cd server\ATIS;   python mumble.py  # server-side ATIS manager (needs ffmpeg on PATH)
 python server\login.py              # Murmur Ice authenticator (run on the Mumble host)
 ```
 
-Build a Windows bundle (from the component directory, output lands in `dist/`):
+Build a Windows bundle (from the component directory):
 
 ```powershell
 pyinstaller gui.spec
 ```
 
-Tests — only the controller has any; both run from `controller/` and need no server, no audio device and no network:
+**Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/airwaysn-controller/` and `dist/airwaysn-atis/`.
+
+Tests — the controller and the ATIS client have them; each runs from its own directory and needs no server, no audio device and no network:
 
 ```powershell
+cd controller
 python -m unittest test_radiostack -v    # radio stack model + RX/TX/XC coupling rules
 python -m unittest test_radiostack.CouplingRulesTest.test_tx_forces_rx_on   # one test
+python -m unittest test_applog           # logging, including uncaught-exception capture
 python smoke_gui.py                      # builds every window/dialog offscreen
+
+cd atis
+python -m unittest test_atis -v          # METAR, templates, stations, vATIS import, FSD
+python -m unittest test_applog
+python smoke_gui.py
 ```
+
+**Logging.** Both clients ship `applog.py` (a per-component copy, matching how the rest of the repo duplicates rather than shares). `applog.setup(debug)` installs a rotating file handler writing `airwaysn-controller.log` / `airwaysn-atis.log` to the CWD, plus a console handler when one exists. This is not optional polish: the packaged builds are `console=False`, so a bare `print` goes nowhere and a user reporting "it won't connect" has nothing to send you. Use `log = logging.getLogger("模块名")` per module rather than `print`.
+
+`setup()` also replaces `sys.excepthook` **and** `threading.excepthook` — an uncaught exception in a Qt slot or a worker thread otherwise vanishes silently, leaving a frozen window and an empty log. `--debug` (or the settings checkbox, persisted as `debug`) drops the level to DEBUG, which is where the protocol traffic lives: every FSD packet in and out (with the `#AA` password redacted), channel-listener changes, voice-target changes, and the radio-stack sync.
 
 `smoke_gui.py` replaces `QMessageBox.warning`/`critical` with a recorder before touching the GUI — a modal dialog blocks forever even under the offscreen platform, so any new code path that can pop one needs that stub to stay in place.
 
 Three environment facts that will cost an afternoon otherwise:
 
 - **Use Python 3.12.** PyAudio has no wheel for 3.13+, and building it from source needs PortAudio headers plus MSVC.
+- **pymumble 1.6.1 does not work on Python 3.12 out of the box.** Its `connect()` builds the TLS socket with `ssl.wrap_socket()`, which was **removed in 3.12**, and its `except AttributeError` fallback calls *the same removed function* — so the exception escapes, from inside pymumble's own thread. The caller only sees `is_alive() == False` and naturally reports "server rejected the connection", which sends you hunting for a password problem while the TLS handshake never even started (the Murmur log shows a connection opening and closing milliseconds later). `mumblecompat.install()` reinstates a `wrap_socket` built on `SSLContext`. **All four components carry a copy and call it at import** — without it the voice path is dead in every packaged build, pilot clients included.
+- **Every spec must bundle `opus.dll`.** `opuslib` loads it through `ctypes` at runtime, so PyInstaller's static analysis never sees it and a packaged build dies at startup on any machine that does not already have Opus. All four specs now run the same `find_opus()` (`find_library` → the component's own `opus.dll` → `pyogg`'s copy).
 - **pymumble needs the native `opus` library** (`opuslib` loads it through `ctypes` at runtime). Without it every import of `radio.py`/`voice.py` dies with `Could not find Opus library`. `controller/gui.spec` now locates `opus.dll` at build time and bundles it — via `find_library`, then `pyogg`'s copy, then `controller/opus.dll` — so a packaged build works on a machine that has never seen Opus. The other three specs do not do this yet.
 - **`favicon.ico` is actually a PNG** with the wrong extension. Qt sniffs the content so the window icon is fine, but PyInstaller 6 refuses it as an exe icon unless `pillow` is installed to convert it.
 
@@ -90,6 +111,8 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 
 **pygame on Windows.** `os.environ['SDL_VIDEODRIVER'] = 'dummy'` and `SDL_AUDIODRIVER = 'dummy'` must be set *before* `import pygame` — that is why these lines sit above the imports in `gui.py`, `radio.py`, and `client/settings.py`. pygame is only used for joystick input; SDL video/audio must stay disabled so it does not fight PyQt6 and PyAudio.
 
+**Diagnosing a refused connection.** pymumble raises `ConnectionRejectedError(mess.reason)` on a server `Reject` — dropping the `type` field, which is the one that actually says *why*, and which Murmur often fills in while leaving `reason` empty. Both clients therefore connect through a `RejectAwareMumble` subclass that parses the `Reject` message in `dispatch_control_message` before handing it on, keeping `reject_type` for the UI. `REJECT_REASONS` maps those types to Chinese; the distinction that matters most is `WrongUserPW` ("密码错误") versus `AuthenticatorFail` ("服务端认证器故障"), because the second one means `server/login.py` is down and no amount of password fiddling will help.
+
 **Qt threading.** pymumble callbacks fire on the library thread, so every GUI marshals them into the Qt thread through `pyqtSignal` wrappers: `ErrorSignal`/`ConnectSignal` in `client/gui.py` and `xplane_client/gui.py`, `VoiceSignals` in `controller/gui.py`. Follow that pattern for anything that touches widgets from a Mumble or audio callback.
 
 **Settings files.** Written to the CWD as JSON: `radio_settings.json` for `client/` and `controller/` (gitignored), `xplane_radio_settings.json` for `xplane_client/`. The pilot clients persist the Mumble username and password in plaintext; the controller persists `last_username` plus the whole radio stack under `radios`, so a session comes back with the same frequencies and their RX/TX/XC state.
@@ -112,6 +135,27 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 - **TX** → a `VoiceTarget` carrying **all** TX channels at once. `sound_output.set_whisper()` cannot do this: for `id == 1` pymumble copies only `targets[0]`, so multi-channel transmit has to build the message directly.
 
 The client still **joins** the selected radio's channel (the one marked `▸`) rather than sitting in root. That is deliberate: if the server is Mumble 1.3, the listener message is silently ignored and the controller would otherwise hear nothing at all — this way the primary frequency always works and `listeners_working` drives a warning in the status bar. Incoming audio is routed to a radio by `user["channel_id"]`, which is what makes per-frequency RX indication and per-frequency volume possible.
+
+## The ATIS client
+
+`atis/` is modelled on vATIS, so the vocabulary is theirs: a **profile** holds **stations**, a station holds **presets**, and a preset holds a **template**. The template is free text with `[WIND]`-style variables; the variable names and the `:VOX` suffix are copied from vATIS's documented set (`template.py: ALIASES`).
+
+The idea worth preserving is that **every weather element has two forms**: `text` reproduces the METAR group (`09004MPS`) for the written ATIS, `voice` is what gets spoken (`wind zero niner zero at four meters per second`). `metar.py` produces both, and `template.render()` returns both — the same template rendered twice. In the voice pass every variable takes its spoken form automatically; `:VOX` only exists to force the spoken form into the *written* ATIS. Altitudes are spoken as `three thousand`, not digit-by-digit, which is `spell_altitude`'s whole reason to exist.
+
+`vatis_import.py` reads real vATIS profile JSON. Field names are camelCase and enums are strings because vATIS sets `PropertyNamingPolicy = CamelCase` and `UseStringEnumConverter` in its `SourceGenerationContext`; older profiles call the station list `composites` instead of `stations`, and older builds may write `atisType` as a number, so all of those are accepted. **`frequency` is a uint in hertz** (`133800000` = 133.800) — the single most damaging field to misread, so `parse_frequency` also tolerates kHz/MHz and rejects anything outside the VHF band. Anything vATIS supports that this client does not (`atisFormat` fine-grained readback options, IDS endpoint, static definition libraries, recorded voice) is skipped and *reported in the import dialog* rather than silently dropped.
+
+Contractions come across too: vATIS references them as `@NAME` in a template, and each has a text and a voice form, which maps exactly onto the two-pass rendering — `render()` takes the station's contraction table and expands `@NAME` differently in each pass.
+
+Station callsigns follow vATIS: `ZSPD_ATIS`, `ZSPD_D_ATIS`, `ZSPD_A_ATIS` for combined/departure/arrival. Each station has a **code range** limiting which information letters it uses, so a departure and an arrival ATIS at one field can't be confused; the letter advances by one whenever the raw METAR text changes, and wraps within the range.
+
+Audio goes out over Mumble, not AFV: `broadcast.py` opens its own connection per station as `{cid}_atis{freq6}` (the shape `server/login.py` authenticates) and opens **no** local audio device. Transmission is paced against `sound_output.get_buffer_size()` and yields the frequency if anyone else keys up. `update_text()` swaps the script for the *next* cycle rather than cutting off the current one.
+
+**One connection, one output queue — the rule that keeps audio on the right frequency.** `sound_output.target` is a single mutable field shared by PTT and cross-couple, and a `VoiceTarget` id is a server-side registration that gets *overwritten* when reprogrammed. Both of those bit us: reusing one id meant a cross-couple forward silently retargeted the controller's next PTT. The invariants now, pinned by `test_voice.py`:
+
+- PTT owns id `1`; each cross-coupled frequency gets its own id from `XC_TARGET_BASE`, programmed once in `sync()`. Forwarding switches the id, it never reprograms one.
+- `_audio_lock` guards every `target =` / `add_sound()` pair.
+- Cross-couple **does not forward while transmitting** — two streams into one queue interleave into garbage, and the controller's own voice is what matters.
+- `start_transmit()` joins the previous transmit thread first; otherwise the old thread's exit resets `target` to 0 *after* the new one started talking.
 
 **XC (cross-couple)** is implemented client-side in `_forward_cross_couple`: audio received on one XC frequency is re-sent to the other XC frequencies by temporarily swapping the voice target. It restores the normal TX target afterwards — if you add an early return in there, make sure the target still gets restored or the controller's next PTT goes to the wrong frequencies.
 
