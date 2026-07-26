@@ -16,9 +16,12 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 | `xplane_client/` | `gui.py` | Pilot client for X-Plane — reads COM1 via **X-Plane UDP** (`XPlaneRadio` in `radio.py`) |
 | `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
 | `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
+| `xpc/` | `gui.py` | **XPC for CAN** — X-Plane pilot client modelled on [xPilot](https://github.com/xpilot-project/xpilot): Mumble voice **and** an FSD connection |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
-`client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/` and `atis/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, and `profile.py` + `broadcast.py`) and have no `radio.py`.
+`client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/`, `atis/` and `xpc/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, `profile.py` + `broadcast.py`, and `xplane.py` + `fsdpilot.py` + `voice.py`) and have no `radio.py`.
+
+`xpc/` **supersedes `xplane_client/`** in scope: same simulator, but it also logs in to FSD so the aircraft appears on the network, where `xplane_client/` is voice-only. `xplane_client/` is still the smaller, voice-only option and is not deprecated.
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
@@ -33,6 +36,7 @@ cd client;        python gui.py     # MSFS pilot client (needs MSFS running)
 cd xplane_client; python gui.py     # X-Plane pilot client (needs X-Plane in a flight)
 cd controller;    python gui.py     # ATC client
 cd atis;          python gui.py     # ATIS client
+cd xpc;           python gui.py     # XPC for CAN — X-Plane pilot client (voice + FSD)
 cd server\ATIS;   python mumble.py  # server-side ATIS manager (needs ffmpeg on PATH)
 python server\login.py              # Murmur Ice authenticator (run on the Mumble host)
 ```
@@ -43,9 +47,9 @@ Build a Windows bundle (from the component directory):
 pyinstaller gui.spec
 ```
 
-**Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/airwaysn-controller/` and `dist/airwaysn-atis/`.
+**Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/airwaysn-controller/`, `dist/airwaysn-atis/` and `dist/xpc-for-can/`.
 
-Tests — the controller and the ATIS client have them; each runs from its own directory and needs no server, no audio device and no network:
+Tests — the controller, the ATIS client and XPC have them; each runs from its own directory and needs no server, no audio device and no network:
 
 ```powershell
 cd controller
@@ -58,7 +62,15 @@ cd atis
 python -m unittest test_atis -v          # METAR, templates, stations, vATIS import, FSD
 python -m unittest test_applog
 python smoke_gui.py
+
+cd xpc
+python -m unittest test_xpc -v           # PBH, position packets, RREF, traffic, model matching
+python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
+python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
+python smoke_gui.py
 ```
+
+`test_xpc.py` loads `plugin/PI_XpcTraffic.py` directly (the plugin guards its `import xp` so it imports outside X-Plane) to check the bridge reassembler and the animation-value ordering. The rest of the plugin needs a running simulator and is not covered.
 
 **Logging.** Both clients ship `applog.py` (a per-component copy, matching how the rest of the repo duplicates rather than shares). `applog.setup(debug)` installs a rotating file handler writing `airwaysn-controller.log` / `airwaysn-atis.log` to the CWD, plus a console handler when one exists. This is not optional polish: the packaged builds are `console=False`, so a bare `print` goes nowhere and a user reporting "it won't connect" has nothing to send you. Use `log = logging.getLogger("模块名")` per module rather than `print`.
 
@@ -159,6 +171,60 @@ Audio goes out over Mumble, not AFV: `broadcast.py` opens its own connection per
 
 **XC (cross-couple)** is implemented client-side in `_forward_cross_couple`: audio received on one XC frequency is re-sent to the other XC frequencies by temporarily swapping the voice target. It restores the normal TX target afterwards — if you add an early return in there, make sure the target still gets restored or the controller's next PTT goes to the wrong frequencies.
 
+## XPC for CAN (`xpc/`)
+
+The X-Plane pilot client, laid out like xPilot: three independent links, none of which can take the others down.
+
+| Module | xPilot equivalent | Role |
+|---|---|---|
+| `xplane.py` | `src/simulator/` | UDP link to X-Plane — position, attitude, transponder, COM1/2 |
+| `fsdpilot.py` | `src/fsd/` | Pilot-side FSD connection: login, position reports, text, flight plans |
+| `voice.py` | `src/audio/` + `afv-native/` | Mumble voice; the channel follows COM1 |
+| `traffic.py` | `src/aircrafts/` | Other aircraft: sample history, interpolation, model-match state |
+| `cslmatch.py` | `src/aircrafts/` (model matching) | CSL package parsing and the type→model fallback chain |
+| `bridge.py` | — | UDP transport to the X-Plane plugin |
+| `plugin/PI_XpcTraffic.py` | `xpilot` XPL plugin | Runs *inside* X-Plane (XPPython3): draws traffic, feeds TCAS |
+| `gui.py` | `Resources/Views/` | Connect bar, messages, nearby-ATC list, radio bar |
+
+**The X-Plane link subscribes, it does not poll.** `xplane_client/radio.py` sends one RREF and waits for the reply every time it wants COM1. That round-trip is fine for a channel switch but not for position reports 5× a second, so `XPlaneLink` sends one RREF per dataref *once* with a rate, then just keeps reading whatever X-Plane pushes and holds the latest value. `snapshot()` returns the whole set already converted to FSD's units (feet, knots, MHz) — X-Plane reports metres and m/s.
+
+**`ConnectionResetError` is normal here, not an error.** On Windows, sending UDP to a port nobody is listening on comes back as an ICMP port-unreachable, which surfaces as `ConnectionResetError` on the *next* `recvfrom`. Before X-Plane is running that is every single read. Treating it as a fatal socket error re-subscribes once a second forever (visible as a wall of "已订阅 14 个 dataref" in the log); it has to be treated like a timeout. `_still_waiting()` owns that decision and is pinned by `WaitingTest`: warn at `STALE_AFTER` (3 s), rediscover only at `REDISCOVER_AFTER` (15 s).
+
+**PBH packing must be the exact inverse of can-fsd's decoder.** Pitch, bank and heading ride in one 32-bit integer at 10 bits each (`360/1024` ≈ 0.35° per step), with bit 1 as the on-ground flag. `pack_pbh()` normalises to 0–360 *before* quantising — a raw negative angle overflows its 10-bit field and puts the aircraft at a nonsense attitude on everyone else's screen. `test_xpc.py` carries a copy of can-fsd's `PitchBankHeading` decode (`internal/fsd/packet.go`) and round-trips against it; if that Go function ever changes, that test is what catches it.
+
+Other things worth knowing:
+
+- **Callsigns are pre-checked client-side** against can-fsd's `IsValidCallsign` (2–10 characters, `A-Z0-9_-`) so the user gets an explanation instead of a login rejection.
+- **`$ID`'s ninth field (challenge) is deliberately omitted** so the server never starts a VATSIM `$ZC` challenge that only official clients hold keys for. Same reasoning as the removed `controller/fsdclient.py`.
+- **Packets are colon-delimited**, so every free-text field (real name, remarks, route, chat) goes through `sanitize()`. A colon in a remarks field otherwise shifts every following field by one.
+- **`#AP` carries the password**, so `_redact()` masks it before anything reaches the log — users paste logs into chat.
+- Position reports drop to one every 5 s when parked on the ground, and the transponder mode character (`S`/`N`/`Y`) is driven by X-Plane's `transponder_mode` dataref, with `Y` held for 8 s after IDENT.
+- FSD and voice failures are isolated in `gui.py`: `on_fsd_status('error')` clears only `self.fsd`, so losing the network connection does not drop the frequency you are listening to.
+
+### Rendering other aircraft
+
+xPilot draws traffic from a C++ plugin built on XPMP2. This does it in Python instead, split across two processes, because **X-Plane's drawing API is only reachable from a plugin, and the plugin runs inside X-Plane's own Python (XPPython3)** — PyQt6, pymumble and pyaudio can't go there.
+
+    client (xpc/)                          plugin (inside X-Plane)
+    FSD → traffic.py → cslmatch.py  ──UDP──→  PI_XpcTraffic.py → draw + TCAS
+
+Everything hard lives client-side where it has unit tests; the plugin is deliberately thin because changing it means restarting the simulator.
+
+**`TrafficTable` is falsy when empty** — it defines `__len__`, so `if not self.traffic` is true for a table with no aircraft in it. `fsdpilot.py` must test `if self.traffic is None`. Getting this wrong silently drops *every* traffic packet, because the table is empty exactly when the first aircraft arrives.
+
+**Aircraft type does not come from the position packet.** `@` carries no model information, so the type is fetched over `#SB`: on first sight the client sends `#SB{me}:{them}:PIR`, and the reply is `PI:GEN:EQUIPMENT=B738:AIRLINE=CCA`. can-fsd relays `#SB` verbatim (`handleSquawkbox`, `internal/fsd/handler.go:515`), so no server change is needed. **We must also answer other clients' `PIR`** or everyone else renders us as a generic model. Until the reply arrives the aircraft is drawn with a fallback model and `model_dirty` tells the renderer to re-match once it does.
+
+**Model matching must always return something.** `ModelSet.match()` degrades type+airline → type → same family → generic-by-category → first model in the package, and returns the reason so a "that aircraft looks wrong" report is diagnosable from the log. An aircraft you cannot see is far more dangerous than one with the wrong livery.
+
+**Two X-Plane facts that shape the plugin**, both confirmed against `Resources/plugins/DataRefs.txt`:
+
+- **`XPLMInstance`-drawn aircraft do not appear on TCAS.** The panel reads `sim/cockpit2/tcas/targets/*` (64 slots, index 0 is the user), which is a separate system that has to be filled by hand. Those datarefs are "writeable only when `override_TCAS` is set", and `override_TCAS` itself is "only writeable by the plugin that has the AI planes acquired" — hence `xp.acquirePlanes()` first. The arrays carry `flight_id` and `icao_type`, so callsign and type show correctly on the ND. Traffic is capped at 63 and sorted by range client-side, because when there are more aircraft than slots the far ones are the right ones to drop.
+- **The animation datarefs must be registered before any CSL model loads.** CSL OBJ8 files reference `libxplanemp/controls/*` by name; X-Plane resolves those while parsing the `.obj`, so registering afterwards gives you a model that renders but never moves. `XPluginStart` registers them, and the values themselves travel through `instanceSetPosition`'s `data` list — whose order must match the `createInstance` dataref list exactly.
+
+Also worth knowing: `instanceSetPosition` takes `(x, y, z, pitch, heading, roll)` — heading before roll. `xp.worldToLocal()` does the coordinate conversion, so unlike the legacy 19-slot multiplayer datarefs there is no hand-rolled tangent-plane maths. If LiveTraffic or another XPMP2-based plugin is loaded it will have registered the same `libxplanemp` datarefs and acquired the AI planes; the plugin detects this and logs a warning rather than fighting over them.
+
+The bridge is UDP with one JSON object per datagram, fragmented over `seq`/`part`/`total`. UDP rather than TCP because this is a pure position stream — a dropped frame is replaced 200 ms later, whereas a reliable queue would build up latency. The plugin keeps only the newest complete frame; late frames make aircraft jump backwards. `bridge.Reassembler` and the plugin's copy are separate implementations, and `test_xpc.py` loads the plugin file to check they agree.
+
 ## Related repositories
 
 This repo is the **voice layer** of a three-part network. The other two live alongside it and own the contracts this one consumes:
@@ -174,7 +240,11 @@ Two integration points, both hardcoded here:
 
 **ATIS datafeed → can-fsd.** `server/ATIS/request.py` polls `https://data.airwaysn.org/v1/data.json`, can-fsd's datafeed (`internal/api`, HTTP port 20350), and `server/ATIS/mumble.py` speaks every `atis[]` entry it finds. It consumes `atis[].callsign`, `.frequency` and `.text_atis` — can-fsd guarantees `text_atis` is a JSON array, never null, and has golden-file tests pinning that document. Two details owned by can-fsd: a station lands in `atis[]` only if its callsign ends in `_ATIS`, and `frequency` is a full MHz string (`"128.500"`) where **`199.998` means "no frequency set"** — never build a `FREQ_*` channel from it. Splitting `text_atis` on `|` into English|Chinese is a convention of *this* repo, not of the datafeed.
 
-**No FSD connection from this repo's clients.** The voice clients only speak Mumble; nothing here logs in to can-fsd's FSD port. A controller's presence on the network comes from whatever ATC client they run (EuroScope and friends), exactly as TrackAudio does it. A previous iteration had `controller/fsdclient.py` log the client-side ATIS in as an `_ATIS` station over the FSD protocol; it was removed with the ATIS feature. If that is ever wanted again, the packet layouts are in can-fsd's `internal/fsd/conn.go`, `handler.go` and `docs/protocol.md` — and note the ninth `$ID` field (challenge) must be omitted so the server never starts a VATSIM `$ZC` challenge that only official clients hold keys for.
+**Which clients speak FSD.** Two do, and they are the only ones: `atis/fsdclient.py` logs a station in as an `_ATIS` controller (`#AA`), and `xpc/fsdpilot.py` logs an aircraft in as a pilot (`#AP`). Packet layouts for both come from can-fsd's `internal/fsd/conn.go`, `handler.go` and `docs/protocol.md`.
+
+The other three — `client/`, `xplane_client/`, `controller/` — speak **only** Mumble and never touch the FSD port. A controller's presence on the network comes from whatever ATC client they run (EuroScope and friends), exactly as TrackAudio does it; keep it that way, because the voice server has no roster check and an FSD login from `controller/` would imply one.
+
+In both FSD clients the ninth `$ID` field (challenge) is deliberately omitted so the server never starts a VATSIM `$ZC` challenge that only official clients hold keys for.
 
 No authorisation is shared: can-fsd checks the `division` roster before a controller may staff a position, but the voice server has no equivalent — any account that authenticates can join any `FREQ_*` channel.
 
@@ -182,5 +252,5 @@ Naming has drifted across the three: can-web now calls the network **Cerulean Av
 
 ## Reference docs
 
-- `xplane_client/API.md` — X-Plane UDP protocol notes (BECN discovery on `239.255.1.1:49707`, RREF requests, dataref precision) and a SimConnect-vs-X-Plane comparison table.
+- `xplane_client/API.md` — X-Plane UDP protocol notes (BECN discovery on `239.255.1.1:49707`, RREF requests, dataref precision) and a SimConnect-vs-X-Plane comparison table. Applies to `xpc/xplane.py` too, except that XPC subscribes rather than polls.
 - `client/API.md` — vendored upstream pymumble API reference, not project documentation.
