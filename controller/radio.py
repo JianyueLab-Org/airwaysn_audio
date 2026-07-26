@@ -293,6 +293,8 @@ class ATCRadioClient:
                         # 应用音量调节（添加限幅以防止溢出）
                         scaled_data = audio_data * self.mic_volume 
                         audio_data = np.clip(scaled_data, np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)
+                        if not self.connected:
+                            continue
                         self.mumble.sound_output.add_sound(audio_data.tobytes())
             except AudioStreamError:
                 time.sleep(0.1)  # 音频流错误时短暂等待
@@ -304,6 +306,8 @@ class ATCRadioClient:
 
     def sound_received(self, user, soundchunk):
         """处理接收到的音频"""
+        if not self.mumble.users.myself:
+            return
         if user["name"] == self.mumble.users.myself["name"]:
             return  # 不处理自己的声音
             

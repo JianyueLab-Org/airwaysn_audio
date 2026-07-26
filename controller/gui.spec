@@ -1,16 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-excludes=['torch']
+excludes = ['torch', 'transformers']
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'scipy._lib._ccallback_c',
+        'scipy._cyutility',
+        'scipy.signal',
+        'scipy.signal._spectral',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )

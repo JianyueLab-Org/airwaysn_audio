@@ -273,6 +273,12 @@ class MumbleRadioClient:
         )
         self.current_channel = None
 
+        # ---- 独立连接状态标记 ----
+        # 由 pymumble 的 connected/disconnected 回调管理，不依赖 mumble 内部线程状态
+        self._connection_established = threading.Event()
+        # 存储登录时发现的初始频率，用于首次连接后的频道切换
+        self._initial_freq = None
+
         # 预初始化 connected 属性（pymumble 的 init_connection 在 start() 后才设置此属性）
         self.mumble.connected = 0
 
@@ -365,20 +371,62 @@ class MumbleRadioClient:
         freq = MumbleRadioClient.convert_frequency(frequency)
         return f"FREQ_{str(freq).zfill(6)}"
 
-    def switch_channel(self, frequency):
+    def set_connection_state(self, connected):
+        """由外部（gui.py 回调）调用，设置独立连接标记。"""
+        if connected:
+            self._connection_established.set()
+            print(f"[连接标记] 已设为 True | thread_alive={self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A'}")
+        else:
+            self._connection_established.clear()
+            print(f"[连接标记] 已设为 False")
+
+    def switch_channel(self, frequency, caller="unknown"):
+        """切换到指定频率对应的 Mumble 频道。
+
+        参数:
+            frequency: COM1 频率（MHz）
+            caller:    调用来源名称（用于日志定位）
+        """
         channel_name = self.get_channel_name(frequency)
+        print(f"[频道切换] {caller}: 尝试切换到 {channel_name} (频率 {frequency:.3f} MHz)"
+              f" | myself={'有' if self.mumble.users.myself else '无'}"
+              f" | 线程存活={self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A'}")
         try:
             channel = self.mumble.channels.find_by_name(channel_name)
+            print(f"[频道切换] find_by_name 成功: channel_id={channel['channel_id']}")
         except pymumble.errors.UnknownChannelError:
-            self.mumble.channels.new_channel(0, channel_name, temporary=True)
-            channel = self.mumble.channels.find_by_name(channel_name)
+            print(f"[频道切换] 频道 {channel_name} 不存在，尝试创建临时频道...")
+            try:
+                self.mumble.channels.new_channel(0, channel_name, temporary=True)
+                print(f"[频道切换] 临时频道创建成功")
+            except Exception as e:
+                print(f"[频道切换] 创建临时频道失败: {type(e).__name__}: {e}")
+                return
+            try:
+                channel = self.mumble.channels.find_by_name(channel_name)
+                print(f"[频道切换] 创建后 find_by_name 成功: channel_id={channel['channel_id']}")
+            except pymumble.errors.UnknownChannelError:
+                print(f"[频道切换] 创建后仍找不到频道 {channel_name}，放弃切换")
+                return
 
-        if channel:
-            current_id = self.mumble.users.myself["channel_id"] if self.mumble.users.myself else None
-            if current_id != channel["channel_id"]:
-                self.mumble.users.myself.move_in(channel["channel_id"])
-                self.current_channel = channel["channel_id"]
-                print(f"已切换到频率: {frequency:.3f} MHz")
+        if not channel:
+            print(f"[频道切换] 频道对象为空，放弃切换")
+            return
+
+        try:
+            if not self.mumble.users.myself:
+                print(f"[频道切换] self.mumble.users.myself 为 None，无法获取当前频道，跳过切换")
+                return
+            current_id = self.mumble.users.myself["channel_id"]
+            if current_id == channel["channel_id"]:
+                print(f"[频道切换] 已在目标频道 {channel_name} 中，无需切换")
+                return
+            print(f"[频道切换] 当前频道 ID={current_id}，目标频道 ID={channel['channel_id']}，开始 move_in...")
+            self.mumble.users.myself.move_in(channel["channel_id"])
+            self.current_channel = channel["channel_id"]
+            print(f"[频道切换] ✅ 成功切换到 {channel_name} (频率 {frequency:.3f} MHz)")
+        except Exception as e:
+            print(f"[频道切换] ❌ move_in 失败: {type(e).__name__}: {e}")
 
     def _sync_ping_heartbeat(self):
         """读取 pymumble 内部 ping_stats['last_rcv'] 刷新心跳。"""
@@ -392,78 +440,122 @@ class MumbleRadioClient:
     def _ensure_in_correct_channel(self, frequency):
         """确保用户在正确的频道中，如果不在则重新加入"""
         try:
-            if not self.mumble.connected:
+            if not self._connection_established.is_set():
+                print(f"[频道检查] 未连接，跳过")
                 return
             if not self.mumble.users.myself:
+                print(f"[频道检查] myself 尚未就绪，跳过")
                 return
             channel_name = self.get_channel_name(frequency)
             current_channel_id = self.mumble.users.myself["channel_id"]
-            if not current_channel_id:
-                print(f"[频道检查] 未加入任何频道，重新加入 {channel_name}")
-                self.switch_channel(frequency)
+            print(f"[频道检查] 当前channel_id={current_channel_id!r}, 目标={channel_name}")
+
+            # channel_id=0 => Root 频道，必须重新加入
+            if current_channel_id == 0:
+                print(f"[频道检查] ⚠️ 用户处于 Root 频道! 重新加入 {channel_name}")
+                self.switch_channel(frequency, caller="频道检查-Root")
                 return
+
+            if current_channel_id is None:
+                print(f"[频道检查] 未加入任何频道，重新加入 {channel_name}")
+                self.switch_channel(frequency, caller="频道检查-无频道")
+                return
+
             try:
                 current_channel = self.mumble.channels[current_channel_id]
-                if current_channel["name"] != channel_name:
-                    print(f"[频道检查] 频道不匹配 ({current_channel['name']} -> {channel_name})，重新加入")
-                    self.switch_channel(frequency)
-            except (KeyError, Exception):
-                print(f"[频道检查] 频道 ID {current_channel_id} 无效，重新加入 {channel_name}")
-                self.switch_channel(frequency)
+                current_name = current_channel["name"]
+                if current_name != channel_name:
+                    print(f"[频道检查] 频道不匹配 ({current_name} -> {channel_name})，重新加入")
+                    self.switch_channel(frequency, caller="频道检查-不匹配")
+                else:
+                    print(f"[频道检查] ✅ 频道匹配 ({current_name})")
+            except (KeyError, Exception) as e:
+                print(f"[频道检查] 频道 ID {current_channel_id} 无效 ({e})，重新加入 {channel_name}")
+                self.switch_channel(frequency, caller="频道检查-ID无效")
         except Exception as e:
+            import traceback
             print(f"[频道检查] 错误: {e}")
+            traceback.print_exc()
 
     def monitor_frequency(self):
         """监控 COM1 频率变化和连接/频道状态"""
         last_frequency = None
         last_connected = False
-        PING_TIMEOUT = 3
         tick = 0
-        first_loop = True
+        freq_read_fail_count = 0
+        channel_switch_attempted = False  # 是否已尝试过首次频道切换
         while self.running:
             try:
                 tick += 1
                 self._sync_ping_heartbeat()
-                mumble_connected = bool(self.mumble.connected)
+
+                # ★ 使用独立连接标记作为主要判断，不依赖 mumble.connected 或 is_alive()
+                mumble_connected = self._connection_established.is_set()
+
+                # 诊断信息
+                pymumble_connected_raw = bool(self.mumble.connected)
+                thread_alive = self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else True
+                ping_ago = time.time() - self._last_ping_rcv
+                ping_timeout = ping_ago > 3
+
                 myself = self.mumble.users.myself
                 my_channel_id = myself["channel_id"] if myself else None
                 chan_name = ""
-                if my_channel_id:
+                if my_channel_id is not None:
                     try:
                         chan_name = self.mumble.channels[my_channel_id]["name"]
                     except:
                         chan_name = "<无效ID>"
-                thread_alive = self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else True
-                ping_ago = time.time() - self._last_ping_rcv
-                ping_timeout = ping_ago > PING_TIMEOUT
-                print(f"[监控 T{tick}] connected={mumble_connected}"
+
+                print(f"[监控 T{tick}] 连接标记={mumble_connected}"
+                      f" | pymumble.connected={pymumble_connected_raw}"
                       f" | thread_alive={thread_alive}"
                       f" | channel_id={my_channel_id}"
-                      f" | channel_name={chan_name}"
+                      f" | channel_name={chan_name!r}"
                       f" | ping_ago={ping_ago:.1f}s"
-                      f"{' ⚠️PING_TIMEOUT' if ping_timeout else ''}")
-                if not thread_alive or (mumble_connected and ping_timeout):
-                    if mumble_connected:
-                        mumble_connected = False
-                        print(f"[监控 T{tick}] 主动标记断连")
+                      f"{' ⚠️线程死亡' if not thread_alive else ''}"
+                      f"{' ⚠️超时' if ping_timeout else ''}")
+
+                # ★ 不再根据 thread_alive 主动标记断连！仅记录日志供诊断
+                # 连接状态变化由回调管理，通知 UI
                 if mumble_connected != last_connected:
                     last_connected = mumble_connected
                     print(f"[监控 T{tick}] 连接状态变化: {not mumble_connected} -> {mumble_connected}")
                     if self.on_connection_change:
                         self.on_connection_change(mumble_connected)
+
                 if mumble_connected:
                     freq = self.xplane.read_com1_freq(self.xplane.addr)
                     if freq is not None:
+                        freq_read_fail_count = 0
                         if freq != last_frequency:
                             print(f"[监控 T{tick}] 频率变化: {last_frequency} -> {freq}")
-                            self.switch_channel(freq)
+                            self.switch_channel(freq, caller=f"监控-T{tick}-变")
                             last_frequency = freq
                         else:
                             self._ensure_in_correct_channel(freq)
-                first_loop = False
+                    else:
+                        freq_read_fail_count += 1
+                        print(f"[监控 T{tick}] ⚠️ read_com1_freq 返回 None (连续{freq_read_fail_count}次)")
+                        # 即使读不到频率，也用 last_frequency 检查频道
+                        if last_frequency is not None:
+                            print(f"[监控 T{tick}] 用 last_frequency={last_frequency} 做频道检查")
+                            self._ensure_in_correct_channel(last_frequency)
+                        else:
+                            print(f"[监控 T{tick}] 无 last_frequency 可用，跳过频道检查")
+
+                    # 首次连接后确保至少尝试过一次频道切换
+                    if not channel_switch_attempted and last_frequency is not None:
+                        channel_switch_attempted = True
+                        print(f"[监控 T{tick}] 首次连接后的频道切换已完成")
+                else:
+                    print(f"[监控 T{tick}] 未连接，跳过频率读取")
+
             except Exception as e:
+                import traceback
                 if self.running:
-                    print(f"[监控] 频率监控错误: {e}")
+                    print(f"[监控 T{tick}] 错误: {e}")
+                    traceback.print_exc()
             time.sleep(1)
 
     # ---------- 音量 ----------
@@ -564,6 +656,10 @@ class MumbleRadioClient:
                     if not self.stream or not self.mumble:
                         continue
                     try:
+                        # ★ 先检查独立连接标记（比 mumble.connected 更可靠）
+                        if not self._connection_established.is_set():
+                            print("[DEBUG] 连接标记已清除，跳过音频发送")
+                            continue
                         if not self.mumble.connected > 0:
                             continue
                         if not self.mumble.channels:
@@ -571,7 +667,7 @@ class MumbleRadioClient:
                         if not self.mumble.users.myself or not self.mumble.users.myself["channel_id"]:
                             continue
 
-                        data = self.stream.read(self.CHUNK, exception_on_overflow=False)
+                        data = self._safe_stream_read(self.CHUNK)
                         if data:
                             audio_data = np.frombuffer(data, dtype=np.int16)
                             audio_data = (audio_data * (self.settings.mic_volume / 100.0)).astype(np.int16)
@@ -585,6 +681,8 @@ class MumbleRadioClient:
                 time.sleep(0.1)
 
     def handle_incoming_audio(self, user, soundchunk):
+        if not self.mumble.users.myself:
+            return
         if user["name"] != self.mumble.users.myself["name"]:
             try:
                 # 标记正在接收
@@ -596,9 +694,24 @@ class MumbleRadioClient:
 
                 audio_data = np.frombuffer(soundchunk.pcm, dtype=np.int16)
                 audio_data = (audio_data * (self.settings.speaker_volume / 100.0)).astype(np.int16)
-                self.output_stream.write(audio_data.tobytes())
+                self._safe_stream_write(audio_data.tobytes())
             except Exception as e:
                 print(f"音频输出错误: {e}")
+
+    def _safe_stream_read(self, chunk):
+        """线程安全地读取音频流，处理流被外部关闭的竞态。"""
+        try:
+            return self.stream.read(chunk, exception_on_overflow=False)
+        except (OSError, IOError, Exception) as e:
+            print(f"[DEBUG] 音频流读取错误（可能已被重初始化）: {e}")
+            return None
+
+    def _safe_stream_write(self, data):
+        """线程安全地写入音频流，处理流被外部关闭的竞态。"""
+        try:
+            self.output_stream.write(data)
+        except (OSError, IOError, Exception) as e:
+            print(f"[DEBUG] 音频流写入错误（可能已被重初始化）: {e}")
 
     def reinitialize_audio(self):
         try:

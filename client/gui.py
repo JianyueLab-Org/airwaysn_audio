@@ -290,6 +290,13 @@ class RadioGUI(QMainWindow):
                 # 重连情况：只更新连接状态，不创建新窗口
                 print("重连成功，更新主窗口状态")
                 self.main_window.update_connection_status(True)
+                # 重连时也切一次频道
+                if self.radio_client and self.radio_client._initial_freq is not None:
+                    try:
+                        self.radio_client.switch_channel(
+                            self.radio_client._initial_freq, caller="GUI-重连")
+                    except Exception as e:
+                        print(f"[DEBUG-GUI] 重连频道切换失败: {e}")
                 return
 
             # 首次连接：创建主窗口
@@ -317,7 +324,19 @@ class RadioGUI(QMainWindow):
                 if self.main_window:
                     self.main_window.update_connection_status(connected)
             self.radio_client.on_connection_change = on_connection_change
-            
+
+            # ★ 连接后立即读取频率并切频道（不等 monitor 线程首次循环）
+            try:
+                initial_freq = self.radio_client.aq.get("COM_ACTIVE_FREQUENCY:1")
+                if initial_freq is not None:
+                    print(f"[DEBUG-GUI] 连接成功，初始频率 {initial_freq:.3f} MHz，立即切换到频道")
+                    self.radio_client.switch_channel(initial_freq, caller="GUI-on_connected")
+                    self.radio_client._initial_freq = initial_freq
+                else:
+                    print(f"[DEBUG-GUI] 连接后无法读取 SimConnect 频率")
+            except Exception as e:
+                print(f"[DEBUG-GUI] 初始频率读取/切换异常: {e}")
+
             # 启动监控和语音线程
             self.radio_client.monitor_thread = threading.Thread(target=self.radio_client.monitor_frequency)
             self.radio_client.voice_thread = threading.Thread(target=self.radio_client.handle_voice)
@@ -357,15 +376,21 @@ class RadioGUI(QMainWindow):
             self.radio_client = MumbleRadioClient("hjdczy.top", username, password, settings=self.settings)
             print("MumbleRadioClient 初始化完成")
             
-            # 设置连接成功/断开回调
+            # Mumble 连接回调：同步更新 radio_client 的独立连接标记
             self.radio_client.mumble.callbacks.set_callback(
                 pymumble.constants.PYMUMBLE_CLBK_CONNECTED, 
-                lambda: self.connection_signal.connected.emit()
+                lambda: (
+                    self.radio_client.set_connection_state(True),
+                    self.connection_signal.connected.emit(),
+                ),
             )
 
             self.radio_client.mumble.callbacks.set_callback(
                 pymumble.constants.PYMUMBLE_CLBK_DISCONNECTED,
-                lambda: self.connection_signal.disconnected.emit()
+                lambda: (
+                    self.radio_client.set_connection_state(False),
+                    self.connection_signal.disconnected.emit(),
+                ),
             )
             
             def run_client():
