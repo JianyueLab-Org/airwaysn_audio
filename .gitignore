@@ -3,3 +3,4 @@ radio_settings.json
 tools
 .vscode
 xplane_radio_settings.json
+.venv*

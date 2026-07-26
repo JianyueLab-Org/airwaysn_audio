@@ -1,4 +1,8 @@
 __pycache__
+# slice2py 生成的绑定，在服务器上按实际的 Mumble 版本生成
+MumbleServer
+MumbleServer_ice.py
+MumbleServer.ice
 Murmur
-Murmur_ice.py 
+Murmur_ice.py
 Murmur.ice
