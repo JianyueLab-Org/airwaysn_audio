@@ -2,3 +2,5 @@ temp.wav
 radio_settings.json
 tools
 .vscode
+
+.venv*
