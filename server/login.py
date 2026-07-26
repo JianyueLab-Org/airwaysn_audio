@@ -8,6 +8,8 @@
 # 生成绑定：
 #     slice2py /usr/share/mumble-server/MumbleServer.ice     # Debian 13
 import sys
+import os
+import signal
 import Ice
 import requests
 import json
@@ -20,8 +22,11 @@ except ImportError:                            # 1.4 及更早叫 Murmur
     import Murmur as MumbleIce
 
 ICE_PROXY = "Meta:tcp -h 127.0.0.1 -p 6502"
-ICE_SECRET = ""            # 对应配置文件里的 icesecretwrite
+ICE_SECRET = "yoyo14185721"            # 对应配置文件里的 icesecretwrite
 SERVER_ID = 1
+
+# 全局关闭标志，Ctrl+C 时立即设置，阻止清理时再做 Ice 调用
+_shutting_down = False
 
 
 class AuthenticatorI(MumbleIce.ServerAuthenticator):
@@ -31,16 +36,33 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
         self.context = context or {}
         self.online_users = {}  # 用户名 -> session，由 ServerCallbackI 维护
 
+        # oneway 代理用于 kickUser —— 在 Ice 分发线程中做同步 Ice 调用
+        # 可能因线程池耗尽而死锁，oneway 发完即返，不等待响应
+        try:
+            self._kick_proxy = MumbleIce.ServerPrx.uncheckedCast(
+                server.ice_oneway())
+        except Exception:
+            self._kick_proxy = None
+
     def kick_previous_session(self, name):
         """同名账号已经在线就把旧会话踢掉。
 
         踢人要带上 secret context，否则服务端会抛 InvalidSecretException。
+
+        注意：authenticate 在 Ice 服务端分发线程中运行，如果再发起同步
+        Ice 调用（kickUser）可能导致线程池耗尽而死锁。这里优先使用 oneway
+        代理，发送即返回，不等待响应。
         """
+        if _shutting_down:
+            return
         old_session = self.online_users.get(name)
         if old_session is None:
             return
         try:
-            self.server.kickUser(old_session, "您的账号在其他位置登录", self.context)
+            kicker = self._kick_proxy or self.server
+            kicker.kickUser(old_session, "您的账号在其他位置登录", self.context)
+        except Ice.ConnectionTimeoutException:
+            pass  # 关闭时连接的 Ice 已断，忽略
         except Exception as e:
             print(f"踢出用户失败: {e}")
 
@@ -179,13 +201,47 @@ def login_ATIS(cid, password):
 
 
 
+def signal_handler(signum, frame):
+    """收到 Ctrl+C 或 SIGTERM 时立即标记关闭，触发 Ice shutdown。"""
+    global _shutting_down
+    if _shutting_down:
+        return  # 重复信号不做处理
+    _shutting_down = True
+    print(f"\n收到信号 {signum}，正在关闭 ...")
+    # communicator 是全局的，在 main 里赋值
+    if _communicator:
+        try:
+            _communicator.shutdown()
+        except Exception:
+            pass
+
+
+_communicator = None
+
+
 def main():
-    # 显式设置 Ice 编码版本为 1.0
+    global _shutting_down, _communicator
+
+    # 注册信号处理（确保主线程处理）
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # 显式设置 Ice 编码版本为 1.0，并缩短 Ice 超时
     init_data = Ice.InitializationData()
     init_data.properties = Ice.createProperties()
     init_data.properties.setProperty("Ice.Default.EncodingVersion", "1.0")
+    init_data.properties.setProperty("Ice.ACM.Close", "3")          # 空闲超时主动关闭
+    init_data.properties.setProperty("Ice.Connection.ConnectTimeout", "5")
+    init_data.properties.setProperty("Ice.Connection.CloseTimeout", "1")
+    # 加大线程池避免分发线程中做同步 Ice 调用时死锁
+    init_data.properties.setProperty("Ice.ThreadPool.Server.Size", "4")
+    init_data.properties.setProperty("Ice.ThreadPool.Server.SizeMax", "8")
+    init_data.properties.setProperty("Ice.ThreadPool.Client.Size", "4")
+    init_data.properties.setProperty("Ice.ThreadPool.Client.SizeMax", "8")
 
     with Ice.initialize(init_data) as communicator:
+        _communicator = communicator
+
         # 设置Ice连接，强制代理使用 1.0 编码
         base = communicator.stringToProxy(ICE_PROXY)
         meta = MumbleIce.MetaPrx.checkedCast(base)
@@ -199,6 +255,9 @@ def main():
         if not server:
             print("无法获取服务器实例")
             return
+
+        # 尽早给服务器代理设超时，避免关闭时卡住
+        server = MumbleIce.ServerPrx.checkedCast(server.ice_timeout(3000))
 
         # 创建Ice适配器
         adapter = communicator.createObjectAdapterWithEndpoints(
@@ -231,18 +290,22 @@ def main():
             # 保持程序运行
             communicator.waitForShutdown()
         except Ice.Exception as e:
-            print(f"Ice异常: {e}")
-            traceback.print_exc()
+            if not _shutting_down:
+                print(f"Ice异常: {e}")
+                traceback.print_exc()
         finally:
-            # 清理
-            try:
-                server.removeCallback(callback_prx, context)
-            except:
-                pass
-            try:
-                server.setAuthenticator(None, context)
-            except:
-                pass
+            # 关闭时不再做任何 Ice 调用
+            if not _shutting_down:
+                try:
+                    server.removeCallback(callback_prx, context)
+                except Exception:
+                    pass
+                try:
+                    server.setAuthenticator(None, context)
+                except Exception:
+                    pass
+            else:
+                print("清理跳过 — 正在关闭中")
 
 if __name__ == "__main__":
     main()
