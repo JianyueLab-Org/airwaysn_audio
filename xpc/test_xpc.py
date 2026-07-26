@@ -6,6 +6,7 @@
 必须能被 can-fsd 原样解回来，RREF 回包必须按 X-Plane 的格式解析。
 """
 
+import inspect
 import os
 import struct
 import sys
@@ -368,6 +369,44 @@ class XPlaneParsingTest(unittest.TestCase):
         self.assertEqual(len(set(xplane.INDEX_TO_NAME)), len(xplane.DATAREFS))
 
 
+class ComFrequencyFallbackTest(unittest.TestCase):
+    """X-Plane 11.30 以前没有 8.33 那个 dataref，两个一起订、优先精确的。
+
+    不存在的 dataref X-Plane 只是不推送，不报错，所以不用按版本分支。
+    """
+
+    def setUp(self):
+        self.link = xplane.XPlaneLink()
+
+    def test_prefers_the_precise_dataref(self):
+        # 两个都有时用 8.33 那个，它能表示 132.005
+        self.assertEqual(self.link._frequency(132005.0, 13200.0), 132.005)
+
+    def test_falls_back_to_the_legacy_dataref(self):
+        # 老的单位是 10 kHz：12150 -> 121.500
+        self.assertEqual(self.link._frequency(None, 12150.0), 121.5)
+
+    def test_falls_back_when_precise_is_zero(self):
+        self.assertEqual(self.link._frequency(0.0, 11800.0), 118.0)
+
+    def test_none_when_neither_is_available(self):
+        self.assertIsNone(self.link._frequency(None, None))
+        self.assertIsNone(self.link._frequency(0.0, 0.0))
+
+    def test_snapshot_uses_the_legacy_value(self):
+        self.link.values = {"com1_legacy": 12150.0}
+        self.assertEqual(self.link.snapshot()["com1"], 121.5)
+
+    def test_both_com_radios_have_a_fallback(self):
+        for name in ("com1", "com2"):
+            self.assertIn(f"{name}_legacy", xplane.DATAREFS)
+
+    def test_legacy_datarefs_have_their_own_indices(self):
+        # 索引撞了会让回包对错 dataref
+        self.assertEqual(len(set(xplane.NAME_TO_INDEX.values())),
+                         len(xplane.DATAREFS))
+
+
 class WaitingTest(unittest.TestCase):
     """X-Plane 没起来的时候不该一秒重订一次。
 
@@ -437,6 +476,7 @@ class SnapshotTest(unittest.TestCase):
 
     def test_zero_frequency_is_none(self):
         self.link.values["com1"] = 0.0
+        self.link.values.pop("com1_legacy", None)
         self.assertIsNone(self.link.snapshot()["com1"])
 
     def test_heading_is_wrapped(self):
@@ -1025,6 +1065,22 @@ class AnimationValuesTest(unittest.TestCase):
     def test_tcas_cap_leaves_room_for_own_aircraft(self):
         # 数组是 64 个位置，0 号给本机
         self.assertEqual(self.module.MAX_TCAS_TARGETS, 63)
+
+    def test_tcas_is_probed_not_version_gated(self):
+        """能力应当靠 findDataRef 探测，不是按版本号写死。
+
+        X-Plane 11.50 以下没有 TCAS 接管，但按版本分支很容易写错，也挡不住
+        别的插件已经占了 AI 机位的情况。
+        """
+        import inspect
+        source = inspect.getsource(self.module.PythonInterface._find_tcas_datarefs)
+        self.assertIn("findDataRef", source)
+        self.assertIn("tcas_available", source)
+
+    def test_planes_are_not_acquired_without_tcas(self):
+        # 没这个能力还去抢 AI 机位，会挡住 LiveTraffic 之类真正用得上的插件
+        source = inspect.getsource(self.module.PythonInterface.XPluginEnable)
+        self.assertIn("tcas_available", source)
 
 
 if __name__ == "__main__":

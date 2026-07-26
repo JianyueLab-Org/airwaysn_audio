@@ -751,8 +751,11 @@ class SettingsDialog(QDialog):
 
         note = QLabel(
             "需要在 X-Plane 里装 XPPython3，并把 plugin/PI_XpcTraffic.py 放进\n"
-            "Resources/plugins/PythonPlugins/。\n\n"
+            "Resources/plugins/PythonPlugins/。装哪个版本要看模拟器：\n"
+            "    X-Plane 12    → XPPython3 v4.x\n"
+            "    X-Plane 11.52 → XPPython3 v3.1.5（v4 不兼容 XP11）\n\n"
             "没装模型也能用——他机仍然会出现在 TCAS 和 ND 上，只是看不到机身。\n"
+            "TCAS 需要 X-Plane 11.50 以上；更老的版本只会把飞机画出来。\n"
             "同时开着 LiveTraffic 之类的插件会互相抢 AI 机位，建议只开一个。")
         note.setStyleSheet("color: #9aa0a6; font-size: 11px;")
         note.setWordWrap(True)

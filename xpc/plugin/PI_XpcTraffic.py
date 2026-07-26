@@ -4,7 +4,18 @@
 
     <X-Plane>/Resources/plugins/PythonPlugins/PI_XpcTraffic.py
 
-需要先装 XPPython3（https://xppython3.readthedocs.io）。
+需要先装 XPPython3（https://xppython3.readthedocs.io）。**装哪个版本取决于模拟器**：
+
+    X-Plane 12        XPPython3 v4.x
+    X-Plane 11.52     XPPython3 v3.1.5   —— v4 是用 SDK 420 编的，不兼容 XP11
+
+TCAS 接管（override_TCAS + sim/cockpit2/tcas/targets/*）是 X-Plane 11.50 引入
+的。11.50 以前只有旧的 19 个多人机位 dataref，这里不去支持——XPPython3 v3.1.5
+本来也是对着 11.52 发的。所以能力是**探测**出来的，不是按版本号写死的：找不到
+TCAS 的 dataref 就只画飞机、不送 TCAS，并在日志里说清楚。
+
+反过来不用担心：X-Plane 在接管 TCAS 时会自动把最近 19 架镜像回旧的
+sim/multiplayer/position/plane#_* dataref，所以还在读那套的老插件照样能看到。
 
 这个插件**故意做得很薄**。他机航迹、插值、机型匹配全在客户端算好，这里只做两
 件 X-Plane 之外做不到的事：
@@ -146,6 +157,27 @@ class PythonInterface:
         # 否则 X-Plane 解析 OBJ8 时找不到它们，模型能出来但不会动。
         self._register_animation_datarefs()
 
+        self._find_tcas_datarefs()
+
+        xp.registerFlightLoopCallback(self.flight_loop, -1, 0)
+        xp.log(f"XPC 他机插件已启动（{self._version_note()}）")
+        return self.Name, self.Sig, self.Desc
+
+    @staticmethod
+    def _version_note():
+        """把模拟器和 SDK 版本记进日志——用户报问题时第一件要知道的事。"""
+        try:
+            sim, xplm, _ = xp.getVersions()
+            return f"X-Plane {sim}, XPLM {xplm}"
+        except Exception:
+            return "版本未知"
+
+    def _find_tcas_datarefs(self):
+        """探测 TCAS 接管能力。
+
+        override_TCAS 和 tcas/targets 是 X-Plane 11.50 才有的。找不到就只画飞
+        机不送 TCAS——按版本号写死不如直接问 X-Plane 有没有这个 dataref。
+        """
         self.override_tcas = xp.findDataRef("sim/operation/override/override_TCAS")
         self.tcas = {
             name: xp.findDataRef(f"sim/cockpit2/tcas/targets/{path}")
@@ -159,9 +191,11 @@ class PythonInterface:
                 ("flight_id", "flight_id"), ("icao_type", "icao_type"),
             )}
 
-        xp.registerFlightLoopCallback(self.flight_loop, -1, 0)
-        xp.log("XPC 他机插件已启动")
-        return self.Name, self.Sig, self.Desc
+        missing = [name for name, ref in self.tcas.items() if ref is None]
+        self.tcas_available = bool(self.override_tcas) and not missing
+        if not self.tcas_available:
+            xp.log("这个 X-Plane 版本没有 TCAS 接管（需要 11.50 以上）"
+                   f"，他机只会被画出来，不会进 TCAS。缺少: {missing or 'override_TCAS'}")
 
     def _register_animation_datarefs(self):
         """注册 libxplanemp 那套动画 dataref。
@@ -191,14 +225,27 @@ class PythonInterface:
             xp.log(f"绑定 {PLUGIN_PORT} 失败: {e}")
             return 0
 
+        # 只有要送 TCAS 才需要抢 AI 机位。没这个能力就别抢——白占着会挡住
+        # LiveTraffic 之类真正用得上的插件。
+        if not self.tcas_available:
+            return 1
+
         # acquirePlanes 是写 override_TCAS 的前提（X-Plane 的 dataref 文档里
         # 明写 "Only writeable by the plugin that has the AI planes acquired"）
-        self.have_planes = bool(xp.acquirePlanes())
+        try:
+            self.have_planes = bool(xp.acquirePlanes())
+        except Exception as e:
+            xp.log(f"acquirePlanes 失败: {e}")
+            self.have_planes = False
+
         if self.have_planes:
             xp.setDatai(self.override_tcas, 1)
             xp.log("已取得 AI 机位控制权，TCAS 接管")
         else:
-            _, _, who = xp.countAircraft()
+            try:
+                _, _, who = xp.countAircraft()
+            except Exception:
+                who = "?"
             xp.log(f"取不到 AI 机位控制权（被插件 {who} 占着），他机不会进 TCAS")
         return 1
 
@@ -352,9 +399,10 @@ class PythonInterface:
         """填 sim/cockpit2/tcas/targets/*。
 
         第 0 位是本机，他机从 1 开始。带上 flight_id 和 icao_type，ND 上显示
-        的呼号和机型才是对的。
+        的呼号和机型才是对的。X-Plane 会自动把最近 19 架镜像回旧的
+        sim/multiplayer/position/plane#_*，所以老插件也能看到。
         """
-        if not self.have_planes:
+        if not (self.tcas_available and self.have_planes):
             return
 
         count = len(entries)
@@ -403,7 +451,7 @@ class PythonInterface:
         for aircraft in self.aircraft.values():
             aircraft.destroy()
         self.aircraft.clear()
-        if self.have_planes:
+        if self.tcas_available and self.have_planes:
             try:
                 # 目标数清零，否则 ND 上会留下一圈不动的光点
                 xp.setDatavi(self.tcas["modeS"], [0] * MAX_TCAS_TARGETS,

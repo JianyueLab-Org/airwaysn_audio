@@ -41,9 +41,13 @@ DATAREFS = {
     "heading_true": "sim/flightmodel/position/psi",
     "squawk":       "sim/cockpit/radios/transponder_code",
     "xpdr_mode":    "sim/cockpit/radios/transponder_mode",
-    # 0.001 MHz 精度，支持 8.33 kHz 间隔
+    # 0.001 MHz 精度，支持 8.33 kHz 间隔。X-Plane 11.30 起才有。
     "com1":         "sim/cockpit2/radios/actuators/com1_frequency_hz_833",
     "com2":         "sim/cockpit2/radios/actuators/com2_frequency_hz_833",
+    # 老的 dataref，0.01 MHz 精度。两个一起订，谁回就用谁——不存在的 dataref
+    # X-Plane 只是不推送，不会报错，所以不需要按版本分支。
+    "com1_legacy":  "sim/cockpit/radios/com1_freq_hz",
+    "com2_legacy":  "sim/cockpit/radios/com2_freq_hz",
     "com1_power":   "sim/cockpit2/radios/actuators/com1_power",
     "on_ground":    "sim/flightmodel/failures/onground_any",
 }
@@ -253,15 +257,22 @@ class XPlaneLink:
             "heading": raw.get("heading_true", 0.0) % 360.0,
             "squawk": int(raw.get("squawk", 2000)),
             "xpdr_mode": int(raw.get("xpdr_mode", 0)),
-            "com1": self._frequency(raw.get("com1")),
-            "com2": self._frequency(raw.get("com2")),
+            "com1": self._frequency(raw.get("com1"), raw.get("com1_legacy")),
+            "com2": self._frequency(raw.get("com2"), raw.get("com2_legacy")),
             "com1_power": bool(raw.get("com1_power", 1)),
             "on_ground": bool(raw.get("on_ground", 0)),
         }
 
     @staticmethod
-    def _frequency(raw):
-        """_833 dataref 的原始值除以 1000 就是兆赫。"""
-        if not raw or raw <= 0:
-            return None
-        return round(float(raw) / 1000.0, 3)
+    def _frequency(precise, legacy=None):
+        """COM 频率（MHz）。优先 8.33 那个，没有就用老的。
+
+        _833 的单位是 kHz，除以 1000 得兆赫，能表示 8.33 间隔（132.005）。
+        老的那个单位是 10 kHz，除以 100 得兆赫，只有 0.01 MHz 精度——X-Plane
+        11.30 以前只有它，8.33 的频道会被舍到最近的 25 kHz。
+        """
+        if precise and precise > 0:
+            return round(float(precise) / 1000.0, 3)
+        if legacy and legacy > 0:
+            return round(float(legacy) / 100.0, 3)
+        return None
