@@ -4,4 +4,3 @@ __pycache__/
 *.pyc
 xpc_settings.json
 xpc.log*
-opus.dll
