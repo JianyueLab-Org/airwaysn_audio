@@ -427,6 +427,28 @@ class VoiceChannelTest(unittest.TestCase):
         self.assertFalse(caster._channel_wanted.is_set(),
                          "频率没变就不该反复叫醒工作线程")
 
+    def test_root_channel_does_not_block_transmit(self):
+        """根频道的 channel_id 是 0，不能当成"没进频道"。
+
+        写成 `not myself["channel_id"]` 的话，人在根频道时 PTT 会一声不吭地
+        什么都不发——用户看到的就是"语音用不了"，日志里一个字都没有。
+        """
+        source = inspect.getsource(self.voice.Voice._run)
+        self.assertNotIn('not myself["channel_id"]', source)
+        self.assertIn('myself["channel_id"] is None', source)
+
+    def test_silent_ptt_is_explained(self):
+        # 按了 PTT 却一帧没发，必须说出原因，否则没法查
+        source = inspect.getsource(self.voice.Voice)
+        self.assertIn("_skip_reason", source)
+        self.assertIn("一帧都没发出去", source)
+
+    def test_frames_are_counted(self):
+        # "发了但对方听不到"和"根本没发"是两回事，只有帧数能分开
+        source = inspect.getsource(self.voice.Voice)
+        self.assertIn("_sent_frames", source)
+        self.assertIn("_received_frames", source)
+
     def test_switching_happens_on_a_worker_thread(self):
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_channel_loop", source)

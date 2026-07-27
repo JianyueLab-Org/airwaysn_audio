@@ -76,6 +76,9 @@ class Voice:
         self._rate = 48000
         self._chunk = 960
         self._last_rx = 0.0
+        self._sent_frames = 0           # 本次 PTT 已发出的帧数
+        self._received_frames = 0       # 本段接收已播放的帧数
+        self._skip_reason = ""          # 明明按着 PTT 却没发的原因
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
         self._channel_lock = threading.Lock()   # 频道切换不能并发
         self._channel_wanted = threading.Event()  # 有新频率要切
@@ -113,7 +116,22 @@ class Voice:
         self._output = self._audio.open(
             format=FORMAT, channels=CHANNELS, rate=self._rate, output=True,
             frames_per_buffer=self._chunk, output_device_index=output_index)
-        log.info("音频就绪：%d Hz，每帧 %d 采样", self._rate, self._chunk)
+        # 把真正打开的设备名记下来。"听不到/说不出"最常见的原因就是选错了
+        # 设备（比如麦克风指到了不存在的虚拟声卡），只报采样率看不出来。
+        log.info("音频就绪：%d Hz，每帧 %d 采样；麦克风=%s，扬声器=%s",
+                 self._rate, self._chunk,
+                 self._device_name(input_index, True),
+                 self._device_name(output_index, False))
+
+    def _device_name(self, index, is_input):
+        try:
+            if index is None:
+                info = (self._audio.get_default_input_device_info() if is_input
+                        else self._audio.get_default_output_device_info())
+                return f"[系统默认] {info.get('name', '?')}"
+            return self._audio.get_device_info_by_index(index).get("name", "?")
+        except Exception as e:
+            return f"取不到设备信息（{e}）"
 
     def _best_rate(self):
         input_index = getattr(self.settings, "input_device_index", None)
@@ -327,9 +345,27 @@ class Voice:
         if value == self.transmitting:
             return
         self.transmitting = value
-        log.debug("PTT %s", "按下" if value else "松开")
+        if value:
+            self._sent_frames = 0
+            self._skip_reason = ""
+            log.info("PTT 按下")
+        else:
+            # 松开时把这一次到底发出去多少帧说清楚。"语音用不了"最常见的两种
+            # 情况——根本没进发送分支、和发了但对方听不到——只有这个数能分开。
+            if self._sent_frames:
+                log.info("PTT 松开，本次发出 %d 帧（约 %.1f 秒）",
+                         self._sent_frames, self._sent_frames * 0.02)
+            else:
+                log.warning("PTT 松开，一帧都没发出去：%s",
+                            self._skip_reason or "原因不明")
         if self.on_ptt:
             self.on_ptt(value)
+
+    def _skip(self, reason):
+        """记下这一轮为什么没发。同一个原因只记一次，别刷屏。"""
+        if reason != self._skip_reason:
+            self._skip_reason = reason
+            log.debug("暂时不发送: %s", reason)
 
     def _on_sound(self, user, chunk):
         """pymumble 的库线程调用。"""
@@ -340,16 +376,22 @@ class Voice:
             self._last_rx = time.time()
             if not self.receiving:
                 self.receiving = True
+                self._received_frames = 0
+                log.info("收到 %s 的语音", user.get("name", "?"))
                 if self.on_rx:
                     self.on_rx(True)
 
             volume = getattr(self.settings, "speaker_volume", 100) / 100.0
             samples = np.frombuffer(chunk.pcm, dtype=np.int16)
             samples = (samples * volume).astype(np.int16)
-            if self._output:
-                self._output.write(samples.tobytes())
+            if not self._output:
+                # 收到了但扬声器没开——"听不到别人"和"根本没人说话"是两回事
+                log.warning("收到语音但扬声器没有打开，听不到")
+                return
+            self._output.write(samples.tobytes())
+            self._received_frames += 1
         except Exception as e:
-            log.debug("播放收到的音频出错: %s", e)
+            log.warning("播放收到的音频出错: %s", e)
 
     def _run(self):
         """发送线程：按住 PTT 就把麦克风送上去，同时管接收灯的超时。"""
@@ -357,22 +399,39 @@ class Voice:
             try:
                 if self.receiving and time.time() - self._last_rx > RX_TIMEOUT:
                     self.receiving = False
+                    log.info("接收结束，本段 %d 帧（约 %.1f 秒）",
+                             self._received_frames, self._received_frames * 0.02)
                     if self.on_rx:
                         self.on_rx(False)
 
-                if not (self.transmitting and self.connected and self._input):
+                if not self.transmitting:
+                    time.sleep(0.02)
+                    continue
+                if not self.connected:
+                    self._skip("语音服务器未连接")
+                    time.sleep(0.02)
+                    continue
+                if not self._input:
+                    self._skip("麦克风没有打开")
                     time.sleep(0.02)
                     continue
 
                 myself = self.mumble.users.myself
-                if not myself or not myself["channel_id"]:
+                if not myself:
+                    self._skip("服务器还没回报我们自己的用户信息")
+                    time.sleep(0.05)
+                    continue
+                # 注意是 is None：根频道的 channel_id 就是 0，写成 not 会把
+                # "在根频道"当成"没进频道"，PTT 于是一声不吭地什么都不做。
+                if myself["channel_id"] is None:
+                    self._skip("还没有进入任何频道")
                     time.sleep(0.05)
                     continue
 
                 try:
                     data = self._input.read(self._chunk, exception_on_overflow=False)
                 except Exception as e:
-                    log.debug("读麦克风出错: %s", e)
+                    self._skip(f"读麦克风出错: {e}")
                     time.sleep(0.05)
                     continue
 
@@ -380,6 +439,7 @@ class Voice:
                 samples = (np.frombuffer(data, dtype=np.int16) * volume).astype(np.int16)
                 with self._lock:
                     self.mumble.sound_output.add_sound(samples.tobytes())
+                self._sent_frames += 1
             except Exception as e:
                 log.debug("发送线程出错: %s", e)
                 time.sleep(0.1)
