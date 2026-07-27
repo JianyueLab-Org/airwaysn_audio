@@ -146,6 +146,17 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 - **RX** → `UserState.listening_channel_add/remove` (Mumble 1.4 channel listeners), sent via `send_message(PYMUMBLE_MSG_TYPES_USERSTATE, …)`. pymumble's `ModUserState` only forwards a fixed set of fields and drops these.
 - **TX** → a `VoiceTarget` carrying **all** TX channels at once. `sound_output.set_whisper()` cannot do this: for `id == 1` pymumble copies only `targets[0]`, so multi-channel transmit has to build the message directly.
 
+**"没有权限（频道监听需要 Listen 权限）" is a server ACL problem, not a client bug.** Channel listeners need the `Listen` permission (`0x800` in `src/ACL.h`), which **Mumble 1.4 added and older default ACLs do not carry** — a server upgraded from 1.2/1.3 keeps its old root ACL, so every listener request is refused and the controller just hears silence on every frequency except the one it joined. Frequency channels are temporary children of root, so granting it once on root is enough:
+
+```powershell
+python server\grant_listen.py            # 看当前 ACL，不改
+python server\grant_listen.py --apply    # 真的写进去
+```
+
+Run it on the Mumble host (Ice only listens on `127.0.0.1`). It reads the root ACL, finds the `all` group entry that applies to subchannels, ORs in `Listen`, and reads back to confirm. If `Listen` is already granted and radios are still silent, the cause is the `listenersperuser` / `listenersperchannel` caps in `mumble-server.ini` instead — `voice.py`'s `PERMISSIONDENIED` callback distinguishes those three cases by denial type.
+
+Note that `getACL` returns inherited ACLs too and those are read-only; the script filters them before `setACL`. On root there are none, but don't rely on that if you adapt it for another channel.
+
 The client still **joins** the selected radio's channel (the one marked `▸`) rather than sitting in root. That is deliberate: if the server is Mumble 1.3, the listener message is silently ignored and the controller would otherwise hear nothing at all — this way the primary frequency always works and `listeners_working` drives a warning in the status bar. Incoming audio is routed to a radio by `user["channel_id"]`, which is what makes per-frequency RX indication and per-frequency volume possible.
 
 ## The ATIS client
