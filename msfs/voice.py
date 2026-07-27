@@ -24,6 +24,7 @@ mumblecompat.install()
 import numpy as np
 import pyaudio
 import pymumble_py3 as pymumble
+from pymumble_py3 import messages
 from pymumble_py3.constants import (PYMUMBLE_CLBK_SOUNDRECEIVED,
                                     PYMUMBLE_CONN_STATE_CONNECTED)
 
@@ -322,6 +323,33 @@ class Voice:
         except pymumble.errors.UnknownChannelError:
             return None
 
+    def _create_channel(self, name):
+        """在根下建一个临时频道，**不要阻塞**。
+
+        pymumble 的 channels.new_channel() 走 execute_command(blocking=True)，
+        那个 acquire 没有任何超时——它自己的源码里就写着
+        "TODO: manage a timeout for blocking commands"。命令一旦没被处理，这里
+        就永远卡住，而且我们还握着 _channel_lock，整条切换链全死。
+
+        实测就是这样：日志停在"建一个临时的"，之后既没有成功也没有任何错误，
+        因为线程根本没从这一行返回。
+
+        自己发命令、不等锁；频道有没有建出来由 _wait_for_channel 轮询判断，
+        那本来就是更可靠的判据——服务器拒绝建频道时也不会干等。
+        """
+        command = messages.CreateChannel(0, name, True)
+        self.mumble.execute_command(command, blocking=False)
+
+    def _wait_until_in(self, channel_id):
+        """等服务器确认我们真的进了这个频道。"""
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            myself = self.mumble.users.myself
+            if myself and myself["channel_id"] == channel_id:
+                return True
+            time.sleep(0.1)
+        return False
+
     def _wait_for_channel(self, name):
         """等服务器把新建的频道回报回来。
 
@@ -372,7 +400,7 @@ class Voice:
                 channel = self._find_channel(name)
                 if channel is None:
                     log.info("频道 %s 不存在，建一个临时的", name)
-                    self.mumble.channels.new_channel(0, name, temporary=True)
+                    self._create_channel(name)
                     channel = self._wait_for_channel(name)
                 if channel is None:
                     log.warning("建立频道 %s 后 %.0f 秒内没有出现，%.0f 秒后重试",
@@ -381,9 +409,22 @@ class Voice:
 
                 myself = self.mumble.users.myself
                 if myself and myself["channel_id"] != channel["channel_id"]:
-                    myself.move_in(channel["channel_id"])
+                    # move_in() 也走 execute_command(blocking=True)，和建频道
+                    # 一样会无限期卡住，同样自己发命令
+                    self.mumble.execute_command(
+                        messages.MoveCmd(self.mumble.users.myself_session,
+                                         channel["channel_id"]),
+                        blocking=False)
+                    # 命令是异步的，确认真的进去了再记账——否则收敛循环会以为
+                    # 成功而不再重试，人却还留在原地
+                    if not self._wait_until_in(channel["channel_id"]):
+                        log.warning("发出了进入 %s 的请求，但 %.0f 秒内没有生效，"
+                                    "稍后重试", name, CHANNEL_TIMEOUT)
+                        return
+
                 self.frequency = frequency
                 self.channel = name
+                self._stuck_reason = ""
                 log.info("已切到 %s（%.3f MHz）", name, frequency)
                 if self.on_channel:
                     self.on_channel(frequency, name)

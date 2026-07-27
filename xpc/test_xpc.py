@@ -499,6 +499,38 @@ class VoiceChannelTest(unittest.TestCase):
         source = inspect.getsource(self.voice.Voice._channel_loop)
         self.assertIn("_note_stuck", source)
 
+    def test_channel_commands_never_block(self):
+        """建频道和进频道都不能用 pymumble 的阻塞接口。
+
+        channels.new_channel() 和 users.move_in() 都走
+        execute_command(blocking=True)，那个 acquire 没有超时——pymumble 自己
+        的源码里就写着 "TODO: manage a timeout for blocking commands"。命令没
+        被处理就永远卡住，而且我们还握着 _channel_lock，整条切换链全死。
+
+        实测日志停在"建一个临时的"，之后既没有成功也没有任何错误——线程根本
+        没从那一行返回。
+        """
+        # 用 AST 看真正的调用，别跟注释和文档字符串较劲——那里面也提到了这两
+        # 个接口，按文本匹配会误判
+        import ast
+        tree = ast.parse(inspect.getsource(self.voice).lstrip())
+        blocking_calls = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("new_channel", "move_in"):
+                    blocking_calls.append(node.func.attr)
+        self.assertEqual(blocking_calls, [],
+                         f"{blocking_calls} 会无限期阻塞，要自己发命令")
+
+        for name in ("_create_channel", "_switch_channel"):
+            body = inspect.getsource(getattr(self.voice.Voice, name))
+            self.assertIn("blocking=False", body, f"{name} 应当非阻塞地发命令")
+
+    def test_move_is_confirmed_before_bookkeeping(self):
+        # 命令是异步的：没确认就记账的话，收敛循环会以为成功而不再重试
+        source = inspect.getsource(self.voice.Voice._switch_channel)
+        self.assertIn("_wait_until_in", source)
+
     def test_switching_happens_on_a_worker_thread(self):
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_channel_loop", source)
