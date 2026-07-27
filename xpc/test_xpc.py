@@ -904,6 +904,29 @@ class ModelMatchingTest(unittest.TestCase):
         model, _ = self.models.match(equipment="P28A")
         self.assertEqual(model.icao, "C172")
 
+    def test_widebody_is_not_replaced_by_a_narrowbody(self):
+        # 拿 A319 去顶 B777 视觉上差得离谱；同族之后先按机身类别找
+        models = cslmatch.ModelSet([
+            cslmatch.Model("A319", "a319.obj", icao="A319"),
+            cslmatch.Model("B78X", "b78x.obj", icao="B78X"),
+        ])
+        model, why = models.match(equipment="B77W")
+        self.assertEqual(model.icao, "B78X", why)
+        self.assertIn("宽体", why)
+
+    def test_category_lookup(self):
+        self.assertEqual(cslmatch.category_of("B77W"), "宽体")
+        self.assertEqual(cslmatch.category_of("C172"), "通航")
+        self.assertEqual(cslmatch.category_of("ZZZZ"), "")
+
+    def test_categories_do_not_overlap(self):
+        seen = {}
+        for name, types in cslmatch.CATEGORIES.items():
+            for icao in types:
+                self.assertNotIn(icao, seen,
+                                 f"{icao} 同时在 {seen.get(icao)} 和 {name}")
+                seen[icao] = name
+
     def test_unknown_type_still_returns_something(self):
         # 看不见的飞机比涂装错的飞机危险得多
         model, why = self.models.match(equipment="ZZZZ")

@@ -55,6 +55,26 @@ FAMILIES = [
     ("C172", "C182", "C152", "P28A", "SR22"),
 ]
 
+# 机身类别。同族找不到时按这个找替身——拿一架 A319 去顶 B777 视觉上差得离谱，
+# 而宽体顶宽体、支线顶支线至少大小对得上。
+# 顺序有意义：类别里排在前面的优先被选中当替身。
+CATEGORIES = {
+    "宽体": ("B77W", "B77L", "B772", "B773", "B788", "B789", "B78X",
+             "A332", "A333", "A338", "A339", "A359", "A35K",
+             "B742", "B743", "B744", "B748", "A388", "B762", "B763", "B764",
+             "MD11", "A306", "A310"),
+    "窄体": ("A319", "A320", "A321", "A318", "A19N", "A20N", "A21N",
+             "B737", "B738", "B739", "B736", "B735", "B734", "B733",
+             "B37M", "B38M", "B39M", "B752", "B753", "C919",
+             "MD82", "MD83", "MD88", "MD90", "B712"),
+    "支线": ("E170", "E75L", "E75S", "E190", "E195", "E145", "E135",
+             "CRJ2", "CRJ7", "CRJ9", "CRJX", "AR21", "AT45", "AT72", "AT76",
+             "DH8A", "DH8B", "DH8C", "DH8D", "SF34", "J328"),
+    "通航": ("C172", "C182", "C152", "C208", "C25C", "C700", "P28A", "SR22",
+             "S22T", "DA40", "DA62", "BE36", "BE58", "B350", "TBM9", "PC12",
+             "PC6", "DHC2", "DV20", "DR40", "MXS", "VL3", "A5"),
+}
+
 GENERIC_BY_PREFIX = (
     ("A3", "A320"), ("A2", "A320"), ("A1", "A320"),
     ("B7", "B738"), ("B3", "B738"),
@@ -175,6 +195,15 @@ def family_of(icao):
     return ()
 
 
+def category_of(icao):
+    """机型属于哪一类机身。认不出返回空。"""
+    icao = (icao or "").upper()
+    for name, types in CATEGORIES.items():
+        if icao in types:
+            return name
+    return ""
+
+
 def generic_for(icao):
     icao = (icao or "").upper()
     for prefix, generic in GENERIC_BY_PREFIX:
@@ -276,6 +305,15 @@ class ModelSet:
             found = self._by_icao.get(candidate)
             if found:
                 return found[0], f"退到通用机型 {candidate}"
+
+        # 同类机身。宽体顶宽体、支线顶支线，至少大小对得上——拿一架 A319 去顶
+        # B777 视觉上差得离谱，而机上没装 737 的时候这一级能救回来不少。
+        category = category_of(equipment)
+        if category:
+            for candidate in CATEGORIES[category]:
+                found = self._by_icao.get(candidate)
+                if found:
+                    return found[0], f"同为{category}，用 {candidate} 顶替"
 
         # 兜底。看不见的飞机比涂装错的飞机危险得多。
         # 优先挑有机型码的：没有机型码的多半是装得不规范的附加件，拿它当所有

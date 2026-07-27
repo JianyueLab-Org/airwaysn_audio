@@ -332,6 +332,53 @@ class ModelMatchingTest(unittest.TestCase):
         model, why = self.models.match(equipment="A359")
         self.assertIn("通用", why)
 
+    def test_widebody_is_not_replaced_by_a_narrowbody(self):
+        """拿 A319 去顶 B777 视觉上差得离谱。
+
+        实测发现的：本机装了 787 和 A350，但没装 777，原来会一路掉到兜底挑中
+        一架 A319。同族之后加一级"同类机身"就能救回来。
+        """
+        models = aimatch.ModelSet([
+            aimatch.Model("A319", icao="A319"),        # 排在前面，容易被兜底选中
+            aimatch.Model("787-10", icao="B78X"),
+        ])
+        model, why = models.match(equipment="B77W")
+        self.assertEqual(model.icao, "B78X", why)
+        self.assertIn("宽体", why)
+
+    def test_narrowbody_substitutes_for_narrowbody(self):
+        models = aimatch.ModelSet([
+            aimatch.Model("747", icao="B748"),
+            aimatch.Model("A319", icao="A319"),
+        ])
+        model, why = models.match(equipment="B738")
+        self.assertEqual(model.icao, "A319", why)
+        self.assertIn("窄体", why)
+
+    def test_light_aircraft_not_replaced_by_an_airliner(self):
+        models = aimatch.ModelSet([
+            aimatch.Model("A319", icao="A319"),
+            aimatch.Model("172", icao="C172"),
+        ])
+        model, why = models.match(equipment="SR22")
+        self.assertEqual(model.icao, "C172", why)
+
+    def test_category_lookup(self):
+        self.assertEqual(aimatch.category_of("B77W"), "宽体")
+        self.assertEqual(aimatch.category_of("B738"), "窄体")
+        self.assertEqual(aimatch.category_of("CRJ9"), "支线")
+        self.assertEqual(aimatch.category_of("C172"), "通航")
+        self.assertEqual(aimatch.category_of("ZZZZ"), "")
+
+    def test_categories_do_not_overlap(self):
+        # 一个机型落进两类，替身就成了看字典顺序的抽奖
+        seen = {}
+        for name, types in aimatch.CATEGORIES.items():
+            for icao in types:
+                self.assertNotIn(icao, seen,
+                                 f"{icao} 同时在 {seen.get(icao)} 和 {name}")
+                seen[icao] = name
+
     def test_unknown_type_still_returns_something(self):
         model, why = self.models.match(equipment="ZZZZ")
         self.assertIsNotNone(model, why)

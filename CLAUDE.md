@@ -286,6 +286,11 @@ Three things only a real install revealed — the synthetic `aircraft.cfg` tests
 - **`attachments/` is not aircraft.** Fenix-style addons put dozens of component configs under it, each with a `[GENERAL]` section and a `title` but no type designator. Treated as aircraft they pollute the table and one of them ends up standing in for everyone.
 - **`icao_type_designator` is not clean.** Values like `"A359 ULR"` and `"A-319 CFM SL"` occur; `_clean_icao` takes the first token and requires 2–4 alphanumerics, because a bogus code in the index means real aircraft of that type never match. The ultimate fallback also prefers a model that *has* a type code.
 
+**How good the match actually is depends on what the user has installed**, and the honest answer measured against a stock-ish install (375 liveries, 38 types) with 24 typical Chinese-network flights was: 11 got the right type, 11 got a sensible stand-in, 2 got something unrelated, and **0 got the right airline livery**. Two facts behind that:
+
+- **Livery matching needs livery packs.** Only 40 of 375 liveries carried an `icao_airline` at all, and those were developer house liveries (`AIB`, `FENIX`, `IBE`). Default MSFS aircraft ship without airline codes, so `EQUIPMENT+AIRLINE` almost never hits until the user installs real liveries. This is a user-side fact, not a bug — it just means the realistic ceiling is "right aircraft type, wrong paint".
+- **`CATEGORIES` exists because family fallback isn't enough.** With no 777 installed, a `B77W` used to fall through every tier and land on the arbitrary first model — an A319 standing in for a 777. The tier between "same family" and "first model" substitutes within 宽体/窄体/支线/通航, which turned that A319 into a 787 and cut the unrelated-aircraft cases from 8/24 to 2/24. `cslmatch.py` carries the same table and tier; the two are meant to stay in sync.
+
 ## Related repositories
 
 This repo is the **voice layer** of a three-part network. The other two live alongside it and own the contracts this one consumes:
