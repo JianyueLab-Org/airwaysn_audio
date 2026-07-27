@@ -24,15 +24,24 @@ import time
 
 log = logging.getLogger("模拟器")
 
+# _poll 的三种结果。"没进飞行"和"连接断了"要分开——前者是常态，重开连接
+# 只会在日志里刷一串 SIM OPEN。
+OK = "ok"
+NO_DATA = "no-data"
+FAILED = "failed"
+
 RETRY_INTERVAL = 3.0        # 连不上时隔多久再试
 STALE_AFTER = 3.0           # 超过这么久取不到数据就认为断了
 POLL_INTERVAL = 0.2         # 取数据的间隔，和位置包的 5 Hz 对齐
 
 # SimVar 名字 -> 我们内部的键。值都通过 AircraftRequests.get() 取。
 # 名字必须和 SimConnect 的 SimVar 完全一致，写错了 get() 返回 None。
+# 单位不是猜的：Python-SimConnect 的 RequestList.py 为每个 SimVar 写死了请求
+# 单位。经纬度它按 Degrees 要，姿态和航向按 Radians 要——名字里带 DEGREES 的
+# 那几个反而是弧度。照着它来，不要照 SimVar 的原生单位来。
 SIMVARS = {
-    "latitude": "PLANE_LATITUDE",                  # 弧度
-    "longitude": "PLANE_LONGITUDE",                # 弧度
+    "latitude": "PLANE_LATITUDE",                  # 度（已经是度，不要再转）
+    "longitude": "PLANE_LONGITUDE",                # 度（同上）
     "altitude": "PLANE_ALTITUDE",                  # 英尺
     "agl": "PLANE_ALT_ABOVE_GROUND",               # 英尺
     "groundspeed": "GROUND_VELOCITY",              # 节
@@ -157,11 +166,19 @@ class SimLink:
                     continue
                 log.info("已连接 SimConnect")
 
-            if not self._poll():
-                # 取不到数说明模拟器退了或者还在加载，重开一次连接
-                self._state(False, "MSFS 没有数据（是否已进入飞行？）")
+            result = self._poll()
+            if result is FAILED:
+                # SimConnect 本身出错了，连接多半没了，重开
+                self._state(False, "MSFS 连接中断")
                 self._close()
                 self._sleep(RETRY_INTERVAL)
+                continue
+
+            if result is NO_DATA:
+                # 连接好好的，只是还没进飞行（在菜单里就是这样）。以前这里
+                # 也走重开，日志里每隔几秒一条 "SIM OPEN"，白白反复建连接。
+                self._state(False, "MSFS 没有数据（是否已进入飞行？）")
+                self._sleep(POLL_INTERVAL)
                 continue
 
             self._state(True, "已连接 MSFS")
@@ -174,7 +191,11 @@ class SimLink:
             time.sleep(0.05)
 
     def _poll(self):
-        """取一轮数据。全部取不到返回 False。"""
+        """取一轮数据。
+
+        返回 OK / NO_DATA / FAILED。这三者必须分开：在主菜单里读不到经纬度是
+        完全正常的，不该把整条 SimConnect 连接推倒重来。
+        """
         values = {}
         try:
             for name, simvar in SIMVARS.items():
@@ -183,16 +204,16 @@ class SimLink:
                     values[name] = value
         except Exception as e:
             log.debug("读取 SimVar 出错: %s", e)
-            return False
+            return FAILED
 
         # 经纬度是判断"有没有真的在飞"的最低要求
         if "latitude" not in values or "longitude" not in values:
-            return False
+            return NO_DATA
 
         with self._lock:
             self.values = values
             self.last_update = time.time()
-        return True
+        return OK
 
     # ---------- 取值 ----------
     def snapshot(self):
@@ -203,8 +224,11 @@ class SimLink:
             return None
 
         return {
-            "latitude": math.degrees(raw.get("latitude", 0.0)),
-            "longitude": math.degrees(raw.get("longitude", 0.0)),
+            # 经纬度已经是度。以前这里又 math.degrees 了一次，31.14 变成
+            # 1784.2，服务端每个位置包都回 "Invalid latitude/longitude"，
+            # 90 秒后把连接掐掉。
+            "latitude": raw.get("latitude", 0.0),
+            "longitude": raw.get("longitude", 0.0),
             "altitude": int(round(raw.get("altitude", 0.0))),
             "agl": int(round(raw.get("agl", 0.0))),
             "groundspeed": int(round(raw.get("groundspeed", 0.0))),

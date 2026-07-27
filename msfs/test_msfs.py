@@ -72,8 +72,11 @@ class SnapshotTest(unittest.TestCase):
         import math
         self.link = simlink.SimLink()
         self.link.values = {
-            "latitude": math.radians(31.1434),
-            "longitude": math.radians(121.805),
+            # Python-SimConnect 按 Degrees 请求经纬度，拿到的已经是度。
+            # 这个测试原来喂弧度、断言出度，把错误假设一起钉住了，所以
+            # math.degrees 那个 bug 一路绿灯到实飞才暴露。
+            "latitude": 31.1434,
+            "longitude": 121.805,
             "altitude": 35000.0,
             "agl": 34000.0,
             "groundspeed": 450.0,
@@ -88,11 +91,36 @@ class SnapshotTest(unittest.TestCase):
             "light_strobe": 1, "light_nav": 1,
         }
 
-    def test_latitude_converted_to_degrees(self):
+    def test_latitude_passes_through_unconverted(self):
         self.assertAlmostEqual(self.link.snapshot()["latitude"], 31.1434, places=4)
 
-    def test_longitude_converted_to_degrees(self):
+    def test_longitude_passes_through_unconverted(self):
         self.assertAlmostEqual(self.link.snapshot()["longitude"], 121.805, places=4)
+
+    def test_position_stays_inside_the_valid_range(self):
+        """经纬度必须落在合法范围内。
+
+        实飞时每个位置包都被回 "Invalid latitude/longitude"：经纬度已经是度，
+        又 math.degrees 了一次，31.14 变成 1784.2。这条断言是那次的回归。
+        """
+        for latitude, longitude in ((31.1434, 121.805), (-33.94, 151.18),
+                                    (0.0, 0.0), (89.9, -179.9)):
+            self.link.values["latitude"] = latitude
+            self.link.values["longitude"] = longitude
+            snapshot = self.link.snapshot()
+            self.assertTrue(-90 <= snapshot["latitude"] <= 90,
+                            f"纬度 {snapshot['latitude']} 越界")
+            self.assertTrue(-180 <= snapshot["longitude"] <= 180,
+                            f"经度 {snapshot['longitude']} 越界")
+
+    def test_attitude_is_still_converted_from_radians(self):
+        # 名字里带 DEGREES 的那几个反而是弧度，这些转换是对的，别一起改掉
+        import math
+        self.link.values["pitch"] = math.radians(-2.0)
+        self.link.values["heading"] = math.radians(271.0)
+        snapshot = self.link.snapshot()
+        self.assertAlmostEqual(snapshot["pitch"], 2.0, places=3)
+        self.assertAlmostEqual(snapshot["heading"], 271.0, places=3)
 
     def test_pitch_sign_is_flipped(self):
         # SimVar 里抬头是负的，FSD 那边抬头是正的
@@ -144,6 +172,40 @@ class SnapshotTest(unittest.TestCase):
                     "pitch", "bank", "heading", "squawk", "xpdr_mode",
                     "com1", "com2", "com1_power", "on_ground"}
         self.assertTrue(required.issubset(self.link.snapshot()))
+
+
+class PollResultTest(unittest.TestCase):
+    """在主菜单里读不到位置是常态，不该把 SimConnect 连接推倒重来。
+
+    实飞日志里每隔五六秒一条 "SIM OPEN"，就是把"没进飞行"当成"连接断了"。
+    """
+
+    def setUp(self):
+        self.link = simlink.SimLink()
+
+    def test_three_distinct_results(self):
+        self.assertEqual(len({simlink.OK, simlink.NO_DATA, simlink.FAILED}), 3)
+
+    def test_no_data_when_position_is_missing(self):
+        self.link._requests = type("R", (), {"get": lambda s, v: None})()
+        self.assertIs(self.link._poll(), simlink.NO_DATA)
+
+    def test_failed_when_simconnect_raises(self):
+        def boom(self, simvar):
+            raise OSError("连接没了")
+        self.link._requests = type("R", (), {"get": boom})()
+        self.assertIs(self.link._poll(), simlink.FAILED)
+
+    def test_ok_when_position_is_present(self):
+        self.link._requests = type("R", (), {"get": lambda s, v: 1.0})()
+        self.assertIs(self.link._poll(), simlink.OK)
+
+    def test_no_data_does_not_reopen_the_connection(self):
+        # 只有 FAILED 才该走 _close()
+        import inspect
+        source = inspect.getsource(simlink.SimLink._run)
+        no_data_block = source.split("if result is NO_DATA:")[1].split("continue")[0]
+        self.assertNotIn("_close()", no_data_block)
 
 
 class AircraftCfgTest(unittest.TestCase):
