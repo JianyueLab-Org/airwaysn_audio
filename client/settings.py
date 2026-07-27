@@ -1,4 +1,5 @@
 import os
+import logging
 # 设置SDL环境变量
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
@@ -8,6 +9,8 @@ from PyQt6.QtCore import Qt, QTimer
 import json
 import pygame
 import threading
+
+log = logging.getLogger("设置")
 
 class Settings:
     def __init__(self):
@@ -26,7 +29,7 @@ class Settings:
     def load_settings(self):
         try:
             if os.path.exists(self.config_file):
-                print("[DEBUG-Settings] 正在加载设置文件")
+                log.info("正在加载设置文件")
                 with open(self.config_file, "r") as f:
                     data = json.load(f)
                     self.ptt_key = data.get("ptt_key", "v")
@@ -42,9 +45,9 @@ class Settings:
                 safe = dict(data)
                 if "password" in safe:
                     safe["password"] = "***"
-                print(f"[DEBUG-Settings] 设置加载成功: {safe}")
+                log.debug("设置加载成功: %s", safe)
         except Exception as e:
-            print(f"[DEBUG-Settings] 加载设置失败: {e}")
+            log.error("加载设置失败: %s", e)
 
     def save_settings(self):
         try:
@@ -62,12 +65,12 @@ class Settings:
             # 调整调试输出，隐藏密码
             safe = dict(data)
             safe["password"] = "***" if safe.get("password") else ""
-            print(f"[DEBUG-Settings] 保存设置: {safe}")
+            log.debug("保存设置: %s", safe)
             with open(self.config_file, "w") as f:
                 json.dump(data, f)
-            print("[DEBUG-Settings] 设置保存成功")
+            log.info("设置保存成功")
         except Exception as e:
-            print(f"[DEBUG-Settings] 保存设置失败: {e}")
+            log.error("保存设置失败: %s", e)
 
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
@@ -199,7 +202,7 @@ class SettingsDialog(QDialog):
 
     def start_key_capture(self):
         """开始捕获键盘按键"""
-        print("[DEBUG-Settings] 开始捕获键盘按键")
+        log.debug("开始捕获键盘按键")
         self.listening_for_key = True
         self.ptt_input.setText("请按下按键...")
         self.ptt_reset_btn.setEnabled(False)
@@ -207,7 +210,7 @@ class SettingsDialog(QDialog):
         import keyboard
         def on_key_pressed(event):
             if self.listening_for_key and event.name:
-                print(f"[DEBUG-Settings] 捕获到按键: {event.name}")
+                log.debug("捕获到按键: %s", event.name)
                 self.ptt_input.setText(event.name)
                 self.listening_for_key = False
                 self.ptt_reset_btn.setEnabled(True)
@@ -220,25 +223,25 @@ class SettingsDialog(QDialog):
         with self.pygame_lock:
             try:
                 if not pygame.get_init():
-                    print("[DEBUG-Settings] 初始化pygame子系统")
+                    log.debug("初始化pygame子系统")
                     pygame.init()
                 if not pygame.display.get_init():
-                    print("[DEBUG-Settings] 初始化显示系统")
+                    log.debug("初始化显示系统")
                     pygame.display.init()
                 if not pygame.joystick.get_init():
-                    print("[DEBUG-Settings] 初始化摇杆系统")
+                    log.debug("初始化摇杆系统")
                     pygame.joystick.init()
                 
-                print(f"[DEBUG-Settings] 检测到 {pygame.joystick.get_count()} 个摇杆")
+                log.debug("检测到 %d 个摇杆", pygame.joystick.get_count())
                 
                 if pygame.joystick.get_count() == 0:
-                    print("[DEBUG-Settings] 未检测到摇杆设备")
+                    log.debug("未检测到摇杆设备")
                     self.joy_ptt_input.setText("未检测到摇杆")
                     return
                 
                 joystick = pygame.joystick.Joystick(0)
                 joystick.init()
-                print(f"[DEBUG-Settings] 摇杆已初始化: {joystick.get_name()}")
+                log.debug("摇杆已初始化: %s", joystick.get_name())
                 
                 self.joy_ptt_input.setText("请按下摇杆按键...")
                 self.joy_ptt_reset_btn.setEnabled(False)
@@ -250,7 +253,7 @@ class SettingsDialog(QDialog):
                 self.joy_timer.start(50)  # 提高检查频率到50ms
                 
             except Exception as e:
-                print(f"[DEBUG-Settings] 摇杆初始化失败: {e}")
+                log.debug("摇杆初始化失败: %s", e)
                 self.joy_ptt_input.setText("初始化失败")
                 if self.joy_timer:
                     self.joy_timer.stop()
@@ -274,7 +277,7 @@ class SettingsDialog(QDialog):
                     
                     for i in range(joystick.get_numbuttons()):
                         if joystick.get_button(i):
-                            print(f"[DEBUG-Settings] 检测到摇杆按键: {i}")
+                            log.debug("检测到摇杆按键: %d", i)
                             # 先更新UI
                             self.joy_ptt_input.setText(f"按键 {i}")
                             self.listening_for_joystick = False
@@ -284,13 +287,13 @@ class SettingsDialog(QDialog):
                             self.settings.joystick_ptt = i
                             # 立即保存设置到文件
                             self.settings.save_settings()
-                            print(f"[DEBUG-Settings] 新的摇杆按键设置已保存: {i}")
+                            log.debug("新的摇杆按键设置已保存: %d", i)
                             
                             if self.joy_timer:
                                 self.joy_timer.stop()
                             return
             except Exception as e:
-                print(f"[DEBUG-Settings] 检查摇杆按键状态时出错: {e}")
+                log.debug("检查摇杆按键状态时出错: %s", e)
                 if self.joy_timer:
                     self.joy_timer.stop()
                 self.joy_ptt_input.setText("摇杆读取失败")
@@ -318,9 +321,9 @@ class SettingsDialog(QDialog):
                         joy.quit()
                     except:
                         pass
-            print("[DEBUG-Settings] 摇杆实例已清理")
+            log.debug("摇杆实例已清理")
         except Exception as e:
-            print(f"[DEBUG-Settings] 清理摇杆实例时出错: {e}")
+            log.debug("清理摇杆实例时出错: %s", e)
             pass
 
     def reject(self):
@@ -363,9 +366,9 @@ class SettingsDialog(QDialog):
             
             # 保存设置到文件
             self.settings.save_settings()
-            print(f"[DEBUG-Settings] 保存设置: PTT键={self.settings.ptt_key}, 摇杆按键={self.settings.joystick_ptt}")
+            log.debug("保存设置: PTT键=%s, 摇杆按键=%s", self.settings.ptt_key, self.settings.joystick_ptt)
             
             self.accept()
         except Exception as e:
-            print(f"[DEBUG-Settings] 保存设置时出错: {e}")
+            log.error("保存设置时出错: %s", e)
             self.reject()

@@ -13,6 +13,7 @@ gui.py — X-Plane 无线电客户端 GUI
 
 import sys
 import os
+import logging
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 os.environ['SDL_AUDIODRIVER'] = 'dummy'
 
@@ -29,8 +30,11 @@ import time
 import keyboard
 import pymumble_py3 as pymumble
 import pygame
+import applog
 
 ico_path = r".\favicon.ico"
+
+log = logging.getLogger("GUI")
 
 
 class CircleIndicator(QWidget):
@@ -196,6 +200,10 @@ class RadioGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
+
+        # 设置日志
+        applog.setup()
+
         from PyQt6.QtGui import QIcon
         icon = QIcon(ico_path)
         self.setWindowIcon(icon)
@@ -208,9 +216,9 @@ class RadioGUI(QMainWindow):
             pygame.init()
             pygame.display.init()
             pygame.joystick.init()
-            print(f"[DEBUG-GUI] pygame初始化完成，检测到 {pygame.joystick.get_count()} 个摇杆")
+            log.debug("pygame初始化完成，检测到 %d 个摇杆", pygame.joystick.get_count())
         except Exception as e:
-            print(f"[DEBUG-GUI] Pygame初始化失败: {e}")
+            log.error("Pygame初始化失败: %s", e)
 
         self.setWindowTitle("无线电-Airwaysn (X-Plane)")
         self.setMinimumSize(300, 200)
@@ -228,7 +236,7 @@ class RadioGUI(QMainWindow):
             self.login_window.username_input.setText(self.settings.username or "")
             self.login_window.password_input.setText(self.settings.password or "")
         except Exception as e:
-            print(f"[DEBUG-GUI] 自动填充账号失败: {e}")
+            log.error("自动填充账号失败: %s", e)
 
         self.radio_client = None
         self.main_window = None
@@ -244,7 +252,7 @@ class RadioGUI(QMainWindow):
             QMessageBox.critical(self, "登录错误", message)
 
     def cleanup_client(self):
-        print("开始清理客户端资源")
+        log.info("开始清理客户端资源")
         if self.radio_client:
             self.radio_client.cleanup()
             self.radio_client = None
@@ -256,22 +264,22 @@ class RadioGUI(QMainWindow):
             if self.client_thread.is_alive():
                 self.client_thread.join(timeout=1.0)
             self.client_thread = None
-        print("客户端资源清理完成")
+        log.info("客户端资源清理完成")
 
     def on_connected(self):
         """Mumble 连接成功后，初始化主界面并启动后台线程。"""
         try:
-            print("连接成功，正在初始化主窗口...")
+            log.info("连接成功，正在初始化主窗口...")
             self.login_window.clear_error()
 
             try:
                 if self.radio_client and self.radio_client.settings:
                     self.radio_client.settings.save_settings()
             except Exception as e:
-                print(f"[DEBUG-GUI] 登录后保存设置失败: {e}")
+                log.error("登录后保存设置失败: %s", e)
 
             if self.main_window:
-                print("重连成功，更新主窗口状态")
+                log.info("重连成功，更新主窗口状态")
                 self.main_window.update_connection_status(True)
                 # 重连时也切一次频道
                 if self.radio_client and self.radio_client._initial_freq is not None:
@@ -279,7 +287,7 @@ class RadioGUI(QMainWindow):
                         self.radio_client.switch_channel(
                             self.radio_client._initial_freq, caller="GUI-重连")
                     except Exception as e:
-                        print(f"[DEBUG-GUI] 重连频道切换失败: {e}")
+                        log.error("重连频道切换失败: %s", e)
                 return
 
             self.main_window = MainWindow(self.radio_client)
@@ -305,13 +313,13 @@ class RadioGUI(QMainWindow):
             # ★ 连接后立即切到初始频率（不等 monitor 线程第一次循环）
             initial_freq = self.radio_client._initial_freq
             if initial_freq is not None:
-                print(f"[DEBUG-GUI] 连接成功，立即切换到频率 {initial_freq:.3f} MHz")
+                log.info("连接成功，立即切换到频率 %.3f MHz", initial_freq)
                 try:
                     self.radio_client.switch_channel(initial_freq, caller="GUI-on_connected")
                 except Exception as e:
-                    print(f"[DEBUG-GUI] 初始频道切换异常: {e}")
+                    log.error("初始频道切换异常: %s", e)
             else:
-                print(f"[DEBUG-GUI] 无初始频率，跳过首次频道切换")
+                log.warning("无初始频率，跳过首次频道切换")
 
             # 启动监控和语音线程
             self.radio_client.monitor_thread = threading.Thread(
@@ -322,20 +330,20 @@ class RadioGUI(QMainWindow):
             )
             self.radio_client.monitor_thread.start()
             self.radio_client.voice_thread.start()
-            print("后台线程启动完成")
+            log.info("后台线程启动完成")
         except Exception as e:
-            print(f"主窗口初始化失败: {e}")
+            log.error("主窗口初始化失败: %s", e)
             self.login_window.show_error(f"初始化失败: {str(e)}")
             self.cleanup_client()
 
     def on_disconnected(self):
-        print("Mumble 连接断开")
+        log.warning("Mumble 连接断开")
         if self.main_window:
             self.main_window.update_connection_status(False)
 
     def handle_login(self):
         """处理登录按钮点击。"""
-        print("开始登录流程")
+        log.info("开始登录流程")
         self.cleanup_client()
 
         username = self.login_window.username_input.text()
@@ -357,7 +365,7 @@ class RadioGUI(QMainWindow):
                     "  2. 设置 → Data Output → IPs for UDP network 中已添加本机 IP"
                 )
                 return
-            print(f"[DEBUG-GUI] X-Plane 已发现 @ {addr[0]}:{addr[1]}，初始频率 {freq:.3f} MHz")
+            log.info("X-Plane 已发现 @ %s:%s，初始频率 %.3f MHz", addr[0], addr[1], freq)
 
             self.radio_client = MumbleRadioClient(
                 "hjdczy.top", username, password, settings=self.settings,
@@ -365,7 +373,7 @@ class RadioGUI(QMainWindow):
             # 手动设置 X-Plane 地址和初始频率（避免重复发现）
             self.radio_client.xplane._addr = addr
             self.radio_client._initial_freq = freq
-            print(f"[DEBUG-GUI] 保存初始频率: {freq:.3f} MHz")
+            log.info("保存初始频率: %.3f MHz", freq)
 
             # Mumble 连接回调：同步更新 radio_client 的独立连接标记
             self.radio_client.mumble.callbacks.set_callback(
@@ -401,10 +409,10 @@ class RadioGUI(QMainWindow):
 
             self.client_thread = threading.Thread(target=run_client, daemon=True)
             self.client_thread.start()
-            print("客户端线程已启动")
+            log.info("客户端线程已启动")
 
         except Exception as e:
-            print(f"初始化过程发生错误: {str(e)}")
+            log.error("初始化过程发生错误: %s", str(e))
             self.error_signal.error.emit(f"初始化失败: {str(e)}")
             self.cleanup_client()
 

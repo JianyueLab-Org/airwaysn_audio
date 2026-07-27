@@ -1,5 +1,6 @@
 import sys
 import os
+import logging
 
 # 在导入pygame之前设置SDL环境变量
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
@@ -17,8 +18,11 @@ import keyboard
 import pymumble_py3 as pymumble
 import queue
 import pygame
+import applog
 
 ico_path = r".\favicon.ico"
+
+log = logging.getLogger("GUI")
 
 class CircleIndicator(QWidget):
     def __init__(self, parent=None, active_color=None):
@@ -179,6 +183,10 @@ class ConnectionSignal(QObject):
 class RadioGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # 设置日志
+        applog.setup()
+
         # 设置应用程序图标和窗口图标
         from PyQt6.QtGui import QIcon
         icon = QIcon(ico_path)
@@ -189,24 +197,22 @@ class RadioGUI(QMainWindow):
 
         # 初始化pygame
         try:
-            print("[DEBUG-GUI] 开始初始化pygame子系统")
+            log.debug("开始初始化pygame子系统")
             pygame.init()
-            print(f"[DEBUG-GUI] pygame.init() 返回值: {pygame.get_init()}")
-            
-            print("[DEBUG-GUI] 开始初始化显示系统")
+            log.debug("pygame.init() 返回值: %s", pygame.get_init())
+
+            log.debug("开始初始化显示系统")
             pygame.display.init()
-            print("[DEBUG-GUI] 显示系统初始化状态:", pygame.display.get_init())
-            
-            print("[DEBUG-GUI] 开始初始化摇杆系统")
+            log.debug("显示系统初始化状态: %s", pygame.display.get_init())
+
+            log.debug("开始初始化摇杆系统")
             pygame.joystick.init()
-            print(f"[DEBUG-GUI] 摇杆系统初始化完成，检测到 {pygame.joystick.get_count()} 个摇杆")
-            print(f"[DEBUG-GUI] 摇杆系统初始化状态: {pygame.joystick.get_init()}")
+            log.debug("摇杆系统初始化完成，检测到 %d 个摇杆", pygame.joystick.get_count())
+            log.debug("摇杆系统初始化状态: %s", pygame.joystick.get_init())
         except Exception as e:
-            print(f"[DEBUG-GUI] Pygame初始化失败: {e}")
-            print(f"[DEBUG-GUI] pygame状态:")
-            print(f"- pygame.get_init(): {pygame.get_init()}")
-            print(f"- pygame.display.get_init(): {pygame.display.get_init()}")
-            print(f"- pygame.joystick.get_init(): {pygame.joystick.get_init()}")
+            log.error("Pygame初始化失败: %s", e)
+            log.debug("pygame状态: get_init=%s display=%s joystick=%s",
+                       pygame.get_init(), pygame.display.get_init(), pygame.joystick.get_init())
             
         self.setWindowTitle("无线电-Airwaysn")
         self.setMinimumSize(300, 200)
@@ -228,7 +234,7 @@ class RadioGUI(QMainWindow):
             self.login_window.username_input.setText(self.settings.username or "")
             self.login_window.password_input.setText(self.settings.password or "")
         except Exception as e:
-            print(f"[DEBUG-GUI] 自动填充账号失败: {e}")
+            log.error("自动填充账号失败: %s", e)
 
         self.radio_client = None
         self.main_window = None
@@ -244,23 +250,23 @@ class RadioGUI(QMainWindow):
         self.connection_signal.disconnected.connect(self.on_disconnected)
 
     def show_error(self, message):
-        print(f"显示错误: {message}")
+        log.error("显示错误: %s", message)
         # 如果已经有主窗口（即登录成功后断连），不弹模态对话框
         if not self.main_window:
             QMessageBox.critical(self, "登录错误", message)
 
     def cleanup_client(self):
         """完全清理客户端及其资源"""
-        print("开始清理客户端资源")
+        log.info("开始清理客户端资源")
         if self.radio_client:
             self.radio_client.cleanup()
             self.radio_client = None
-            print("已清理 radio_client")
+            log.info("已清理 radio_client")
         if self.main_window:
             self.stacked_widget.removeWidget(self.main_window)
             self.main_window.deleteLater()
             self.main_window = None
-            print("已清理 main_window")
+            log.info("已清理 main_window")
         
         # 只在非当前线程中进行线程清理
         if (not self.client_thread or 
@@ -268,27 +274,27 @@ class RadioGUI(QMainWindow):
             if self.client_thread and self.client_thread.is_alive():
                 self.client_thread.join(timeout=1.0)
                 self.client_thread = None
-                print("已清理 client_thread")
+                log.info("已清理 client_thread")
         else:
             self.client_thread = None
             
-        print("客户端资源清理完成")
+        log.info("客户端资源清理完成")
 
     def on_connected(self):
         """在主线程中处理连接成功（首次连接或重连）"""
         try:
-            print("连接成功，正在初始化主窗口...")
+            log.info("连接成功，正在初始化主窗口...")
             self.login_window.clear_error()
             # 保存账号与密码到设置文件
             try:
                 if self.radio_client and self.radio_client.settings:
                     self.radio_client.settings.save_settings()
             except Exception as e:
-                print(f"[DEBUG-GUI] 登录后保存设置失败: {e}")
+                log.error("登录后保存设置失败: %s", e)
 
             if self.main_window:
                 # 重连情况：只更新连接状态，不创建新窗口
-                print("重连成功，更新主窗口状态")
+                log.info("重连成功，更新主窗口状态")
                 self.main_window.update_connection_status(True)
                 # 重连时也切一次频道
                 if self.radio_client and self.radio_client._initial_freq is not None:
@@ -296,14 +302,14 @@ class RadioGUI(QMainWindow):
                         self.radio_client.switch_channel(
                             self.radio_client._initial_freq, caller="GUI-重连")
                     except Exception as e:
-                        print(f"[DEBUG-GUI] 重连频道切换失败: {e}")
+                        log.error("重连频道切换失败: %s", e)
                 return
 
             # 首次连接：创建主窗口
             self.main_window = MainWindow(self.radio_client)
             self.stacked_widget.addWidget(self.main_window)
             self.stacked_widget.setCurrentWidget(self.main_window)
-            print("主窗口初始化完成")
+            log.info("主窗口初始化完成")
             # 立即点亮连接指示灯，不等 monitor_frequency 首次循环
             self.main_window.update_connection_status(True)
             
@@ -329,13 +335,13 @@ class RadioGUI(QMainWindow):
             try:
                 initial_freq = self.radio_client.aq.get("COM_ACTIVE_FREQUENCY:1")
                 if initial_freq is not None:
-                    print(f"[DEBUG-GUI] 连接成功，初始频率 {initial_freq:.3f} MHz，立即切换到频道")
+                    log.info("连接成功，初始频率 %.3f MHz，立即切换到频道", initial_freq)
                     self.radio_client.switch_channel(initial_freq, caller="GUI-on_connected")
                     self.radio_client._initial_freq = initial_freq
                 else:
-                    print(f"[DEBUG-GUI] 连接后无法读取 SimConnect 频率")
+                    log.warning("连接后无法读取 SimConnect 频率")
             except Exception as e:
-                print(f"[DEBUG-GUI] 初始频率读取/切换异常: {e}")
+                log.error("初始频率读取/切换异常: %s", e)
 
             # 启动监控和语音线程
             self.radio_client.monitor_thread = threading.Thread(target=self.radio_client.monitor_frequency)
@@ -344,37 +350,37 @@ class RadioGUI(QMainWindow):
             self.radio_client.voice_thread.daemon = True
             self.radio_client.monitor_thread.start()
             self.radio_client.voice_thread.start()
-            print("后台线程启动完成")
+            log.info("后台线程启动完成")
         except Exception as e:
-            print(f"主窗口初始化失败: {e}")
+            log.error("主窗口初始化失败: %s", e)
             self.login_window.show_error(f"初始化失败: {str(e)}")
             self.cleanup_client()
 
     def on_disconnected(self):
         """在主线程中处理连接断开（不弹窗，仅更新UI）"""
-        print("Mumble 连接断开")
+        log.warning("Mumble 连接断开")
         if self.main_window:
             self.main_window.update_connection_status(False)
 
     def handle_login(self):
-        print("开始登录流程")
+        log.info("开始登录流程")
         self.cleanup_client()
         
         username = self.login_window.username_input.text()
         password = self.login_window.password_input.text()
-        print(f"正在尝试登录，用户名: {username}")
+        log.info("正在尝试登录，用户名: %s", username)
         
         try:
-            print("正在初始化 MumbleRadioClient...")
+            log.info("正在初始化 MumbleRadioClient...")
             # 新增：把输入的账号密码写入现有 Settings，并传入客户端
             try:
                 self.settings.username = username or ""
                 self.settings.password = password or ""
             except Exception as e:
-                print(f"[DEBUG-GUI] 写入账号到设置失败: {e}")
+                log.error("写入账号到设置失败: %s", e)
 
             self.radio_client = MumbleRadioClient("hjdczy.top", username, password, settings=self.settings)
-            print("MumbleRadioClient 初始化完成")
+            log.info("MumbleRadioClient 初始化完成")
             
             # Mumble 连接回调：同步更新 radio_client 的独立连接标记
             self.radio_client.mumble.callbacks.set_callback(
@@ -395,37 +401,37 @@ class RadioGUI(QMainWindow):
             
             def run_client():
                 try:
-                    print("正在启动客户端连接...")
+                    log.info("正在启动客户端连接...")
                     
                     self.radio_client.mumble.run()
-                    print("等待连接完成...")
+                    log.info("等待连接完成...")
                     self.radio_client.mumble.is_ready()
-                    print("连接成功")
+                    log.info("连接成功")
                     
                     while self.radio_client and self.radio_client.mumble.is_alive():
                         time.sleep(1)
                         
                 except pymumble.errors.ConnectionRejectedError as e:
-                    print(f"连接被拒绝: {str(e)}")
+                    log.error("连接被拒绝: %s", str(e))
                     if "Wrong certificate or password" in str(e):
                         self.error_signal.error.emit("登录失败：用户名或密码错误")
                     else:
                         self.error_signal.error.emit(f"登录失败：{str(e)}")
                     self.cleanup_client()
                 except Exception as e:
-                    print(f"连接过程中发生错误: {str(e)}")
+                    log.error("连接过程中发生错误: %s", str(e))
                     self.error_signal.error.emit(f"连接错误: {str(e)}")
                     self.cleanup_client()
                 finally:
-                    print("客户端线程结束")
+                    log.debug("客户端线程结束")
             
-            print("正在启动客户端线程...")
+            log.debug("正在启动客户端线程...")
             self.client_thread = threading.Thread(target=run_client, daemon=True)
             self.client_thread.start()
-            print("客户端线程已启动")
+            log.debug("客户端线程已启动")
             
         except Exception as e:
-            print(f"初始化过程发生错误: {str(e)}")
+            log.error("初始化过程发生错误: %s", str(e))
             self.error_signal.error.emit(f"初始化失败: {str(e)}")
             self.cleanup_client()
 
