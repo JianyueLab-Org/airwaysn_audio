@@ -17,6 +17,7 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 | `controller/` | `gui.py` | ATC client — a **stack of frequencies** modelled on [TrackAudio](https://github.com/pierr3/TrackAudio), each with RX/TX/XC |
 | `atis/` | `gui.py` | ATIS client modelled on [vATIS](https://github.com/vatis-project/vatis) — stations, presets, templates; broadcasts over Mumble |
 | `xpc/` | `gui.py` | **XPC for CAN** — X-Plane pilot client modelled on [xPilot](https://github.com/xpilot-project/xpilot): Mumble voice **and** an FSD connection |
+| `msfs/` | `gui.py` | **MSFS for CAN** — the same client for Microsoft Flight Simulator, over SimConnect |
 | `server/` | `login.py`, `ATIS/mumble.py` | Runs on the Mumble/Murmur host: Ice authenticator + server-side ATIS bot fleet |
 
 `client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/`, `atis/` and `xpc/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, `profile.py` + `broadcast.py`, and `xplane.py` + `fsdpilot.py` + `voice.py`) and have no `radio.py`.
@@ -37,6 +38,7 @@ cd xplane_client; python gui.py     # X-Plane pilot client (needs X-Plane in a f
 cd controller;    python gui.py     # ATC client
 cd atis;          python gui.py     # ATIS client
 cd xpc;           python gui.py     # XPC for CAN — X-Plane pilot client (voice + FSD)
+cd msfs;          python gui.py     # MSFS for CAN — same, for Microsoft Flight Simulator
 cd server\ATIS;   python mumble.py  # server-side ATIS manager (needs ffmpeg on PATH)
 python server\login.py              # Murmur Ice authenticator (run on the Mumble host)
 ```
@@ -67,6 +69,11 @@ cd xpc
 python -m unittest test_xpc -v           # PBH, position packets, RREF, traffic, model matching
 python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
 python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
+python smoke_gui.py
+
+cd msfs
+python -m unittest test_msfs -v          # BCD squawk, SimVar units, aircraft.cfg
+python -m unittest test_msfs.RealWorldLayoutTest   # the ones a live install found
 python smoke_gui.py
 ```
 
@@ -253,6 +260,31 @@ Everything hard lives client-side where it has unit tests; the plugin is deliber
 Also worth knowing: `instanceSetPosition` takes `(x, y, z, pitch, heading, roll)` — heading before roll. Writing the TCAS targets makes X-Plane mirror the nearest 19 aircraft back into the legacy `sim/multiplayer/position/plane#_*` datarefs automatically, so plugins still reading those keep working. `xp.worldToLocal()` does the coordinate conversion, so unlike the legacy 19-slot multiplayer datarefs there is no hand-rolled tangent-plane maths. If LiveTraffic or another XPMP2-based plugin is loaded it will have registered the same `libxplanemp` datarefs and acquired the AI planes; the plugin detects this and logs a warning rather than fighting over them.
 
 The bridge is UDP with one JSON object per datagram, fragmented over `seq`/`part`/`total`. UDP rather than TCP because this is a pure position stream — a dropped frame is replaced 200 ms later, whereas a reliable queue would build up latency. The plugin keeps only the newest complete frame; late frames make aircraft jump backwards. `bridge.Reassembler` and the plugin's copy are separate implementations, and `test_xpc.py` loads the plugin file to check they agree.
+
+## MSFS for CAN (`msfs/`)
+
+The same client as `xpc/`, for Microsoft Flight Simulator. `fsdpilot.py`, `voice.py`, `traffic.py`, `applog.py` and `mumblecompat.py` are **byte-identical copies** of the `xpc/` versions — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
+
+| Module | Replaces | Role |
+|---|---|---|
+| `simlink.py` | `xpc/xplane.py` | SimConnect instead of X-Plane UDP |
+| `inject.py` + `aimatch.py` | `xpc/bridge.py` + `plugin/` + `cslmatch.py` | AI aircraft instead of an XPPython3 plugin |
+
+**`snapshot()` must stay field-for-field identical to `xpc/xplane.py`'s**, because `fsdpilot.py` and `voice.py` are shared copies that consume it. `SnapshotTest.test_field_names_match_the_xplane_client` pins that.
+
+**MSFS needs no plugin, and TCAS is free.** SimConnect lets an outside process create AI aircraft (`AICreateNonATCAircraft`), so this is one process rather than XPC's client-plus-plugin split. Because the injected aircraft are real SimObjects, the cockpit's traffic display sees them without the hand-filled TCAS arrays that X-Plane requires.
+
+**The object ID comes back asynchronously and Python-SimConnect loses it.** `AICreateNonATCAircraft` only queues the request; the real object ID arrives in a `SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID` message correlated by `dwRequestID`. The wrapper *does* handle that message — but it stores the result in `os.environ["SIMCONNECT_OBJECT_ID"]` with **no request correlation**, so creating twenty aircraft overwrites one global and you cannot tell which ID belongs to which. `inject.py` therefore wraps `my_dispatch_proc`, records `requestID → objectID` in its own table, and hands the message on.
+
+**Two SimVar traps.** `TRANSPONDER CODE:1` is **BCD** — reading `0x1200` as decimal gives 4608 and the wire squawk is garbage. And `PLANE_PITCH_DEGREES` / `PLANE_BANK_DEGREES` are in **radians despite the name**, with the opposite sign convention to FSD (nose-up is negative in the sim).
+
+**Model matching reads the sim's installed aircraft, not CSL packages.** `aimatch.py` walks each package tree for `aircraft.cfg`, taking `icao_type_designator` from `[GENERAL]` and one `title` + `icao_airline` per `[FLTSIM.n]` section. The title string is what `AICreateNonATCAircraft` takes, so it must be reproduced exactly. The fallback chain is the same as `cslmatch.py`'s and the two `FAMILIES` tables are meant to stay in sync.
+
+Three things only a real install revealed — the synthetic `aircraft.cfg` tests all passed while a live scan found 10 liveries instead of 375:
+
+- **The package directory must come from `UserCfg.opt`.** `InstalledPackagesPath` can point anywhere; on the dev machine it is `D:\MSFS2022` (257 aircraft) while the guessed `%APPDATA%\Microsoft Flight Simulator\Packages` holds none. Guessing paths silently misses the whole install.
+- **`attachments/` is not aircraft.** Fenix-style addons put dozens of component configs under it, each with a `[GENERAL]` section and a `title` but no type designator. Treated as aircraft they pollute the table and one of them ends up standing in for everyone.
+- **`icao_type_designator` is not clean.** Values like `"A359 ULR"` and `"A-319 CFM SL"` occur; `_clean_icao` takes the first token and requires 2–4 alphanumerics, because a bogus code in the index means real aircraft of that type never match. The ultimate fallback also prefers a model that *has* a type code.
 
 ## Related repositories
 

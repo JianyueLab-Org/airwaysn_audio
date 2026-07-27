@@ -34,7 +34,7 @@ log = logging.getLogger("模型匹配")
 # 同族机型。匹配不到精确型号时按这里找替身，都是外形接近的。
 # 不求全，只覆盖网络上常见的；查不到就落到按类别的通用匹配。
 FAMILIES = [
-    ("A318", "A319", "A320", "A321"),
+    ("A318", "A319", "A320", "A321", "A19N", "A20N", "A21N"),
     ("A332", "A333", "A338", "A339"),
     ("A343", "A345", "A346"),
     ("A359", "A35K"),
@@ -254,11 +254,13 @@ class ModelSet:
             if found:
                 return found[0], f"用同族 {relative} 顶替"
 
-        # 4. 同类别通用
+        # 4. 同类别通用。猜出来的通用机型本身也可能没装（比如猜出 A320 但包里
+        #    只有 A20N），所以这一级同样要走一遍同族，否则会白白掉到兜底。
         generic = generic_for(equipment)
-        found = self._by_icao.get(generic)
-        if found:
-            return found[0], f"退到通用机型 {generic}"
+        for candidate in (generic,) + tuple(family_of(generic)):
+            found = self._by_icao.get(candidate)
+            if found:
+                return found[0], f"退到通用机型 {candidate}"
 
         # 5. 兜底。看不见的飞机比涂装错的飞机危险得多。
         return self.models[0], "没有近似机型，用了包里的第一个"
