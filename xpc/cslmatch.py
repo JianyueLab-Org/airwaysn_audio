@@ -1,0 +1,264 @@
+"""CSL 模型匹配。
+
+对应 xPilot 的 `src/aircrafts/` 里那套 model matching。CSL 是 X-Plane 多人机
+模型的通用格式（Bluebell、X-CSL 等），xPilot、LiveTraffic、swift 都用它，所以
+这里跟着它的约定走，用户装哪个包都能认。
+
+一个 CSL 包的目录里有 `xsb_aircraft.txt`，长这样：
+
+    EXPORT_NAME BB_Airbus
+    OBJ8_AIRCRAFT A320_CCA
+    OBJ8 SOLID YES A320/A320_CCA.obj
+    ICAO A320
+    AIRLINE A320 CCA
+
+`ICAO` 给机型码，`AIRLINE` 再加航司码。匹配就是拿 FSD 那边问来的
+`EQUIPMENT=B738:AIRLINE=CCA` 去这张表里找，找不到就一级级往下退：
+
+    1. 机型 + 航司     波音 738 的国航涂装
+    2. 机型            波音 738，随便什么涂装
+    3. 同族近似机型    B739 顶替 B738
+    4. 同类别通用      双发喷气客机
+    5. 兜底            包里的第一个模型
+
+**退化必须一直有结果**。宁可画一架涂装不对的飞机，也不能因为匹配不到就让天上
+空着——飞行员看不见的飞机比看错涂装的飞机危险得多。
+"""
+
+import logging
+import os
+import re
+
+log = logging.getLogger("模型匹配")
+
+# 同族机型。匹配不到精确型号时按这里找替身，都是外形接近的。
+# 不求全，只覆盖网络上常见的；查不到就落到按类别的通用匹配。
+FAMILIES = [
+    ("A318", "A319", "A320", "A321"),
+    ("A332", "A333", "A338", "A339"),
+    ("A343", "A345", "A346"),
+    ("A359", "A35K"),
+    ("A388",),
+    ("B731", "B732", "B733", "B734", "B735", "B736", "B737", "B738", "B739",
+     "B37M", "B38M", "B39M"),
+    ("B741", "B742", "B743", "B744", "B748"),
+    ("B752", "B753"),
+    ("B762", "B763", "B764"),
+    ("B772", "B773", "B77L", "B77W"),
+    ("B788", "B789", "B78X"),
+    ("E170", "E75L", "E75S", "E190", "E195"),
+    ("CRJ2", "CRJ7", "CRJ9", "CRJX"),
+    ("C919", "AR21"),
+    ("MD82", "MD83", "MD88", "MD90"),
+    ("C172", "C182", "C152", "P28A", "SR22"),
+]
+
+# 机型码猜类别，用于最后一级通用匹配
+GENERIC_BY_PREFIX = (
+    ("A3", "A320"), ("A2", "A320"),
+    ("B7", "B738"), ("B3", "B738"),
+    ("E1", "E190"), ("E7", "E190"),
+    ("CRJ", "CRJ7"),
+    ("MD", "MD82"),
+    ("DH", "DH8D"), ("AT", "AT76"),
+    ("C1", "C172"), ("P2", "C172"), ("SR", "C172"),
+)
+
+DEFAULT_TYPE = "B738"
+
+
+class Model:
+    """CSL 包里的一个模型。"""
+
+    __slots__ = ("name", "path", "icao", "airline", "livery", "package")
+
+    def __init__(self, name, path, package="", icao="", airline="", livery=""):
+        self.name = name
+        self.path = path
+        self.package = package
+        self.icao = icao.upper()
+        self.airline = airline.upper()
+        self.livery = livery.upper()
+
+    def __repr__(self):
+        return f"<Model {self.name} {self.icao}/{self.airline or '-'}>"
+
+
+def parse_package(directory):
+    """读一个 CSL 包的 xsb_aircraft.txt，返回 Model 列表。
+
+    这个格式有几十年的历史，各家包写得并不一致：路径分隔符可能是 `/` 也可能
+    是 `\\`，OBJ8 行的字段数不固定，注释用 `#`。宽松地读，认不出的行跳过就好
+    ——一个包里一行有问题不该让整包用不了。
+    """
+    manifest = os.path.join(directory, "xsb_aircraft.txt")
+    if not os.path.isfile(manifest):
+        return []
+
+    models = []
+    package = ""
+    current = None
+    try:
+        with open(manifest, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        log.warning("读不了 %s: %s", manifest, e)
+        return []
+
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        keyword = parts[0].upper()
+
+        if keyword == "EXPORT_NAME" and len(parts) > 1:
+            package = parts[1]
+        elif keyword in ("OBJ8_AIRCRAFT", "AIRCRAFT") and len(parts) > 1:
+            current = Model(parts[1], "", package=package)
+            models.append(current)
+        elif keyword == "OBJ8" and current is not None and len(parts) >= 4:
+            # OBJ8 <类型> <是否有动画> <路径>；只要 SOLID 的那条
+            if parts[1].upper() == "SOLID" and not current.path:
+                relative = " ".join(parts[3:]).replace("\\", "/")
+                current.path = os.path.normpath(os.path.join(directory, relative))
+        elif keyword == "ICAO" and current is not None and len(parts) > 1:
+            current.icao = parts[1].upper()
+        elif keyword == "AIRLINE" and current is not None and len(parts) > 2:
+            current.icao = current.icao or parts[1].upper()
+            current.airline = parts[2].upper()
+        elif keyword == "LIVERY" and current is not None and len(parts) > 3:
+            current.icao = current.icao or parts[1].upper()
+            current.airline = current.airline or parts[2].upper()
+            current.livery = parts[3].upper()
+
+    usable = [m for m in models if m.path and m.icao]
+    log.info("%s: %d 个模型（共 %d 条，%d 条缺路径或机型码）",
+             os.path.basename(directory), len(usable), len(models),
+             len(models) - len(usable))
+    return usable
+
+
+def find_packages(root):
+    """在一个目录树里找所有 CSL 包（含 xsb_aircraft.txt 的目录）。"""
+    packages = []
+    if not os.path.isdir(root):
+        return packages
+    for directory, subdirs, files in os.walk(root):
+        if "xsb_aircraft.txt" in files:
+            packages.append(directory)
+            subdirs[:] = []          # 包里面不会再套包，别往下走
+    return packages
+
+
+def family_of(icao):
+    """机型所属的同族列表，不在表里就返回空。"""
+    icao = (icao or "").upper()
+    for family in FAMILIES:
+        if icao in family:
+            return family
+    return ()
+
+
+def generic_for(icao):
+    """猜一个同类别的通用机型码。"""
+    icao = (icao or "").upper()
+    for prefix, generic in GENERIC_BY_PREFIX:
+        if icao.startswith(prefix):
+            return generic
+    return DEFAULT_TYPE
+
+
+class ModelSet:
+    """所有装好的 CSL 模型，以及匹配逻辑。"""
+
+    def __init__(self, models=None):
+        self.models = list(models or [])
+        self._by_icao = {}
+        self._by_icao_airline = {}
+        self._reindex()
+
+    def _reindex(self):
+        self._by_icao.clear()
+        self._by_icao_airline.clear()
+        for model in self.models:
+            self._by_icao.setdefault(model.icao, []).append(model)
+            if model.airline:
+                key = (model.icao, model.airline)
+                self._by_icao_airline.setdefault(key, []).append(model)
+
+    def __len__(self):
+        return len(self.models)
+
+    @property
+    def types(self):
+        return set(self._by_icao)
+
+    @classmethod
+    def load(cls, root):
+        """把一个目录下所有 CSL 包读进来。"""
+        models = []
+        for package in find_packages(root):
+            models.extend(parse_package(package))
+        log.info("从 %s 载入 %d 个模型", root, len(models))
+        return cls(models)
+
+    def by_name(self, name):
+        """对方直接指定了 CSL 名字时按名字找。"""
+        if not name:
+            return None
+        name = name.upper()
+        for model in self.models:
+            if model.name.upper() == name:
+                return model
+        return None
+
+    def match(self, equipment="", airline="", csl=""):
+        """挑一个模型。返回 (Model, 匹配层级说明) 或 (None, 原因)。
+
+        层级说明会写进日志，用户报"我看到的飞机长得不对"时能直接看出来是精确
+        匹配还是退化了几级。
+        """
+        if not self.models:
+            return None, "没有装任何 CSL 模型"
+
+        # 0. 对方直接给了 CSL 名字
+        model = self.by_name(csl)
+        if model:
+            return model, "CSL 名字精确匹配"
+
+        equipment = (equipment or "").upper()
+        airline = (airline or "").upper()
+
+        # 1. 机型 + 航司
+        if equipment and airline:
+            found = self._by_icao_airline.get((equipment, airline))
+            if found:
+                return found[0], "机型和航司都匹配"
+
+        # 2. 机型，任意涂装
+        if equipment:
+            found = self._by_icao.get(equipment)
+            if found:
+                return found[0], "机型匹配，涂装不对"
+
+        # 3. 同族近似机型；优先仍带正确航司的
+        for relative in family_of(equipment):
+            if relative == equipment:
+                continue
+            if airline:
+                found = self._by_icao_airline.get((relative, airline))
+                if found:
+                    return found[0], f"用同族 {relative} 顶替，航司正确"
+            found = self._by_icao.get(relative)
+            if found:
+                return found[0], f"用同族 {relative} 顶替"
+
+        # 4. 同类别通用
+        generic = generic_for(equipment)
+        found = self._by_icao.get(generic)
+        if found:
+            return found[0], f"退到通用机型 {generic}"
+
+        # 5. 兜底。看不见的飞机比涂装错的飞机危险得多。
+        return self.models[0], "没有近似机型，用了包里的第一个"
