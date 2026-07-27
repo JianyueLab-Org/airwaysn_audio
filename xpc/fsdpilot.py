@@ -6,8 +6,9 @@
     登录   $ID{呼号}:SERVER:{客户端ID}:{客户端名}:{主}:{次}:{CID}:{机器码}
            #AP{呼号}:SERVER:{CID}:{密码}:{等级}:{协议版本}:{模拟器}:{真实姓名}
     位置   @{应答机模式}:{呼号}:{squawk}:{等级}:{纬度}:{经度}:{高度}:{地速}:{PBH}:{气压差}
-    计划   $FP{呼号}:*A:{规则}:{机型}:{巡航速度}:{起飞地}:{预计起飞}:{实际起飞}
-           :{巡航高度}:{目的地}:{备降小时}:{备降分钟}:{备降场}:{备注}:{航路}
+    计划   $FP{呼号}:SERVER:{规则}:{机型}:{真空速}:{起飞地}:{预计起飞}:{实际起飞}
+           :{巡航高度}:{目的地}:{航路小时}:{航路分钟}:{燃油小时}:{燃油分钟}
+           :{备降场}:{备注}:{航路}          —— 一共 17 段，少一段整包被拒
     文字   #TM{呼号}:{收件人}:{正文}
     下线   #DP{呼号}:{CID}
 
@@ -40,7 +41,12 @@ CLIENT_NAME = "XPC for CAN"
 CLIENT_MAJOR = 1
 CLIENT_MINOR = 0
 
-SIMULATOR_XPLANE = 8          # X-Plane 在 FSD 里的模拟器编号
+# 模拟器编号，取自 can-fsd 的 docs/enumerations.md。原来写的 8 是
+# "Microsoft Flight Simulator 2004"——X-Plane 客户端一直在谎报模拟器。
+# 我们没有从链路上判断 X-Plane 大版本，按 12 报（11 是 15）。
+SIMULATOR_XPLANE_11 = 15
+SIMULATOR_XPLANE_12 = 16
+SIMULATOR = SIMULATOR_XPLANE_12
 
 # 应答机模式对应位置包的第一个字符
 XPDR_STANDBY = "S"            # 待机 / 仅 mode A
@@ -199,7 +205,18 @@ class FSDPilot:
         return self._send(f"#TM{self.callsign}:{sanitize(recipient)}:{message}")
 
     def file_flight_plan(self, plan):
-        """提交飞行计划。plan 是 gui 那边攒好的字典。"""
+        """提交飞行计划。plan 是 gui 那边攒好的字典。
+
+        字段顺序和数量抄自 can-fsd 的 docs/protocol.md（Flight Plan `$FP`），
+        **一共 17 段**，少一段服务端就回 "Too few fields for $FP"（真实日志里
+        每次提交都是这个）。先前漏了燃油小时/分钟两段，而且把航路时间那两段
+        当成了备降时间。
+
+            $FP呼号:SERVER:规则:机型:真空速:起飞地:预计起飞:实际起飞:巡航高度
+                   :目的地:航路小时:航路分钟:燃油小时:燃油分钟:备降场:备注:航路
+
+        收件人按文档是 SERVER；`*A` 是服务端转发给管制时用的，不是填报用的。
+        """
         fields = [
             sanitize(plan.get("rules", "I"))[:1] or "I",
             sanitize(plan.get("aircraft", self.aircraft)),
@@ -209,13 +226,15 @@ class FSDPilot:
             sanitize(plan.get("actual_time", "")),
             sanitize(plan.get("cruise_altitude", "")),
             sanitize(plan.get("arrival", "")).upper(),
-            sanitize(plan.get("alternate_hours", "0")),
-            sanitize(plan.get("alternate_minutes", "0")),
+            sanitize(plan.get("enroute_hours", "0")) or "0",
+            sanitize(plan.get("enroute_minutes", "0")) or "0",
+            sanitize(plan.get("fuel_hours", "0")) or "0",
+            sanitize(plan.get("fuel_minutes", "0")) or "0",
             sanitize(plan.get("alternate", "")).upper(),
             sanitize(plan.get("remarks", "")),
             sanitize(plan.get("route", "")).upper(),
         ]
-        return self._send(f"$FP{self.callsign}:*A:" + ":".join(fields))
+        return self._send(f"$FP{self.callsign}:SERVER:" + ":".join(fields))
 
     def request_atis(self, callsign):
         """问某个管制席位要文字通播。"""
@@ -295,7 +314,7 @@ class FSDPilot:
         self._send(f"$ID{self.callsign}:SERVER:{CLIENT_ID}:{CLIENT_NAME}:"
                    f"{CLIENT_MAJOR}:{CLIENT_MINOR}:{self.cid}:{machine_id}")
         self._send(f"#AP{self.callsign}:SERVER:{self.cid}:{self.password}:"
-                   f"{self.rating}:{PROTO_REVISION}:{SIMULATOR_XPLANE}:{self.real_name}")
+                   f"{self.rating}:{PROTO_REVISION}:{SIMULATOR}:{self.real_name}")
         self._send(f"$CQ{self.callsign}:SERVER:CAPS")
 
         deadline = time.time() + LOGIN_TIMEOUT

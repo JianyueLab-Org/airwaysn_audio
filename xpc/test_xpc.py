@@ -290,6 +290,12 @@ class PacketHandlingTest(unittest.TestCase):
 
 
 class FlightPlanTest(unittest.TestCase):
+    """$FP 的字段布局。真实日志里每次提交都被回 "Too few fields for $FP"。"""
+
+    # can-fsd 的 minimumFields（packet.go）要求 17 段，
+    # 布局见 docs/protocol.md 的 Flight Plan `$FP`
+    FIELDS = 17
+
     def setUp(self):
         self.sent = []
         self.pilot = fsdpilot.FSDPilot("example.invalid", "CCA1501", "1234", "pw")
@@ -301,12 +307,50 @@ class FlightPlanTest(unittest.TestCase):
             "departure": "ZSPD", "arrival": "ZBAA", "cruise_altitude": "35000",
             "route": "PIKAS A461 SASAN", "remarks": "/v/",
         })
-        # $FP呼号 + *A + 13 个字段
-        self.assertEqual(len(self.sent[0].split(":")), 15)
+        self.assertEqual(len(self.sent[0].split(":")), self.FIELDS)
+
+    def test_empty_plan_still_has_every_field(self):
+        # 什么都不填也得凑满 17 段，否则整包被拒
+        self.pilot.file_flight_plan({})
+        self.assertEqual(len(self.sent[0].split(":")), self.FIELDS)
 
     def test_route_colons_do_not_break_the_packet(self):
         self.pilot.file_flight_plan({"route": "A:B", "remarks": "x:y"})
-        self.assertEqual(len(self.sent[0].split(":")), 15)
+        self.assertEqual(len(self.sent[0].split(":")), self.FIELDS)
+
+    def test_filed_to_server(self):
+        # 按 protocol.md，填报发给 SERVER；*A 是服务端转发给管制时用的
+        self.pilot.file_flight_plan({})
+        self.assertEqual(self.sent[0].split(":")[1], "SERVER")
+
+    def test_field_order_matches_the_protocol(self):
+        self.pilot.file_flight_plan({
+            "rules": "I", "aircraft": "B738", "cruise_speed": "450",
+            "departure": "ZSPD", "departure_time": "1230",
+            "cruise_altitude": "35000", "arrival": "ZBAA",
+            "enroute_hours": "2", "enroute_minutes": "15",
+            "fuel_hours": "4", "fuel_minutes": "30",
+            "alternate": "ZSNJ", "remarks": "RMK", "route": "PIKAS",
+        })
+        f = self.sent[0].split(":")
+        self.assertEqual(f[0], "$FPCCA1501")
+        self.assertEqual(f[2], "I")          # 飞行规则
+        self.assertEqual(f[3], "B738")       # 机型
+        self.assertEqual(f[4], "450")        # 真空速
+        self.assertEqual(f[5], "ZSPD")       # 起飞地
+        self.assertEqual(f[8], "35000")      # 巡航高度
+        self.assertEqual(f[9], "ZBAA")       # 目的地
+        self.assertEqual(f[10], "2")         # 航路小时
+        self.assertEqual(f[11], "15")        # 航路分钟
+        self.assertEqual(f[12], "4")         # 燃油小时
+        self.assertEqual(f[13], "30")        # 燃油分钟
+        self.assertEqual(f[14], "ZSNJ")      # 备降场
+        self.assertEqual(f[16], "PIKAS")     # 航路
+
+    def test_simulator_is_not_flight_simulator_2004(self):
+        """模拟器编号原来写的 8，在 can-fsd 的枚举里是 MSFS 2004。"""
+        self.assertNotEqual(fsdpilot.SIMULATOR, 8)
+        self.assertEqual(fsdpilot.SIMULATOR, fsdpilot.SIMULATOR_XPLANE_12)
 
 
 class VoiceChannelTest(unittest.TestCase):

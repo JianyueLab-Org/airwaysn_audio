@@ -415,6 +415,28 @@ class ModelMatchingTest(unittest.TestCase):
         self.assertIn("没有带机型码", why)
 
 
+class FlightPlanTest(unittest.TestCase):
+    """$FP 的字段布局。协议层和 xpc 共用同一份 fsdpilot.py。"""
+
+    def setUp(self):
+        import fsdpilot
+        self.fsdpilot = fsdpilot
+        self.sent = []
+        self.pilot = fsdpilot.FSDPilot("example.invalid", "CCA1501", "1", "pw")
+        self.pilot._send = lambda packet: self.sent.append(packet) or True
+
+    def test_field_count(self):
+        # can-fsd 的 minimumFields 要求 17 段
+        self.pilot.file_flight_plan({})
+        self.assertEqual(len(self.sent[0].split(":")), 17)
+
+    def test_identifies_as_msfs_not_xplane(self):
+        # 这份是从 xpc 复制来的，连它报 X-Plane 的编号一起带了过来
+        self.assertEqual(self.fsdpilot.SIMULATOR,
+                         self.fsdpilot.SIMULATOR_MSFS_2020)
+        self.assertEqual(self.fsdpilot.CLIENT_NAME, "MSFS for CAN")
+
+
 class InjectorTest(unittest.TestCase):
     """他机注入。真正跑要 SimConnect，这里只测不依赖模拟器的那部分。"""
 

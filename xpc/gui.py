@@ -854,6 +854,31 @@ class FlightPlanDialog(QDialog):
         form.addRow("备降场", self.alternate)
         form.addRow("巡航高度", self.cruise_altitude)
         form.addRow("预计起飞", self.departure_time)
+
+        # 航路时间和续航时间是 $FP 的必填段，漏了服务端会整包拒收
+        self.enroute_hours = QLineEdit(saved.get("enroute_hours", "0"))
+        self.enroute_minutes = QLineEdit(saved.get("enroute_minutes", "0"))
+        self.fuel_hours = QLineEdit(saved.get("fuel_hours", "0"))
+        self.fuel_minutes = QLineEdit(saved.get("fuel_minutes", "0"))
+        for widget in (self.enroute_hours, self.enroute_minutes,
+                       self.fuel_hours, self.fuel_minutes):
+            widget.setMaximumWidth(60)
+
+        enroute_row = QHBoxLayout()
+        enroute_row.addWidget(self.enroute_hours)
+        enroute_row.addWidget(QLabel("小时"))
+        enroute_row.addWidget(self.enroute_minutes)
+        enroute_row.addWidget(QLabel("分钟"))
+        enroute_row.addStretch()
+        form.addRow("航路时间", enroute_row)
+
+        fuel_row = QHBoxLayout()
+        fuel_row.addWidget(self.fuel_hours)
+        fuel_row.addWidget(QLabel("小时"))
+        fuel_row.addWidget(self.fuel_minutes)
+        fuel_row.addWidget(QLabel("分钟"))
+        fuel_row.addStretch()
+        form.addRow("续航时间", fuel_row)
         form.addRow("航路", self.route)
         form.addRow("备注", self.remarks)
 
@@ -874,8 +899,10 @@ class FlightPlanDialog(QDialog):
             "cruise_altitude": self.cruise_altitude.text().strip(),
             "departure_time": self.departure_time.text().strip(),
             "actual_time": self.departure_time.text().strip(),
-            "alternate_hours": "0",
-            "alternate_minutes": "0",
+            "enroute_hours": self.enroute_hours.text().strip() or "0",
+            "enroute_minutes": self.enroute_minutes.text().strip() or "0",
+            "fuel_hours": self.fuel_hours.text().strip() or "0",
+            "fuel_minutes": self.fuel_minutes.text().strip() or "0",
             "route": self.route.toPlainText().strip().upper(),
             "remarks": self.remarks.toPlainText().strip(),
         }
