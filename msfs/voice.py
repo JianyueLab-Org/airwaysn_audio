@@ -78,6 +78,8 @@ class Voice:
         self._last_rx = 0.0
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
         self._channel_lock = threading.Lock()   # 频道切换不能并发
+        self._channel_wanted = threading.Event()  # 有新频率要切
+        self._channel_thread = None
         self._pending = None               # 还没切过去的频率
         self._thread = None
 
@@ -182,19 +184,43 @@ class Voice:
         self._status('online', f"语音已连接（{self.username}）")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._channel_thread = threading.Thread(target=self._channel_loop,
+                                                daemon=True)
+        self._channel_thread.start()
 
+        # 连上之前记下的频率现在可以切了
         if self._pending is not None:
-            self.set_frequency(self._pending)
+            self._channel_wanted.set()
+
+    def _channel_loop(self):
+        """频道切换的工作线程。
+
+        单独一条线程，不跟发送线程挤：切换要等服务器回 ChannelState，而发送
+        线程是 20 ms 一帧的节奏，把切换放进去会把 PTT 一起卡住。
+        """
+        while self.running:
+            if not self._channel_wanted.wait(timeout=0.5):
+                continue
+            self._channel_wanted.clear()
+            target = self._pending
+            if target is None or target == self.frequency:
+                continue
+            try:
+                self._switch_channel(target)
+            except Exception as e:
+                log.warning("切换频道出错: %s", e)
 
     def stop(self):
         self.running = False
 
         # 先收线程再动 PyAudio。反过来的话发送线程可能正卡在 stream.read()
         # 里，C 层被 terminate 掉是直接崩，Python 的 try/except 接不住。
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2)
-        self._thread = None
+        self._channel_wanted.set()      # 叫醒切换线程好让它看到 running=False
+        for thread in (self._thread, self._channel_thread):
+            if (thread and thread.is_alive()
+                    and thread is not threading.current_thread()):
+                thread.join(timeout=2)
+        self._thread = self._channel_thread = None
 
         for stream in (self._input, self._output):
             try:
@@ -243,15 +269,28 @@ class Voice:
         return self._find_channel(name)
 
     def set_frequency(self, frequency):
-        """COM1 变了。频率一样就什么都不做。
+        """COM1 变了。**必须立刻返回**。
 
-        整个切换过程上锁：start() 里的补切和 tick() 的定时调用会同时进来，
-        两边各建一次频道、各报一次错（真实日志里就是这样）。
+        这个方法是从 gui.py 的 tick() 调的，而 tick() 跑在 Qt 主线程上。真正
+        的切换要建频道、等服务器回 ChannelState，是一次网络往返，最坏要等满
+        CHANNEL_TIMEOUT——在主线程上干这件事窗口会直接"未响应"（实测过）。
+
+        所以这里只记下目标频率并叫醒工作线程，切换在那边做。
         """
         if frequency is None:
             return
         frequency = round(float(frequency), 3)
+        if frequency == self._pending:
+            return
         self._pending = frequency
+        self._channel_wanted.set()
+
+    def _switch_channel(self, frequency):
+        """真正的切换。只在工作线程里跑。
+
+        整个过程上锁：start() 里的补切和工作线程会同时进来，两边各建一次
+        频道、各报一次错（真实日志里就是这样）。
+        """
         if not self.connected:
             return
 

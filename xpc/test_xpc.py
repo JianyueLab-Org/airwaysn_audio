@@ -10,6 +10,7 @@ import inspect
 import os
 import struct
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -367,19 +368,69 @@ class VoiceChannelTest(unittest.TestCase):
         """建频道是一次网络往返，固定 sleep 赌不起。
 
         原来 new_channel 之后 sleep(0.3) 就去找，远程服务器上经常还没回来，
-        报出来是"频道不存在"，看着像建不了。
+        报出来是"频道不存在"，看着像建不了。等待逻辑现在在 _switch_channel
+        里——它跑在工作线程上，set_frequency 只负责记下目标。
         """
-        source = inspect.getsource(self.voice.Voice.set_frequency)
+        source = inspect.getsource(self.voice.Voice._switch_channel)
         self.assertNotIn("sleep(0.3)", source)
         self.assertIn("_wait_for_channel", source)
 
     def test_switching_is_serialised(self):
-        # start() 的补切和 tick() 的定时调用会同时进来，各建一次各报一次错
-        source = inspect.getsource(self.voice.Voice.set_frequency)
+        # start() 的补切和工作线程会同时进来，各建一次各报一次错
+        source = inspect.getsource(self.voice.Voice._switch_channel)
         self.assertIn("_channel_lock", source)
 
     def test_channel_timeout_is_generous_enough_for_a_remote_server(self):
         self.assertGreaterEqual(self.voice.CHANNEL_TIMEOUT, 2.0)
+
+    def test_set_frequency_returns_immediately(self):
+        """set_frequency 不能阻塞调用方。
+
+        它是从 gui.py 的 tick() 调的，tick() 跑在 Qt 主线程上。真正的切换要等
+        服务器回 ChannelState，最坏 CHANNEL_TIMEOUT 秒——在主线程上等这么久，
+        窗口直接"未响应"（实测过，日志停在"建一个临时的"之后就没了）。
+
+        前面几条测试只看代码结构，正是这样漏掉了这个问题，所以这条直接计时。
+        """
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        caster.frequency = None
+        caster._pending = None
+        caster._channel_wanted = threading.Event()
+
+        started = time.time()
+        caster.set_frequency(121.5)
+        elapsed = time.time() - started
+
+        self.assertLess(elapsed, 0.05,
+                        f"set_frequency 阻塞了 {elapsed:.2f} 秒")
+        self.assertEqual(caster._pending, 121.5, "目标频率应当记下来")
+        self.assertTrue(caster._channel_wanted.is_set(), "应当叫醒切换线程")
+
+    def test_set_frequency_does_not_touch_the_network(self):
+        # 一个连 mumble 都没有的实例上调用也不该炸——真正的活儿在工作线程
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        caster.frequency = None
+        caster._pending = None
+        caster._channel_wanted = threading.Event()
+        caster.mumble = None
+        caster.set_frequency(133.15)
+        self.assertEqual(caster._pending, 133.15)
+
+    def test_repeated_same_frequency_is_cheap(self):
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        caster.frequency = None
+        caster._pending = None
+        caster._channel_wanted = threading.Event()
+        caster.set_frequency(121.5)
+        caster._channel_wanted.clear()
+        caster.set_frequency(121.5)     # tick() 每 0.5 秒就来一次
+        self.assertFalse(caster._channel_wanted.is_set(),
+                         "频率没变就不该反复叫醒工作线程")
+
+    def test_switching_happens_on_a_worker_thread(self):
+        source = inspect.getsource(self.voice.Voice)
+        self.assertIn("_channel_loop", source)
+        self.assertIn("_switch_channel", source)
 
 
 class ChannelNameTest(unittest.TestCase):
