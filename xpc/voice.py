@@ -24,7 +24,8 @@ mumblecompat.install()
 import numpy as np
 import pyaudio
 import pymumble_py3 as pymumble
-from pymumble_py3.constants import PYMUMBLE_CLBK_SOUNDRECEIVED
+from pymumble_py3.constants import (PYMUMBLE_CLBK_SOUNDRECEIVED,
+                                    PYMUMBLE_CONN_STATE_CONNECTED)
 
 log = logging.getLogger("语音")
 
@@ -83,6 +84,7 @@ class Voice:
         self._sent_frames = 0           # 本次 PTT 已发出的帧数
         self._received_frames = 0       # 本段接收已播放的帧数
         self._skip_reason = ""          # 明明按着 PTT 却没发的原因
+        self._stuck_reason = ""         # 迟迟进不了频率频道的原因
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
         self._channel_lock = threading.Lock()   # 频道切换不能并发
         self._channel_wanted = threading.Event()  # 有新频率要切
@@ -101,7 +103,16 @@ class Voice:
 
     @property
     def connected(self):
-        return bool(self.mumble and self.mumble.connected)
+        """真的连上了才算。
+
+        pymumble 的 connected 是状态码不是布尔：0 未连接、1 认证中、2 已连接、
+        3 失败。原来写 bool(...)，**失败的 3 也是真值**，于是连接被服务器拒绝
+        之后我们照样当成连上了——实测日志里就是这样：Mumble 回了
+        "Wrong certificate or password"，界面还报"语音已连接"。
+        """
+        if not self.mumble:
+            return False
+        return self.mumble.connected == PYMUMBLE_CONN_STATE_CONNECTED
 
     # ---------- 音频设备 ----------
     def _open_audio(self):
@@ -203,6 +214,16 @@ class Voice:
             self._status('error', f"语音服务器连接失败: {e}")
             return
 
+        # is_ready() 返回不代表连上了：服务器拒绝时 pymumble 的连接线程会带着
+        # ConnectionRejectedError 直接死掉，而 is_ready() 照样放行。实测里
+        # 用户名填错，Mumble 回 "Wrong certificate or password"，界面却报
+        # "语音已连接"，然后一切都莫名其妙地不工作。
+        if not self.connected:
+            self.running = False
+            self._status('error',
+                         f"语音服务器拒绝了 {self.username}（用户名或密码不对？）")
+            return
+
         self._status('online', f"语音已连接（{self.username}）")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -234,14 +255,30 @@ class Voice:
                 break
 
             target = self._pending
-            if target is None or target == self.frequency:
+            if target is None:
+                self._note_stuck("还没有拿到 COM1 频率")
+                continue
+            if target == self.frequency:
+                self._stuck_reason = ""      # 到位了
                 continue
             if not self.connected:
-                continue          # 还没连上，下一轮再来
+                self._note_stuck("语音服务器还没连上")
+                continue
             try:
                 self._switch_channel(target)
             except Exception as e:
                 log.warning("切换频道出错: %s", e)
+
+    def _note_stuck(self, reason):
+        """迟迟切不过去时说明原因。
+
+        原来这两个分支是静默 continue 的：日志里既没有"建一个临时的"也没有
+        任何错误，只剩下"PTT 一帧都没发"，完全看不出卡在哪一步。
+        """
+        if reason == self._stuck_reason:
+            return
+        self._stuck_reason = reason
+        log.warning("还没能进入频率频道：%s", reason)
 
     def stop(self):
         self.running = False

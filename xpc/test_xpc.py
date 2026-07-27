@@ -470,6 +470,35 @@ class VoiceChannelTest(unittest.TestCase):
         source = inspect.getsource(self.voice.Voice._run)
         self.assertIn("ROOT_CHANNEL", source)
 
+    def test_failed_connection_is_not_reported_as_connected(self):
+        """pymumble 的 connected 是状态码：3 是 FAILED，也是真值。
+
+        实测里用户名填错，Mumble 回 "Wrong certificate or password"，连接线程
+        带着异常死掉，界面却报"语音已连接"，然后一切莫名其妙地不工作。
+        """
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        # 测试环境里 pymumble 的常量可能是替身，所以拿模块自己导入的那个比对
+        connected_state = self.voice.PYMUMBLE_CONN_STATE_CONNECTED
+
+        caster.mumble = type("M", (), {"connected": connected_state})()
+        self.assertTrue(caster.connected, "真的连上了应当是 True")
+
+        # 0 未连接、1 认证中、3 失败——用 bool() 判断的话 1 和 3 都会是真值
+        for state in (0, 1, 3):
+            caster.mumble = type("M", (), {"connected": state})()
+            self.assertFalse(caster.connected,
+                             f"connected={state} 不该算作已连接")
+
+    def test_no_mumble_means_not_connected(self):
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        caster.mumble = None
+        self.assertFalse(caster.connected)
+
+    def test_stuck_channel_is_explained(self):
+        # 切不过去的两个分支原来是静默 continue，日志里什么都看不到
+        source = inspect.getsource(self.voice.Voice._channel_loop)
+        self.assertIn("_note_stuck", source)
+
     def test_switching_happens_on_a_worker_thread(self):
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_channel_loop", source)
