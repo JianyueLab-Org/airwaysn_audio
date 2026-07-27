@@ -787,6 +787,83 @@ class ResampleTest(unittest.TestCase):
         self.assertEqual(len(broadcast.resample(np.zeros(0), 22050, 48000)), 0)
 
 
+class VoiceFixTest(unittest.TestCase):
+    """语音稿收尾。用例全部来自 RJTT 的真实播出输出。"""
+
+    def setUp(self):
+        global voicefix
+        import voicefix
+
+    # 真实播出时管制员填的自由文本，原样照抄自 vATIS 的 RJTT profile
+    FREE = ("ILS ZULU RWY34L APCH AND ILS ZULU RWY34R APCH. LDG RWY 34 LEFT "
+            "AND 34 RIGHT. DEP RWY 05 AND 34 RIGHT. DEP FREQ 126.0, "
+            "SIMUL PARL ILS APCHS TO RWY34L_R ARE INPR")
+
+    def test_abbreviations_are_expanded(self):
+        out = voicefix.expand_free_text(self.FREE)
+        for short in ("APCH", "LDG", "RWY", "DEP", "SIMUL", "PARL", "INPR"):
+            self.assertNotIn(short, out.upper().split(),
+                             f"{short} 没展开，TTS 会逐字母念")
+
+    def test_runway_number_is_spelled(self):
+        # RWY34L 念成"三十四"是错的，通播里逐位念
+        out = voicefix.expand_free_text("RWY34L")
+        self.assertIn("three four left", out)
+        self.assertNotIn("34", out)
+
+    def test_underscore_means_and(self):
+        # 日本通播里 RWY34L_R 是 34 左和 34 右
+        out = voicefix.expand_free_text("RWY34L_R")
+        self.assertIn("left and right", out)
+        self.assertNotIn("_", out)
+
+    def test_frequency_decimal(self):
+        out = voicefix.expand_free_text("DEP FREQ 126.0")
+        self.assertIn("one two six decimal zero", out)
+
+    def test_no_stray_symbols_left(self):
+        out = voicefix.expand_free_text(self.FREE)
+        for symbol in ("_", "/"):
+            self.assertNotIn(symbol, out)
+
+    # 真实播出里粘在一起的那段
+    GLUED = ("broken niner thousandtemperature two five/dew point two two "
+             "QNH one zero one four hectopascals2992")
+
+    def test_glued_words_are_separated(self):
+        # 全小写的粘连没有模式能识别，靠已知的段起始词切
+        out = voicefix.polish(self.GLUED)
+        self.assertNotIn("thousandtemperature", out)
+        self.assertIn("thousand, temperature", out)
+
+    def test_glued_number_is_separated_and_spelled(self):
+        out = voicefix.polish(self.GLUED)
+        self.assertNotIn("hectopascals2992", out)
+        self.assertIn("two niner niner two", out)
+
+    def test_slash_is_removed(self):
+        self.assertNotIn("/", voicefix.polish(self.GLUED))
+
+    def test_polish_leaves_good_text_alone(self):
+        good = "wind zero eight zero at one zero knots, visibility one zero kilometers"
+        self.assertEqual(voicefix.polish(good), good)
+
+    def test_join_elements_separates(self):
+        self.assertEqual(
+            voicefix.join_elements(["broken niner thousand", "temperature two five"]),
+            "broken niner thousand, temperature two five")
+
+    def test_join_skips_empties(self):
+        self.assertEqual(voicefix.join_elements(["a", "", None, "b"]), "a, b")
+
+    def test_empty_input(self):
+        self.assertEqual(voicefix.polish(""), "")
+        self.assertEqual(voicefix.expand_free_text(""), "")
+
+    def test_punctuation_spacing(self):
+        self.assertEqual(voicefix.polish("a ,b .c"), "a, b. c")
+
+
 class ChineseVoiceTest(unittest.TestCase):
     """中文通播稿。不是英文的逐词翻译，语序和读法都是民航自己的一套。"""
 

@@ -15,6 +15,8 @@
 
 import re
 
+import voicefix
+
 VARIABLE = re.compile(r'\[([A-Z_]+)(:VOX)?\]')
 # 缩略语在模板里写成 @变量名，和 vATIS 一致
 CONTRACTION = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
@@ -69,8 +71,14 @@ def build_context(metar, facility="", letter="A", airport_conditions="",
     from metar import Element
 
     def free(value):
+        """自由文本（机场条件、NOTAM）。
+
+        文字通播保留缩写原样——那份是给人看的，`RWY34L APCH` 正是它该有的样子。
+        语音稿必须展开，否则 TTS 会把 APCH 念成"埃屁西埃奇"、把 RWY34L_R 念成
+        "阿威三十四艾尔下划线啊"。
+        """
         value = (value or "").strip()
-        return Element(value, value)
+        return Element(value, voicefix.expand_free_text(value))
 
     closing_text = DEFAULT_CLOSING if closing is None else closing
     context = {
@@ -146,7 +154,8 @@ def render(template, context, contractions=None):
         _substitute(template, context, voice=False), contractions, voice=False)
     voice = _expand_contractions(
         _substitute(template, context, voice=True), contractions, voice=True)
-    return tidy(text), tidy(voice)
+    # polish 是最后一道防线：上游哪一环少了分隔符，也不该让用户听到一个怪词
+    return tidy(text), voicefix.polish(tidy(voice))
 
 
 def unknown_variables(template):
