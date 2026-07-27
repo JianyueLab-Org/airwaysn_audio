@@ -311,8 +311,11 @@ class FSDPilot:
                 return False
             if self._logged_in:
                 self._status('online', f"已作为 {self.callsign} 上线")
-                # 上线先问一遍在线管制，好把附近频率列出来
-                self._send(f"$CQ{self.callsign}:SERVER:ATC")
+                # 这里曾经发过 $CQ…:SERVER:ATC 想要一份在线管制列表。那是误解：
+                # can-fsd 的 handleQueryATC 是问"某个指定呼号是不是在线管制"，
+                # 第 3 段必须带目标呼号，不带就回 "Missing callsign"（真实日志
+                # 里每次登录都有一条）。本来也不需要——管制席位是靠 % 位置包
+                # 主动广播过来的，_note_controller 已经在收了。
                 return True
 
         self._status('error', "FSD 登录超时，未收到服务器回应")

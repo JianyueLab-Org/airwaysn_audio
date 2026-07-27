@@ -27,6 +27,26 @@ DEFAULT_PORT = 49000
 UPDATE_RATE = 5                 # 每个 dataref 每秒推送次数
 STALE_AFTER = 3.0               # 超过这么久没有新数据就认为断了
 REDISCOVER_AFTER = 15.0         # 还是没有的话，重新去找一次 X-Plane
+BEACON_GATHER = 1.0             # 收到第一份信标后再等这么久，收齐其他网卡的
+
+# 这些网段几乎都是虚拟网卡：VPN、WSL、Hyper-V、Docker。信标会从它们身上也回
+# 来一份，但往那边发 RREF 收不到任何数据。排序时排在最后。
+VIRTUAL_PREFIXES = ("198.18.", "198.19.", "172.17.", "172.18.", "172.19.",
+                    "172.20.", "169.254.", "10.211.", "10.37.")
+
+
+def _address_rank(ip):
+    """给发现到的地址排个优先级，小的优先。
+
+    本机最优（同机跑 X-Plane 是最常见的情形，而且必然通）；其次是普通局域网
+    地址；已知的虚拟网卡段排最后——实测里 198.18.0.1 就是这么混进来的，选中
+    它之后一个 dataref 都收不到。
+    """
+    if ip.startswith("127."):
+        return 0
+    if any(ip.startswith(prefix) for prefix in VIRTUAL_PREFIXES):
+        return 2
+    return 1
 
 # 我们订阅的 dataref。索引是发给 X-Plane 的编号，回包按它对应回来。
 DATAREFS = {
@@ -68,6 +88,8 @@ class XPlaneLink:
     def __init__(self, on_state=None):
         self.on_state = on_state
         self.address = None
+        self._known_good = None     # 真的回过数据的地址，最可信
+        self._last_discovered = None    # 最近一次信标发现到的地址
         self.values = {}            # dataref 名 -> 最新值
         self.last_update = 0.0
         self.running = False
@@ -118,28 +140,63 @@ class XPlaneLink:
 
     # ---------- 发现 ----------
     def discover(self, timeout=DISCOVER_TIMEOUT):
-        """等 X-Plane 的多播信标。返回 (ip, port) 或 None。"""
+        """等 X-Plane 的多播信标。返回 (ip, port) 或 None。
+
+        一台机器上装了 VPN 或虚拟网卡时，同一个信标会从多个网卡各收到一份，
+        源地址各不相同（实测见过 198.18.0.1 这种 CGNAT 段的虚拟网卡地址）。
+        只取先到的那份等于抽签，抽中虚拟网卡就永远收不到数据。所以在整个超时
+        窗口里把能收到的都收下来，再按"哪个地址更可能真的通"来挑。
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        candidates = []
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", MCAST_PORT))
             mreq = struct.pack("4sl", socket.inet_aton(MCAST_GROUP), socket.INADDR_ANY)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            sock.settimeout(timeout)
-            data, addr = sock.recvfrom(1500)
-        except (socket.timeout, OSError):
+
+            deadline = time.time() + timeout
+            # 收到第一份之后再多等一会儿，好把其他网卡上的同一个信标也收齐
+            while time.time() < deadline:
+                sock.settimeout(max(0.1, min(BEACON_GATHER, deadline - time.time())))
+                try:
+                    data, addr = sock.recvfrom(1500)
+                except socket.timeout:
+                    if candidates:
+                        break
+                    continue
+                except OSError:
+                    break
+                found = self._parse_beacon(data, addr)
+                if found and found not in candidates:
+                    candidates.append(found)
+                    deadline = min(deadline, time.time() + BEACON_GATHER)
+        except OSError:
             return None
         finally:
             sock.close()
 
+        if not candidates:
+            return None
+        best = min(candidates, key=lambda a: _address_rank(a[0]))
+        if len(candidates) > 1:
+            log.info("信标来自 %d 个网卡 %s，选用 %s",
+                     len(candidates), [a[0] for a in candidates], best[0])
+        else:
+            log.info("发现 X-Plane @ %s:%s", best[0], best[1])
+        return best
+
+    @staticmethod
+    def _parse_beacon(data, addr):
         if data[:5] != b"BECN\x00":
-            log.warning("收到未知信标 %r", data[:5])
+            log.debug("收到未知信标 %r", data[:5])
             return None
         try:
-            _, major, minor, _, _, _, port = struct.unpack_from("=5sBBiiIH", data)
+            # 这两个字节是**信标协议**的版本，不是 X-Plane 的版本号——早先按
+            # "X-Plane v1.2" 打进日志是错的，会让人以为装了个远古版本。
+            _, _, _, _, _, _, port = struct.unpack_from("=5sBBiiIH", data)
         except struct.error:
             return None
-        log.info("发现 X-Plane v%s.%s @ %s:%s", major, minor, addr[0], port)
         return (addr[0], port)
 
     # ---------- 订阅 ----------
@@ -158,8 +215,12 @@ class XPlaneLink:
         while self.running:
             address = self.address or self.discover(timeout=5)
             if not address:
-                # 有的机器上多播收不到，直接试本机默认端口
-                address = ("127.0.0.1", DEFAULT_PORT)
+                # 这一轮没收到信标。以前无脑退回本机，结果是：明明发现过
+                # 192.168.31.231，等 15 秒没数据（X-Plane 还在读盘）就把它扔了，
+                # 下一轮退回 127.0.0.1，再等 15 秒，来回折腾了 8 分钟。
+                # 收过数据的地址最可信，其次是上一次发现到的。
+                address = (self._known_good or self._last_discovered
+                           or ("127.0.0.1", DEFAULT_PORT))
 
             self._close()
             try:
@@ -173,6 +234,8 @@ class XPlaneLink:
 
             self._subscribe(self._socket, address)
             self.address = address
+            if address != self._known_good:
+                self._last_discovered = address
             log.info("已向 %s:%s 订阅 %d 个 dataref", address[0], address[1], len(DATAREFS))
 
             got_data = False
@@ -199,6 +262,9 @@ class XPlaneLink:
                     silent_since = time.time()
                     if not got_data:
                         got_data = True
+                        # 这个地址真的有数据回来，记住它——以后信标收不到时
+                        # 优先用它，不要退回本机瞎试
+                        self._known_good = address
                         self._state(True, f"已连接 X-Plane @ {address[0]}")
 
             self._close()

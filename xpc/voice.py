@@ -32,6 +32,9 @@ SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RX_TIMEOUT = 0.5          # 这么久没有新音频就把接收灯灭掉
+# 建完临时频道到它出现在频道表里，要等服务器回一条 ChannelState。这是一次网络
+# 往返，固定 sleep 赌不起——远程服务器上经常不够。
+CHANNEL_TIMEOUT = 5.0
 
 
 def channel_name(frequency_mhz):
@@ -74,6 +77,7 @@ class Voice:
         self._chunk = 960
         self._last_rx = 0.0
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
+        self._channel_lock = threading.Lock()   # 频道切换不能并发
         self._pending = None               # 还没切过去的频率
         self._thread = None
 
@@ -216,37 +220,66 @@ class Voice:
         self._status('stopped', "语音已断开")
 
     # ---------- 频率 ----------
+    def _find_channel(self, name):
+        try:
+            return self.mumble.channels.find_by_name(name)
+        except pymumble.errors.UnknownChannelError:
+            return None
+
+    def _wait_for_channel(self, name):
+        """等服务器把新建的频道回报回来。
+
+        new_channel() 只是发一条消息就返回，频道要等服务器回 ChannelState 才
+        进本地表——这是一次网络往返。原来固定 sleep(0.3) 再找，连远程服务器时
+        经常还没回来，日志里就是连着两条 "Channel FREQ_121700 does not exists"，
+        看着像频道建不了，其实只是没等到。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            channel = self._find_channel(name)
+            if channel is not None:
+                return channel
+            time.sleep(0.1)
+        return self._find_channel(name)
+
     def set_frequency(self, frequency):
-        """COM1 变了。频率一样就什么都不做。"""
+        """COM1 变了。频率一样就什么都不做。
+
+        整个切换过程上锁：start() 里的补切和 tick() 的定时调用会同时进来，
+        两边各建一次频道、各报一次错（真实日志里就是这样）。
+        """
         if frequency is None:
             return
         frequency = round(float(frequency), 3)
-        if frequency == self.frequency:
-            return
         self._pending = frequency
         if not self.connected:
             return
 
-        name = channel_name(frequency)
-        try:
+        with self._channel_lock:
+            if frequency == self.frequency:
+                return          # 等锁的时候已经被另一个调用切过去了
+            name = channel_name(frequency)
             try:
-                channel = self.mumble.channels.find_by_name(name)
-            except pymumble.errors.UnknownChannelError:
-                log.info("频道 %s 不存在，建一个临时的", name)
-                self.mumble.channels.new_channel(0, name, temporary=True)
-                time.sleep(0.3)
-                channel = self.mumble.channels.find_by_name(name)
+                channel = self._find_channel(name)
+                if channel is None:
+                    log.info("频道 %s 不存在，建一个临时的", name)
+                    self.mumble.channels.new_channel(0, name, temporary=True)
+                    channel = self._wait_for_channel(name)
+                if channel is None:
+                    log.warning("建立频道 %s 后 %.0f 秒内没有出现",
+                                name, CHANNEL_TIMEOUT)
+                    return
 
-            myself = self.mumble.users.myself
-            if myself and myself["channel_id"] != channel["channel_id"]:
-                myself.move_in(channel["channel_id"])
-            self.frequency = frequency
-            self.channel = name
-            log.info("已切到 %s（%.3f MHz）", name, frequency)
-            if self.on_channel:
-                self.on_channel(frequency, name)
-        except Exception as e:
-            log.warning("切换到 %s 失败: %s", name, e)
+                myself = self.mumble.users.myself
+                if myself and myself["channel_id"] != channel["channel_id"]:
+                    myself.move_in(channel["channel_id"])
+                self.frequency = frequency
+                self.channel = name
+                log.info("已切到 %s（%.3f MHz）", name, frequency)
+                if self.on_channel:
+                    self.on_channel(frequency, name)
+            except Exception as e:
+                log.warning("切换到 %s 失败: %s", name, e)
 
     # ---------- 收发 ----------
     def set_transmitting(self, value):

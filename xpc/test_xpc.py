@@ -305,6 +305,35 @@ class FlightPlanTest(unittest.TestCase):
         self.assertEqual(len(self.sent[0].split(":")), 15)
 
 
+class VoiceChannelTest(unittest.TestCase):
+    """频道切换。真实日志里连着两条 "Channel FREQ_121700 does not exists"。"""
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors", "numpy"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice = voice
+
+    def test_waits_for_the_server_instead_of_a_fixed_sleep(self):
+        """建频道是一次网络往返，固定 sleep 赌不起。
+
+        原来 new_channel 之后 sleep(0.3) 就去找，远程服务器上经常还没回来，
+        报出来是"频道不存在"，看着像建不了。
+        """
+        source = inspect.getsource(self.voice.Voice.set_frequency)
+        self.assertNotIn("sleep(0.3)", source)
+        self.assertIn("_wait_for_channel", source)
+
+    def test_switching_is_serialised(self):
+        # start() 的补切和 tick() 的定时调用会同时进来，各建一次各报一次错
+        source = inspect.getsource(self.voice.Voice.set_frequency)
+        self.assertIn("_channel_lock", source)
+
+    def test_channel_timeout_is_generous_enough_for_a_remote_server(self):
+        self.assertGreaterEqual(self.voice.CHANNEL_TIMEOUT, 2.0)
+
+
 class ChannelNameTest(unittest.TestCase):
     """频率到频道名是全网约定，改了三个客户端一起坏。"""
 
@@ -405,6 +434,84 @@ class ComFrequencyFallbackTest(unittest.TestCase):
         # 索引撞了会让回包对错 dataref
         self.assertEqual(len(set(xplane.NAME_TO_INDEX.values())),
                          len(xplane.DATAREFS))
+
+
+class DiscoveryTest(unittest.TestCase):
+    """信标发现。用例来自一次真实飞行的日志：连上模拟器花了 8 分半。
+
+    那台机器上信标从两个网卡回来（198.18.0.1 的虚拟网卡和 192.168.31.231 的
+    局域网卡），而且每次 15 秒没数据就把发现到的地址整个扔掉、退回本机重来。
+    """
+
+    def test_virtual_adapters_rank_last(self):
+        # 198.18/15 是 benchmark 段，实际是 VPN 虚拟网卡，往那边发收不到数据
+        self.assertGreater(xplane._address_rank("198.18.0.1"),
+                           xplane._address_rank("192.168.31.231"))
+
+    def test_loopback_ranks_first(self):
+        self.assertLess(xplane._address_rank("127.0.0.1"),
+                        xplane._address_rank("192.168.31.231"))
+
+    def test_ordinary_lan_beats_virtual(self):
+        for virtual in ("198.18.0.1", "172.17.0.1", "169.254.1.1"):
+            self.assertGreater(xplane._address_rank(virtual),
+                               xplane._address_rank("10.0.0.5"),
+                               f"{virtual} 应当排在普通局域网地址之后")
+
+    def test_beacon_is_parsed(self):
+        packet = b"BECN\x00" + struct.pack("=BBiiIH", 1, 2, 11, 1200, 1, 49000)
+        self.assertEqual(
+            xplane.XPlaneLink._parse_beacon(packet, ("192.168.31.231", 5000)),
+            ("192.168.31.231", 49000))
+
+    def test_foreign_packet_is_rejected(self):
+        self.assertIsNone(
+            xplane.XPlaneLink._parse_beacon(b"XXXX\x00" + b"\x00" * 20,
+                                            ("1.2.3.4", 5000)))
+
+    def test_known_good_address_is_preferred_over_loopback(self):
+        """收过数据的地址不该被扔掉。
+
+        真实日志里发现了 192.168.31.231，等 15 秒没数据（X-Plane 还在读盘）就
+        退回 127.0.0.1，来回折腾了 8 分钟。
+        """
+        link = xplane.XPlaneLink()
+        link._known_good = ("192.168.31.231", 49000)
+        fallback = (link._known_good or link._last_discovered
+                    or ("127.0.0.1", xplane.DEFAULT_PORT))
+        self.assertEqual(fallback, ("192.168.31.231", 49000))
+
+    def test_last_discovered_is_used_when_nothing_worked_yet(self):
+        link = xplane.XPlaneLink()
+        link._last_discovered = ("192.168.31.231", 49000)
+        fallback = (link._known_good or link._last_discovered
+                    or ("127.0.0.1", xplane.DEFAULT_PORT))
+        self.assertEqual(fallback, ("192.168.31.231", 49000))
+
+    def test_loopback_only_as_a_last_resort(self):
+        link = xplane.XPlaneLink()
+        fallback = (link._known_good or link._last_discovered
+                    or ("127.0.0.1", xplane.DEFAULT_PORT))
+        self.assertEqual(fallback[0], "127.0.0.1")
+
+
+class LoginTest(unittest.TestCase):
+    """登录时发的东西。真实日志里每次登录都跟着一条服务器错误。"""
+
+    def test_no_bogus_atc_query_on_login(self):
+        """不要再发没有目标呼号的 $CQ…:SERVER:ATC。
+
+        can-fsd 的 handleQueryATC 是问"某个指定呼号是不是在线管制"，第 3 段
+        必须带目标；不带就回 "Missing callsign"（handler.go:400）。而且本来就
+        不需要——管制席位是靠 % 位置包广播过来的。
+        """
+        # 只看真正发出去的语句：解释这段历史的注释里也提到了这个包
+        sends = [line for line in
+                 inspect.getsource(fsdpilot.FSDPilot._connect).splitlines()
+                 if "_send(" in line and not line.strip().startswith("#")]
+        self.assertTrue(sends, "登录时总要发点什么")
+        for line in sends:
+            self.assertNotIn("SERVER:ATC", line)
 
 
 class WaitingTest(unittest.TestCase):
