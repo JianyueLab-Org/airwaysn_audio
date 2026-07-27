@@ -527,6 +527,34 @@ class InjectorTest(unittest.TestCase):
                         "altitude": 0, "model": "x"}])
         self.assertEqual(injector.aircraft, {})
 
+    def test_bad_titles_are_not_retried(self):
+        """建不出来的模型不该每轮都再试一次。
+
+        实测日志里 CREATE_OBJECT_FAILED 反复出现，而且包自带的报错只有一句
+        枚举名，不说是哪架飞机、哪个模型，完全没法查。
+        """
+        injector = self.inject.TrafficInjector(sim=None)
+        injector.available = True
+        injector._bad_titles.add("坏模型")
+        calls = []
+        injector.sim = type("S", (), {"dll": None, "hSimConnect": None})()
+        injector._enums = None
+        injector._create("CES1003", {"latitude": 0, "longitude": 0,
+                                     "altitude": 0}, "坏模型")
+        self.assertEqual(injector.aircraft, {}, "拉黑的模型不该再尝试")
+
+    def test_exception_codes_come_from_the_enum(self):
+        # CREATE_OBJECT_FAILED 是 22；按"排第 12 位"猜会得到 TOO_MANY_REQUESTS
+        import inspect
+        source = inspect.getsource(self.inject.TrafficInjector._note_exception)
+        self.assertIn("SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED", source)
+        self.assertNotIn("= 12", source)
+
+    def test_requested_titles_are_remembered_for_diagnostics(self):
+        # 出错时要说得出是哪个模型，否则日志没法查
+        injector = self.inject.TrafficInjector(sim=None)
+        self.assertIsInstance(injector._requested_titles, dict)
+
     def test_cap_leaves_headroom(self):
         # 每架都是完整的飞机模型，放太多会掉帧
         self.assertLessEqual(self.inject.MAX_AIRCRAFT, 64)

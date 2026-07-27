@@ -22,6 +22,7 @@ objectID 通过 SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID 消息回来，靠 dwReque
 import ctypes
 import logging
 import threading
+import time
 
 log = logging.getLogger("他机注入")
 
@@ -62,7 +63,9 @@ class TrafficInjector:
 
         self._lock = threading.Lock()
         self._pending = {}          # requestID -> 呼号（等 objectID 回来）
+        self._requested_titles = {}  # requestID -> 模型名，出错时才知道是谁
         self._assigned = {}         # requestID -> objectID
+        self._bad_titles = set()    # 建不出来的模型，别反复重试
         self._next_request = REQUEST_BASE
         self._enums = None
 
@@ -92,7 +95,8 @@ class TrafficInjector:
 
         def dispatch(pData, cbData, pContext):
             try:
-                if (pData.contents.dwID ==
+                kind = pData.contents.dwID
+                if (kind ==
                         enums.SIMCONNECT_RECV_ID.SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID):
                     body = ctypes.cast(
                         pData,
@@ -100,11 +104,63 @@ class TrafficInjector:
                     ).contents
                     with self._lock:
                         self._assigned[int(body.dwRequestID)] = int(body.dwObjectID)
+                elif kind == enums.SIMCONNECT_RECV_ID.SIMCONNECT_RECV_ID_EXCEPTION:
+                    self._note_exception(ctypes.cast(
+                        pData,
+                        ctypes.POINTER(enums.SIMCONNECT_RECV_EXCEPTION)).contents)
             except Exception as e:
-                log.debug("处理 ASSIGNED_OBJECT_ID 出错: %s", e)
+                log.debug("处理 SimConnect 消息出错: %s", e)
             return original(pData, cbData, pContext)
 
         sc.my_dispatch_proc = dispatch
+
+    def _note_exception(self, body):
+        """SimConnect 的异步错误。
+
+        建 AI 飞机失败是通过这条消息回来的，包自带的日志只打一个
+        SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED，不说是哪架、哪个模型——
+        实测日志里就是这样，完全没法查。这里把模型名补上。
+
+        dwSendID 对应发出去的那个包，但要 GetLastSentPacketID 才能对上；我们
+        没记那个，所以退而求其次：把最近一次请求过的模型都列出来。这已经足够
+        指认是哪个模型建不出来了。
+        """
+        exceptions = self._enums.SIMCONNECT_EXCEPTION
+        # 编号从枚举里取，别硬编码——CREATE_OBJECT_FAILED 是 22，我一开始
+        # 按"排第 12 位"猜成了 12，那其实是 TOO_MANY_REQUESTS。
+        interesting = {
+            int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED):
+                "建不出来（模型名对不上，或这个机型不能作为 AI 生成）",
+            int(exceptions.SIMCONNECT_EXCEPTION_OBJECT_OUTSIDE_REALITY_BUBBLE):
+                "位置太远，超出模拟器的加载范围",
+            int(exceptions.SIMCONNECT_EXCEPTION_OBJECT_CONTAINER):
+                "模型容器有问题（装得不完整？）",
+        }
+        try:
+            code = int(body.dwException)
+        except Exception:
+            return
+        reason = interesting.get(code)
+        if reason is None:
+            return
+
+        with self._lock:
+            titles = list(self._requested_titles.values())
+            waiting = list(self._pending.values())
+        log.warning("模拟器拒绝生成他机：%s。等待中的飞机 %s，用到的模型 %s",
+                    reason, waiting or "无", titles or "无")
+        # 模型建不出来才拉黑；位置太远是暂时的，换个地方就好了，别把好模型
+        # 永久排除掉
+        blacklist = code == int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED)
+        with self._lock:
+            if blacklist:
+                self._bad_titles.update(titles)
+            self._requested_titles.clear()
+            for callsign in waiting:
+                record = self.aircraft.get(callsign)
+                if record is not None and record.get("object_id") is None:
+                    self.aircraft.pop(callsign, None)
+            self._pending.clear()
 
     def _define_position(self):
         """注册位置的数据定义。只需要做一次。"""
@@ -181,6 +237,10 @@ class TrafficInjector:
         self._move(object_id, entry)
 
     def _create(self, callsign, entry, title):
+        if title in self._bad_titles:
+            # 这个模型已经证明建不出来，别每轮都再试一次
+            return
+
         init = self._enums.SIMCONNECT_DATA_INITPOSITION()
         init.Latitude = entry["latitude"]
         init.Longitude = entry["longitude"]
@@ -196,14 +256,18 @@ class TrafficInjector:
             self.sim.hSimConnect, title.encode("utf-8"),
             callsign.encode("utf-8")[:12], init, request_id)
         if hr != 0:
-            log.warning("创建 %s 失败（模型 %s）: %s", callsign, title, hr)
+            log.warning("创建 %s 失败（模型 %r）: HRESULT %s", callsign, title, hr)
+            self._bad_titles.add(title)
             return
 
         with self._lock:
             self._pending[request_id] = callsign
+            self._requested_titles[request_id] = title
         self.aircraft[callsign] = {"object_id": None, "title": title,
-                                   "request_id": request_id}
-        log.debug("已请求创建 %s，模型 %s，请求号 %d", callsign, title, request_id)
+                                   "request_id": request_id,
+                                   "requested_at": time.time()}
+        log.info("请求把 %s 放进模拟器：模型 %r，请求号 %d",
+                 callsign, title, request_id)
 
     def _move(self, object_id, entry):
         values = (ctypes.c_double * len(_Definition.FIELDS))(

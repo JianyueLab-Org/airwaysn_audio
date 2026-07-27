@@ -101,6 +101,7 @@ class MsfsWindow(QMainWindow):
         # 他机：FSD 线程往表里写，tick() 读出来插值好放进模拟器
         self.traffic = traffic_module.TrafficTable()
         self.injector = None            # 要等 SimConnect 连上才能建
+        self._injecting = threading.Event()   # 上一轮注入还没做完
         self.models = aimatch.ModelSet()
         self._model_cache = {}          # 呼号 -> 匹配到的 title
         self._load_models()
@@ -454,9 +455,23 @@ class MsfsWindow(QMainWindow):
 
         for entry in entries:
             entry["model"] = self._model_for(entry)
-        if self.injector is not None:
-            self.injector.sync(entries)
+
+        # 注入走后台线程。sync() 里每架飞机都是一次 SimConnect 同步 IPC，最多
+        # 40 架、每 0.5 秒一轮——在 Qt 主线程上做这件事窗口会"未响应"。
+        # 上一轮还没做完就跳过这一轮，别让请求越堆越多。
+        if self.injector is not None and not self._injecting.is_set():
+            self._injecting.set()
+            threading.Thread(target=self._inject, args=(entries,),
+                             daemon=True).start()
         self.traffic_label.setText(f"他机 {len(entries)}")
+
+    def _inject(self, entries):
+        try:
+            self.injector.sync(entries)
+        except Exception as e:
+            log.warning("放他机进模拟器出错: %s", e)
+        finally:
+            self._injecting.clear()
 
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。"""

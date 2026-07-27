@@ -8,6 +8,7 @@
 
 import os
 import sys
+import time
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -193,6 +194,11 @@ def main():
     def traffic_reaches_the_injector():
         window.injector = FakeInjector()
         window.tick()
+        # 注入走后台线程了，等它跑完
+        for _ in range(50):
+            if window.injector.synced:
+                break
+            time.sleep(0.02)
         assert window.injector.synced, "他机没有交给注入器"
         entries = window.injector.synced[-1]
         assert entries, "交给注入器的列表是空的"
@@ -205,6 +211,24 @@ def main():
     def label_updates():
         assert "1" in window.traffic_label.text(), window.traffic_label.text()
     check("界面显示他机数", label_updates)
+
+    def tick_does_not_block_on_injection():
+        """tick() 跑在 Qt 主线程上，注入不能拖住它。
+
+        sync() 里每架飞机都是一次 SimConnect 同步 IPC，实测会让窗口"未响应"。
+        """
+        class SlowInjector(FakeInjector):
+            def sync(self, entries):
+                time.sleep(1.0)          # 假装 SimConnect 很慢
+                super().sync(entries)
+
+        window.injector = SlowInjector()
+        started = time.time()
+        window.tick()
+        elapsed = time.time() - started
+        assert elapsed < 0.2, f"tick() 被注入拖了 {elapsed:.2f} 秒"
+        time.sleep(1.2)                  # 让后台线程收尾，别泄漏到下一项
+    check("注入不阻塞界面", tick_does_not_block_on_injection)
 
     def render_can_be_turned_off():
         window.injector = FakeInjector()
