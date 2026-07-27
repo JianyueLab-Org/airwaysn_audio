@@ -169,6 +169,8 @@ def main():
 
         def __init__(self):
             self.synced = []
+            # 匹配时要排除模拟器拒绝生成过的模型，真的注入器有这个字段
+            self.bad_titles = set()
 
         def sync(self, entries):
             self.synced.append(entries)
@@ -229,6 +231,33 @@ def main():
         assert elapsed < 0.2, f"tick() 被注入拖了 {elapsed:.2f} 秒"
         time.sleep(1.2)                  # 让后台线程收尾，别泄漏到下一项
     check("注入不阻塞界面", tick_does_not_block_on_injection)
+
+    def rejected_model_is_replaced():
+        """模拟器拒绝的模型，下一轮要换一个。
+
+        实飞日志里 CREATE_OBJECT_FAILED 反复出现，就是因为匹配器一直挑同一个
+        建不出来的模型，注入端又因为它在黑名单里而跳过——飞机永远出不来。
+        """
+        import aimatch
+        window.injector = FakeInjector()
+        window.models = aimatch.ModelSet([
+            aimatch.Model("坏模型", icao="B738", airline="CCA"),
+            aimatch.Model("好模型", icao="B738"),
+        ])
+        window._model_cache.clear()
+        window.traffic.set_plane_info("CES2345", equipment="B738", airline="CCA")
+        window.tick()
+        time.sleep(0.15)
+        first = window.injector.synced[-1][0]["model"]
+        assert first == "坏模型", first
+
+        # 模拟器拒绝了它
+        window.injector.bad_titles.add("坏模型")
+        window.tick()
+        time.sleep(0.15)
+        second = window.injector.synced[-1][0]["model"]
+        assert second == "好模型", f"被拒之后还在用 {second}"
+    check("被拒绝的模型会换一个", rejected_model_is_replaced)
 
     def render_can_be_turned_off():
         window.injector = FakeInjector()

@@ -474,15 +474,23 @@ class MsfsWindow(QMainWindow):
             self._injecting.clear()
 
     def _model_for(self, entry):
-        """给一架飞机挑模型。匹配结果缓存住，别每帧都算。"""
+        """给一架飞机挑模型。匹配结果缓存住，别每帧都算。
+
+        模拟器拒绝生成过的模型要排除掉。缓存也要跟着失效——否则会一直返回那个
+        建不出来的模型，注入端又因为它在黑名单里而跳过，飞机永远出不来。
+        """
         callsign = entry["callsign"]
-        if not entry.get("model_dirty") and callsign in self._model_cache:
-            return self._model_cache[callsign]
+        rejected = self.injector.bad_titles if self.injector else frozenset()
+        cached = self._model_cache.get(callsign)
+        if (not entry.get("model_dirty") and cached is not None
+                and cached not in rejected):
+            return cached
 
         model, why = self.models.match(
             equipment=entry.get("equipment", ""),
             airline=entry.get("airline", ""),
-            csl=entry.get("csl", ""))
+            csl=entry.get("csl", ""),
+            exclude=rejected)
         title = model.title if model else ""
         self._model_cache[callsign] = title
         self.traffic.mark_model_clean(callsign)

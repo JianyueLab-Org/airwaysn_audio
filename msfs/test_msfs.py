@@ -453,6 +453,38 @@ class ModelMatchingTest(unittest.TestCase):
         self.assertIsNone(model)
         self.assertIn("没有找到", why)
 
+    def test_rejected_models_are_skipped(self):
+        """模拟器拒绝生成过的模型要换一个，不能死磕。
+
+        实飞日志里 CREATE_OBJECT_FAILED 反复出现：匹配挑中的模型建不出来，
+        被拉黑之后匹配器还是挑同一个，注入端又因为在黑名单里而跳过——飞机
+        永远出不来。
+        """
+        model, why = self.models.match(equipment="B738", airline="CCA",
+                                       exclude={"738 Air China"})
+        self.assertNotEqual(model.title, "738 Air China", why)
+        self.assertEqual(model.icao, "B738", "还是该给个 738")
+
+    def test_exclusion_falls_through_every_tier(self):
+        # 整个机型都被拉黑时，要继续往同族/同类退，而不是直接放弃
+        model, why = self.models.match(
+            equipment="B738",
+            exclude={"738 Air China", "738 China Eastern"})
+        self.assertIsNotNone(model, why)
+        self.assertNotIn(model.title, ("738 Air China", "738 China Eastern"))
+
+    def test_everything_rejected_returns_nothing(self):
+        # 全都建不出来时要明说，别硬塞一个已知会失败的
+        titles = {m.title for m in self.models.models}
+        model, why = self.models.match(equipment="B738", exclude=titles)
+        self.assertIsNone(model)
+        self.assertIn("拒绝", why)
+
+    def test_exclusion_is_case_insensitive(self):
+        model, _ = self.models.match(equipment="B738", airline="CCA",
+                                     exclude={"738 AIR CHINA"})
+        self.assertNotEqual(model.title, "738 Air China")
+
     def test_explicit_title_wins_when_installed(self):
         model, why = self.models.match(equipment="B738", csl="Cessna 172")
         self.assertEqual(model.title, "Cessna 172")
@@ -535,7 +567,7 @@ class InjectorTest(unittest.TestCase):
         """
         injector = self.inject.TrafficInjector(sim=None)
         injector.available = True
-        injector._bad_titles.add("坏模型")
+        injector.bad_titles.add("坏模型")
         calls = []
         injector.sim = type("S", (), {"dll": None, "hSimConnect": None})()
         injector._enums = None

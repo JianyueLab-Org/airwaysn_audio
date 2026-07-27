@@ -65,7 +65,7 @@ class TrafficInjector:
         self._pending = {}          # requestID -> 呼号（等 objectID 回来）
         self._requested_titles = {}  # requestID -> 模型名，出错时才知道是谁
         self._assigned = {}         # requestID -> objectID
-        self._bad_titles = set()    # 建不出来的模型，别反复重试
+        self.bad_titles = set()     # 模拟器拒绝生成过的模型；匹配时要排除掉
         self._next_request = REQUEST_BASE
         self._enums = None
 
@@ -154,7 +154,7 @@ class TrafficInjector:
         blacklist = code == int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED)
         with self._lock:
             if blacklist:
-                self._bad_titles.update(titles)
+                self.bad_titles.update(titles)
             self._requested_titles.clear()
             for callsign in waiting:
                 record = self.aircraft.get(callsign)
@@ -237,7 +237,7 @@ class TrafficInjector:
         self._move(object_id, entry)
 
     def _create(self, callsign, entry, title):
-        if title in self._bad_titles:
+        if title in self.bad_titles:
             # 这个模型已经证明建不出来，别每轮都再试一次
             return
 
@@ -257,7 +257,7 @@ class TrafficInjector:
             callsign.encode("utf-8")[:12], init, request_id)
         if hr != 0:
             log.warning("创建 %s 失败（模型 %r）: HRESULT %s", callsign, title, hr)
-            self._bad_titles.add(title)
+            self.bad_titles.add(title)
             return
 
         with self._lock:

@@ -260,7 +260,7 @@ class ModelSet:
                 return model
         return None
 
-    def match(self, equipment="", airline="", csl=""):
+    def match(self, equipment="", airline="", csl="", exclude=None):
         """挑一个涂装。返回 (Model, 匹配层级说明) 或 (None, 原因)。
 
         层级说明会写进日志，用户报"这飞机长得不对"时能直接看出来退化了几级。
@@ -276,52 +276,64 @@ class ModelSet:
 
         equipment = (equipment or "").upper()
         airline = (airline or "").upper()
+        # 模拟器拒绝生成过的模型要跳过，否则会一直挑中同一个建不出来的，飞机
+        # 永远出不来。调用方把 TrafficInjector 的黑名单传进来。
+        excluded = {t.strip().lower() for t in (exclude or ())}
+
+        def pick(models):
+            for model in models or ():
+                if model.title.strip().lower() not in excluded:
+                    return model
+            return None
 
         if equipment and airline:
-            found = self._by_icao_airline.get((equipment, airline))
-            if found:
-                return found[0], "机型和航司都匹配"
+            model = pick(self._by_icao_airline.get((equipment, airline)))
+            if model:
+                return model, "机型和航司都匹配"
 
         if equipment:
-            found = self._by_icao.get(equipment)
-            if found:
-                return found[0], "机型匹配，涂装不对"
+            model = pick(self._by_icao.get(equipment))
+            if model:
+                return model, "机型匹配，涂装不对"
 
         for relative in family_of(equipment):
             if relative == equipment:
                 continue
             if airline:
-                found = self._by_icao_airline.get((relative, airline))
-                if found:
-                    return found[0], f"用同族 {relative} 顶替，航司正确"
-            found = self._by_icao.get(relative)
-            if found:
-                return found[0], f"用同族 {relative} 顶替"
+                model = pick(self._by_icao_airline.get((relative, airline)))
+                if model:
+                    return model, f"用同族 {relative} 顶替，航司正确"
+            model = pick(self._by_icao.get(relative))
+            if model:
+                return model, f"用同族 {relative} 顶替"
 
         # 通用机型也可能没装（比如猜出 A320 但用户只有 A20N），所以这一级同样
         # 要走一遍同族，否则会白白掉到兜底。
         generic = generic_for(equipment)
         for candidate in (generic,) + tuple(family_of(generic)):
-            found = self._by_icao.get(candidate)
-            if found:
-                return found[0], f"退到通用机型 {candidate}"
+            model = pick(self._by_icao.get(candidate))
+            if model:
+                return model, f"退到通用机型 {candidate}"
 
         # 同类机身。宽体顶宽体、支线顶支线，至少大小对得上——拿一架 A319 去顶
         # B777 视觉上差得离谱，而机上没装 737 的时候这一级能救回来不少。
         category = category_of(equipment)
         if category:
             for candidate in CATEGORIES[category]:
-                found = self._by_icao.get(candidate)
-                if found:
-                    return found[0], f"同为{category}，用 {candidate} 顶替"
+                model = pick(self._by_icao.get(candidate))
+                if model:
+                    return model, f"同为{category}，用 {candidate} 顶替"
 
         # 兜底。看不见的飞机比涂装错的飞机危险得多。
         # 优先挑有机型码的：没有机型码的多半是装得不规范的附加件，拿它当所有
         # 飞机的替身最难看。
-        for model in self.models:
-            if model.icao:
-                return model, "没有近似机型，用了第一个装着的飞机"
-        return self.models[0], "没有近似机型，也没有带机型码的飞机可用"
+        model = pick([m for m in self.models if m.icao])
+        if model:
+            return model, "没有近似机型，用了第一个装着的飞机"
+        model = pick(self.models)
+        if model:
+            return model, "没有近似机型，也没有带机型码的飞机可用"
+        return None, "装着的模型全都被模拟器拒绝过了"
 
 
 def _packages_from_usercfg(path):
