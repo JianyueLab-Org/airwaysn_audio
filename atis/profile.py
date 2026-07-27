@@ -35,6 +35,18 @@ TYPE_LABELS = {
     TYPE_ARRIVAL: "进场",
 }
 
+# 语音语言。中文稿由 chinese.py 单独渲染——中文通播不是英文的逐词翻译，
+# 语序和数字读法都是民航自己的一套。
+LANGUAGE_ENGLISH = "en"
+LANGUAGE_CHINESE = "zh"
+LANGUAGE_BOTH = "both"
+
+LANGUAGES = {
+    LANGUAGE_ENGLISH: "英文",
+    LANGUAGE_CHINESE: "中文",
+    LANGUAGE_BOTH: "中英双语",
+}
+
 
 class Preset:
     def __init__(self, name="默认", template=None, airport_conditions="",
@@ -69,10 +81,18 @@ class Preset:
 class Station:
     def __init__(self, identifier, name="", frequency="118.000",
                  atis_type=TYPE_COMBINED, code_range=None, presets=None,
-                 contractions=None, latitude=0.0, longitude=0.0):
+                 contractions=None, latitude=0.0, longitude=0.0,
+                 voice_language=LANGUAGE_ENGLISH, chinese_name="",
+                 chinese_runway=""):
         self.identifier = identifier.strip().upper()
         self.name = name
         self.frequency = str(frequency).strip()
+        # 语音用哪种语言播。中文稿由 chinese.py 单独渲染，不是英文的翻译。
+        self.voice_language = (voice_language if voice_language in LANGUAGES
+                               else LANGUAGE_ENGLISH)
+        # 中文稿里念的机场名和跑道，比如"上海浦东"和"三六左"。留空就用识别码。
+        self.chinese_name = chinese_name
+        self.chinese_runway = chinese_runway
         self.atis_type = atis_type if atis_type in TYPE_SUFFIX else TYPE_COMBINED
         # 情报字母的可用范围，(起, 止) 闭区间
         self.code_range = tuple(code_range) if code_range else ("A", "Z")
@@ -159,6 +179,9 @@ class Station:
             "contractions": {k: list(v) for k, v in self.contractions.items()},
             "latitude": self.latitude,
             "longitude": self.longitude,
+            "voice_language": self.voice_language,
+            "chinese_name": self.chinese_name,
+            "chinese_runway": self.chinese_runway,
         }
 
     @classmethod
@@ -173,6 +196,10 @@ class Station:
             {k: tuple(v) for k, v in (data.get("contractions") or {}).items()},
             data.get("latitude", 0.0),
             data.get("longitude", 0.0),
+            # 老配置里没有这几项，缺省按英文——升级不该改变已有席位的行为
+            data.get("voice_language", LANGUAGE_ENGLISH),
+            data.get("chinese_name", ""),
+            data.get("chinese_runway", ""),
         )
         station.set_letter(data.get("letter", station.code_range[0]))
         return station

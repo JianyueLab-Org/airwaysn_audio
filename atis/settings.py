@@ -18,6 +18,24 @@ DEFAULT_FSD_PORT = 6809
 # 留着只会一直连不上，所以读配置时直接换掉。
 WRONG_FSD_HOSTS = {"hjdczy.top"}
 
+# 自动刷新天气的间隔（秒）
+DEFAULT_METAR_REFRESH = 300
+MIN_METAR_REFRESH = 60
+MAX_METAR_REFRESH = 3600
+
+
+def clamp_refresh(value):
+    """刷新间隔夹到合理范围。
+
+    配置被改成 0 或负数会让定时器疯转，把气象源打死然后被封；改成一天一次又
+    等于没有自动更新。两头都夹住。
+    """
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_METAR_REFRESH
+    return max(MIN_METAR_REFRESH, min(MAX_METAR_REFRESH, seconds))
+
 
 class Settings:
     def __init__(self):
@@ -34,6 +52,9 @@ class Settings:
         # 这样通播和管制席位显示的等级一致；查不到就退回 OBS。
         self.rating = 0
         self.datafeed_url = datafeed.DEFAULT_DATAFEED_URL
+        # 自动刷新天气的间隔（秒）。METAR 半小时一发，5 分钟查一次足够及时，
+        # 又不至于把气象源打太狠。夹在 1 分钟到 1 小时之间。
+        self.metar_refresh = DEFAULT_METAR_REFRESH
         self.debug = False
         self.load_settings()
 
@@ -55,6 +76,8 @@ class Settings:
                 self.rating = int(data.get("rating") or 0)
                 self.datafeed_url = (data.get("datafeed_url")
                                      or datafeed.DEFAULT_DATAFEED_URL)
+                self.metar_refresh = clamp_refresh(
+                    data.get("metar_refresh", DEFAULT_METAR_REFRESH))
                 self.debug = bool(data.get("debug", False))
         except Exception as e:
             log.warning(f"加载设置失败: {e}")
@@ -71,6 +94,7 @@ class Settings:
                     "connect_fsd": self.connect_fsd,
                     "rating": self.rating,
                     "datafeed_url": self.datafeed_url,
+                    "metar_refresh": self.metar_refresh,
                     "debug": self.debug,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -102,6 +126,22 @@ class SettingsDialog(QDialog):
         fsd_row.addWidget(QLabel("端口:"))
         fsd_row.addWidget(self.fsd_port_input)
         layout.addLayout(fsd_row)
+
+        refresh_row = QHBoxLayout()
+        self.refresh_input = QComboBox()
+        for seconds, label in ((60, "1 分钟"), (120, "2 分钟"), (300, "5 分钟"),
+                               (600, "10 分钟"), (900, "15 分钟"),
+                               (1800, "30 分钟"), (3600, "1 小时")):
+            self.refresh_input.addItem(label, seconds)
+        index = self.refresh_input.findData(
+            clamp_refresh(getattr(self.settings, "metar_refresh",
+                                  DEFAULT_METAR_REFRESH)))
+        self.refresh_input.setCurrentIndex(index if index >= 0 else 2)
+        refresh_row.addWidget(QLabel("天气自动刷新:"))
+        refresh_row.addWidget(self.refresh_input)
+        refresh_row.addWidget(QLabel("（报文变化时自动推进情报字母并换稿）"))
+        refresh_row.addStretch()
+        layout.addLayout(refresh_row)
 
         rating_row = QHBoxLayout()
         self.rating_input = QComboBox()
@@ -160,6 +200,8 @@ class SettingsDialog(QDialog):
     def save_and_close(self):
         self.settings.metar_url = (self.metar_input.text().strip()
                                    or weather.DEFAULT_METAR_URL)
+        self.settings.metar_refresh = clamp_refresh(
+            self.refresh_input.currentData())
         self.settings.connect_fsd = self.connect_fsd.isChecked()
         self.settings.fsd_host = self.fsd_host_input.text().strip() or DEFAULT_FSD_HOST
         try:

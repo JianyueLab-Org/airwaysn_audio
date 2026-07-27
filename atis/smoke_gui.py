@@ -110,6 +110,71 @@ def main():
 
     check("手动推进字母", lambda: window.advance_letter())
 
+    print("中文语音：")
+
+    def chinese_script_is_generated():
+        station = window.profile.get("ZSPD_ATIS")
+        station.voice_language = profile_module.LANGUAGE_CHINESE
+        station.chinese_name = "上海浦东"
+        station.chinese_runway = "三六左"
+        rendered = window.render_for(station)
+        assert rendered, "没有渲染出通播"
+        text, voice = rendered
+        assert "09004MPS" in text, "文字通播仍应照抄电码"
+        for fragment in ("上海浦东", "风", "能见度", "温度", "修正海压"):
+            assert fragment in voice, f"中文稿缺少 {fragment}：{voice}"
+        assert "wind" not in voice, "选了中文就不该混进英文稿"
+    check("中文语音稿", chinese_script_is_generated)
+
+    def bilingual_has_both():
+        station = window.profile.get("ZSPD_ATIS")
+        station.voice_language = profile_module.LANGUAGE_BOTH
+        _, voice = window.render_for(station)
+        assert "wind" in voice and "能见度" in voice, "双语应当两种都有"
+    check("中英双语", bilingual_has_both)
+
+    def english_is_unchanged():
+        station = window.profile.get("ZSPD_ATIS")
+        station.voice_language = profile_module.LANGUAGE_ENGLISH
+        _, voice = window.render_for(station)
+        assert "wind" in voice and "能见度" not in voice
+    check("英文不受影响", english_is_unchanged)
+
+    def language_survives_a_save_load():
+        station = window.profile.get("ZSPD_ATIS")
+        station.voice_language = profile_module.LANGUAGE_CHINESE
+        station.chinese_name = "上海浦东"
+        again = profile_module.Station.from_dict(station.to_dict())
+        assert again.voice_language == profile_module.LANGUAGE_CHINESE
+        assert again.chinese_name == "上海浦东"
+    check("语言设置能存下来", language_survives_a_save_load)
+
+    def old_profiles_default_to_english():
+        # 升级不该改变已有席位的行为
+        station = profile_module.Station.from_dict(
+            {"identifier": "ZBAA", "frequency": "127.500"})
+        assert station.voice_language == profile_module.LANGUAGE_ENGLISH
+    check("老配置默认英文", old_profiles_default_to_english)
+
+    print("自动更新：")
+
+    def interval_is_configurable():
+        import settings as settings_module
+        window.settings.metar_refresh = 900
+        assert window.apply_refresh_interval() == 900
+        assert window.timer.interval() == 900 * 1000
+    check("刷新间隔可配置", interval_is_configurable)
+
+    def silly_intervals_are_clamped():
+        import settings as settings_module
+        window.settings.metar_refresh = 0
+        assert window.apply_refresh_interval() == settings_module.MIN_METAR_REFRESH
+        window.settings.metar_refresh = 999999
+        assert window.apply_refresh_interval() == settings_module.MAX_METAR_REFRESH
+        window.settings.metar_refresh = 300
+        window.apply_refresh_interval()
+    check("离谱的间隔被夹住", silly_intervals_are_clamped)
+
     print("对话框：")
     station_dialog = gui.StationDialog(window.current_station(), parent=window)
     check("建立席位对话框", lambda: station_dialog)

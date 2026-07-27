@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 
 import airports
 import applog
+import chinese
 import datafeed
 import metar as metar_module
 import template as template_module
@@ -31,14 +32,16 @@ import fsdclient
 import vatis_import
 import weather
 from broadcast import Broadcaster
-from profile import Profile, Station, TYPE_LABELS, TYPE_SUFFIX
+import profile as profile_module
+from profile import (LANGUAGES, LANGUAGE_ENGLISH, Profile, Station,
+                     TYPE_LABELS, TYPE_SUFFIX)
+import settings as settings_module
 from settings import Settings, SettingsDialog
 
 log = logging.getLogger("界面")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.airwaysn.org:6809）。
 SERVER = "hjdczy.top"
-METAR_REFRESH_SECONDS = 300
 
 
 def resource_path(name):
@@ -82,6 +85,11 @@ class StationDialog(QDialog):
             if station.latitude or station.longitude:
                 self.latitude.setText(f"{station.latitude:.5f}")
                 self.longitude.setText(f"{station.longitude:.5f}")
+            index = self.language.findData(
+                getattr(station, "voice_language", LANGUAGE_ENGLISH))
+            self.language.setCurrentIndex(max(0, index))
+            self.chinese_name.setText(getattr(station, "chinese_name", ""))
+            self.chinese_runway.setText(getattr(station, "chinese_runway", ""))
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -97,8 +105,20 @@ class StationDialog(QDialog):
         for key in TYPE_SUFFIX:
             self.atis_type.addItem(f"{TYPE_LABELS[key]}  {TYPE_SUFFIX[key]}", key)
 
+        self.language = QComboBox()
+        for key, label in LANGUAGES.items():
+            self.language.addItem(label, key)
+
+        self.chinese_name = QLineEdit()
+        self.chinese_name.setPlaceholderText('中文稿里念的机场名，例如 上海浦东')
+        self.chinese_runway = QLineEdit()
+        self.chinese_runway.setPlaceholderText('中文稿里念的跑道，例如 三六左')
+
         for label, widget in (('机场:', self.identifier), ('名称:', self.name),
-                              ('频率:', self.frequency), ('类型:', self.atis_type)):
+                              ('频率:', self.frequency), ('类型:', self.atis_type),
+                              ('语音:', self.language),
+                              ('中文名:', self.chinese_name),
+                              ('中文跑道:', self.chinese_runway)):
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addWidget(widget)
@@ -189,6 +209,9 @@ class StationDialog(QDialog):
             self.station.contractions if self.station else None,
             coordinate(self.latitude),
             coordinate(self.longitude),
+            self.language.currentData(),
+            self.chinese_name.text().strip(),
+            self.chinese_runway.text().strip(),
         )
 
 
@@ -217,7 +240,7 @@ class AtisWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_all_metars)
-        self.timer.start(METAR_REFRESH_SECONDS * 1000)
+        self.apply_refresh_interval()
 
     # ---------- 界面 ----------
     def setup_ui(self):
@@ -481,6 +504,7 @@ class AtisWindow(QMainWindow):
             preset.airport_conditions, preset.notams, preset.transition_level)
         text, voice = template_module.render(preset.template, context,
                                              station.contractions)
+        voice = self.voice_for(station, parsed, voice)
         self.text_preview.setPlainText(text)
         self.voice_preview.setPlainText(voice)
 
@@ -514,6 +538,15 @@ class AtisWindow(QMainWindow):
                 signals.metar.emit(callsign, None, f"取天气出错: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def apply_refresh_interval(self):
+        """按设置重开定时器。设置改完要调一次，否则新间隔下次重启才生效。"""
+        seconds = settings_module.clamp_refresh(
+            getattr(self.settings, "metar_refresh",
+                    settings_module.DEFAULT_METAR_REFRESH))
+        self.timer.start(seconds * 1000)
+        log.info("天气自动刷新间隔 %d 秒", seconds)
+        return seconds
 
     def refresh_all_metars(self):
         for station in self.profile:
@@ -569,8 +602,30 @@ class AtisWindow(QMainWindow):
         context = template_module.build_context(
             parsed, station.identifier, station.letter,
             preset.airport_conditions, preset.notams, preset.transition_level)
-        return template_module.render(preset.template, context,
-                                      station.contractions)
+        text, voice = template_module.render(preset.template, context,
+                                             station.contractions)
+        return text, self.voice_for(station, parsed, voice)
+
+    @staticmethod
+    def voice_for(station, parsed, english):
+        """按席位设置决定语音稿用哪种语言。
+
+        中文稿不是英文的翻译，是 chinese.py 从 METAR 重新渲染的——语序和数字
+        读法都不一样。双语时中文在后，因为中文飞行员听得懂英文的居多，反过来
+        不一定。
+        """
+        language = getattr(station, "voice_language", profile_module.LANGUAGE_ENGLISH)
+        if language == profile_module.LANGUAGE_ENGLISH:
+            return english
+
+        script = chinese.render(
+            parsed,
+            facility=station.chinese_name or station.identifier,
+            letter=station.letter,
+            runway=station.chinese_runway)
+        if language == profile_module.LANGUAGE_CHINESE:
+            return script
+        return f"{english} {script}"
 
     def advance_letter(self):
         station = self.current_station()
@@ -782,6 +837,8 @@ class AtisWindow(QMainWindow):
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         dialog.exec()
+        # 刷新间隔要立刻生效，不然改了得重启才算数
+        self.apply_refresh_interval()
 
     def closeEvent(self, event):
         try:

@@ -787,6 +787,100 @@ class ResampleTest(unittest.TestCase):
         self.assertEqual(len(broadcast.resample(np.zeros(0), 22050, 48000)), 0)
 
 
+class ChineseVoiceTest(unittest.TestCase):
+    """中文通播稿。不是英文的逐词翻译，语序和读法都是民航自己的一套。"""
+
+    def setUp(self):
+        global chinese
+        import chinese
+
+    def test_radio_digits(self):
+        # 幺两拐洞是无线电通话规范，不是方言；和 server/ATIS/process.py 一致
+        self.assertEqual(chinese.spell("09004"), "洞 九 洞 洞 四")
+        self.assertEqual(chinese.spell("7"), "拐")
+        self.assertEqual(chinese.spell("21"), "两 幺")
+
+    def test_counting_numbers(self):
+        # 温度、米数念整数，不逐位
+        self.assertEqual(chinese.spell_count(25), "二十五")
+        self.assertEqual(chinese.spell_count(900), "九百")
+        self.assertEqual(chinese.spell_count(3000), "三千")
+        self.assertEqual(chinese.spell_count(15), "十五")
+        self.assertEqual(chinese.spell_count(-3), "零下 三")
+        self.assertEqual(chinese.spell_count(0), "零")
+
+    def test_wind(self):
+        self.assertEqual(chinese._wind("09004MPS"), "风 洞 九 洞 度 四 米每秒")
+
+    def test_wind_variable(self):
+        self.assertIn("风向不定", chinese._wind("VRB02MPS"))
+
+    def test_wind_calm(self):
+        self.assertEqual(chinese._wind("00000MPS"), "静风")
+
+    def test_wind_gusts(self):
+        self.assertIn("阵风", chinese._wind("27010G18MPS"))
+
+    def test_visibility(self):
+        self.assertEqual(chinese._visibility("9999"), "能见度 幺洞 公里 以上")
+        self.assertEqual(chinese._visibility("3000"), "能见度 三 公里")
+        self.assertEqual(chinese._visibility("0800"), "能见度 八百 米")
+
+    def test_cavok(self):
+        self.assertIn("云高", chinese._visibility("CAVOK"))
+
+    def test_cloud_height_uses_the_domestic_convention(self):
+        """按 100 英尺 = 30 米折算。
+
+        用精确的 30.48 会念出"九百一十米"，真实通播念的是"九百米"。
+        """
+        self.assertEqual(chinese._clouds("FEW030"), "少云 九百 米")
+        self.assertEqual(chinese._clouds("OVC050"), "阴天 一千五百 米")
+        self.assertEqual(chinese._clouds("SCT100"), "疏云 三千 米")
+
+    def test_cloud_with_type(self):
+        self.assertIn("积雨云", chinese._clouds("BKN020CB"))
+
+    def test_cloud_without_height(self):
+        self.assertEqual(chinese._clouds("NSC"), "无重要云")
+
+    def test_weather_intensity(self):
+        self.assertEqual(chinese._weather("-RA"), "小雨")
+        self.assertEqual(chinese._weather("+TSRA"), "大雷暴雨")
+        self.assertIn("附近有", chinese._weather("VCSH"))
+
+    def test_temperature(self):
+        self.assertEqual(chinese._temperature("25"), "二十五")
+        self.assertEqual(chinese._temperature("M03"), "零下 三")
+
+    def test_pressure_hectopascals(self):
+        self.assertEqual(chinese._pressure("Q1013"), "修正海压 幺 洞 幺 三 百帕")
+
+    def test_pressure_inches(self):
+        self.assertIn("英寸汞柱", chinese._pressure("A2992"))
+
+    def test_full_script(self):
+        parsed = metar_module.Metar(ZSPD)
+        script = chinese.render(parsed, facility="上海浦东", letter="D",
+                                runway="三六左")
+        for fragment in ("上海浦东", "通播", "D", "风", "能见度", "温度",
+                         "修正海压", "完毕"):
+            self.assertIn(fragment, script)
+
+    def test_script_has_no_latin_weather_codes(self):
+        # 漏翻的电码会被 TTS 逐字母念出来，非常难听
+        script = chinese.render(metar_module.Metar(
+            "ZBAA 270830Z 27010G18MPS 3000 -RA BKN020CB OVC050 M03/M07 Q1025"))
+        for code in ("MPS", "BKN", "OVC", "CB", "RA", "Q10"):
+            self.assertNotIn(code, script)
+
+    def test_missing_metar_does_not_raise(self):
+        self.assertIn("通播", chinese.render(None, facility="上海浦东", letter="A"))
+
+    def test_garbage_metar_does_not_raise(self):
+        chinese.render(metar_module.Metar("完全不是报文"))
+
+
 class JoinChannelTest(unittest.TestCase):
     """频率频道不存在时要新建，并且要等服务器把它回报回来。
 
@@ -807,6 +901,8 @@ class JoinChannelTest(unittest.TestCase):
         global broadcast
         import broadcast
         self.broadcast = broadcast
+        # 有的用例要改这个模块级常量，跑完必须还原，否则会影响别的用例
+        self._timeout = broadcast.CHANNEL_TIMEOUT
 
         # 不跑真的构造函数——它会拉起合成器和线程
         self.caster = broadcast.Broadcaster.__new__(broadcast.Broadcaster)
@@ -845,6 +941,9 @@ class JoinChannelTest(unittest.TestCase):
             "channels": Channels(),
             "users": type("U", (), {"myself": Myself()})(),
         })()
+
+    def tearDown(self):
+        self.broadcast.CHANNEL_TIMEOUT = self._timeout
 
     def test_existing_channel_is_used_directly(self):
         self.channels["FREQ_127800"] = {"channel_id": 7}
