@@ -35,7 +35,10 @@ POSITION_INTERVAL = 15.0      # 服务端 150 秒收不到位置包就断线
 LOGIN_TIMEOUT = 10.0
 MAX_ATIS_LINES = 64           # can-fsd 每个席位最多收 64 行
 ATIS_LINE_WIDTH = 70
-MAX_CALLSIGN_LENGTH = 10      # can-fsd 的 IsValidCallsign 上限
+# can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）。原来是 10，
+# 正好卡死 vATIS 的分离通播 ZSPD_D_ATIS / ZSPD_A_ATIS（11 个字符），服务端已经
+# 放宽到 12。
+MAX_CALLSIGN_LENGTH = 12
 
 CLIENT_ID = "0001"
 CLIENT_NAME = "AirwaySN ATIS"

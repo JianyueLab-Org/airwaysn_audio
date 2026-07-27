@@ -104,9 +104,13 @@ class CallsignTest(unittest.TestCase):
         self.assertIsNone(fsdpilot.callsign_problem("ZSPD_TWR"))
 
     def test_too_long_rejected(self):
-        problem = fsdpilot.callsign_problem("ABCDEFGHIJK")     # 11 个字符
+        problem = fsdpilot.callsign_problem("ABCDEFGHIJKLM")   # 13 个字符
         self.assertIsNotNone(problem)
-        self.assertIn("10", problem)
+        self.assertIn("12", problem)
+
+    def test_eleven_characters_is_fine_now(self):
+        # 上限从 10 提到 12 是为了 vATIS 的 ZSPD_D_ATIS / ZSPD_A_ATIS
+        self.assertIsNone(fsdpilot.callsign_problem("ZSPD_D_ATIS"))
 
     def test_too_short_rejected(self):
         self.assertIsNotNone(fsdpilot.callsign_problem("A"))

@@ -369,11 +369,20 @@ class FsdCallsignTest(unittest.TestCase):
     def test_combined_callsign_is_accepted(self):
         self.assertIsNone(self.module.callsign_problem("ZSPD_ATIS"))
 
-    def test_departure_callsign_is_too_long(self):
-        # ZSPD_D_ATIS 有 11 个字符，服务端上限是 10 —— 会被直接拒登
-        problem = self.module.callsign_problem("ZSPD_D_ATIS")
+    def test_split_atis_callsigns_are_accepted(self):
+        """ZSPD_D_ATIS / ZSPD_A_ATIS 有 11 个字符。
+
+        can-fsd 的上限本来是 10，正好把这两个卡死，一个机场没法同时开离场和
+        进场通播。服务端已经放宽到 12（packet.go 的 MaxCallsignLength），这里
+        跟着放开。
+        """
+        self.assertIsNone(self.module.callsign_problem("ZSPD_D_ATIS"))
+        self.assertIsNone(self.module.callsign_problem("ZSPD_A_ATIS"))
+
+    def test_still_rejects_what_the_server_would(self):
+        # 13 个字符，比服务端上限多一个
+        problem = self.module.callsign_problem("ABCDEFGHIJKLM_ATIS")
         self.assertIsNotNone(problem)
-        self.assertIn("11", problem)
 
     def test_must_end_with_atis(self):
         self.assertIn("_ATIS", self.module.callsign_problem("ZSPD_TWR"))

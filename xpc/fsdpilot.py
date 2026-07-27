@@ -32,7 +32,8 @@ RATING_OBSERVER = 1
 POSITION_INTERVAL = 0.2       # 每秒 5 次，和 VATSIM 客户端一致
 SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
 LOGIN_TIMEOUT = 10.0
-MAX_CALLSIGN_LENGTH = 10      # can-fsd 的 IsValidCallsign 上限
+# can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）
+MAX_CALLSIGN_LENGTH = 12
 
 CLIENT_ID = "0001"
 CLIENT_NAME = "XPC for CAN"
