@@ -449,6 +449,27 @@ class VoiceChannelTest(unittest.TestCase):
         self.assertIn("_sent_frames", source)
         self.assertIn("_received_frames", source)
 
+    def test_switching_retries_until_it_succeeds(self):
+        """频道切换必须自愈，不能一次失败就永远留在根频道。
+
+        原来是事件驱动：set_frequency 置位、工作线程消费掉。刚上线那几秒
+        mumble 常常还没就绪，那一次切换白跑，而 _pending 没变、set_frequency
+        又直接 return，于是再也不重试。实测日志里就是这样——连上 19 秒后按
+        PTT，全程没有任何频道切换记录，人一直在根频道。
+        """
+        source = inspect.getsource(self.voice.Voice._channel_loop)
+        # 目标和当前不一致就该重试，而不是只在事件到来时才动
+        self.assertIn("target == self.frequency", source)
+        self.assertIn("CHANNEL_RETRY_INTERVAL", source)
+
+    def test_retry_is_frequent_enough_to_be_unnoticeable(self):
+        self.assertLessEqual(self.voice.CHANNEL_RETRY_INTERVAL, 2.0)
+
+    def test_transmitting_from_root_is_reported(self):
+        # 留在根频道还发，等于对着没人的地方喊，日志必须说出来
+        source = inspect.getsource(self.voice.Voice._run)
+        self.assertIn("ROOT_CHANNEL", source)
+
     def test_switching_happens_on_a_worker_thread(self):
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_channel_loop", source)

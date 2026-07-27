@@ -35,6 +35,10 @@ RX_TIMEOUT = 0.5          # 这么久没有新音频就把接收灯灭掉
 # 建完临时频道到它出现在频道表里，要等服务器回一条 ChannelState。这是一次网络
 # 往返，固定 sleep 赌不起——远程服务器上经常不够。
 CHANNEL_TIMEOUT = 5.0
+# 没切到目标频道时多久重试一次。切换要能自愈——刚上线那几秒 mumble 常常还没
+# 就绪，一次失败就永远留在根频道是最难查的故障。
+CHANNEL_RETRY_INTERVAL = 1.0
+ROOT_CHANNEL = 0
 
 
 def channel_name(frequency_mhz):
@@ -215,14 +219,25 @@ class Voice:
 
         单独一条线程，不跟发送线程挤：切换要等服务器回 ChannelState，而发送
         线程是 20 ms 一帧的节奏，把切换放进去会把 PTT 一起卡住。
+
+        **每轮都比对目标和当前，而不是等一个事件。** 原来是事件驱动的：
+        set_frequency 置位、这里消费掉。只要那一次切换没成功——比如刚上线时
+        mumble 还没就绪、或者建频道等超时——事件就没了，而 _pending 没变，
+        set_frequency 又会直接 return，于是永远不再重试。实测就是这样：人一直
+        留在根频道，对着没人的地方发，也收不到任何东西。
         """
         while self.running:
-            if not self._channel_wanted.wait(timeout=0.5):
-                continue
+            # 事件只用来让新频率立刻生效，不作为唯一触发条件
+            self._channel_wanted.wait(timeout=CHANNEL_RETRY_INTERVAL)
             self._channel_wanted.clear()
+            if not self.running:
+                break
+
             target = self._pending
             if target is None or target == self.frequency:
                 continue
+            if not self.connected:
+                continue          # 还没连上，下一轮再来
             try:
                 self._switch_channel(target)
             except Exception as e:
@@ -323,8 +338,8 @@ class Voice:
                     self.mumble.channels.new_channel(0, name, temporary=True)
                     channel = self._wait_for_channel(name)
                 if channel is None:
-                    log.warning("建立频道 %s 后 %.0f 秒内没有出现",
-                                name, CHANNEL_TIMEOUT)
+                    log.warning("建立频道 %s 后 %.0f 秒内没有出现，%.0f 秒后重试",
+                                name, CHANNEL_TIMEOUT, CHANNEL_RETRY_INTERVAL)
                     return
 
                 myself = self.mumble.users.myself
@@ -425,6 +440,12 @@ class Voice:
                 # "在根频道"当成"没进频道"，PTT 于是一声不吭地什么都不做。
                 if myself["channel_id"] is None:
                     self._skip("还没有进入任何频道")
+                    time.sleep(0.05)
+                    continue
+                if myself["channel_id"] == ROOT_CHANNEL and self.channel is None:
+                    # 还在根频道说明频道切换没成功。发出去也没人听得到，而且
+                    # 会打扰根频道里的人——说清楚，别让它看起来像正常工作。
+                    self._skip("还留在根频道（频率频道没切成功），发出去没人听得到")
                     time.sleep(0.05)
                     continue
 
