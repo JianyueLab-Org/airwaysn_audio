@@ -36,13 +36,38 @@ def find_opus():
     return None
 
 
+def find_simconnect():
+    """定位 SimConnect.dll。
+
+    和 opus.dll 同一类陷阱：Python-SimConnect 是用
+    `os.path.splitext(os.path.abspath(__file__))[0] + '.dll'` 去加载它的，
+    PyInstaller 的静态分析看不到这条依赖。
+
+    漏了它的后果比 opus 更隐蔽：程序照常启动，只是取不到任何模拟器数据，界面
+    一直显示"连不上 MSFS（模拟器是否已启动？）"——用户会去查模拟器，而不是
+    怀疑安装包。所以必须显式打进来，而且要放回 SimConnect/ 子目录，因为路径是
+    从模块自己的 __file__ 推出来的。
+    """
+    try:
+        import SimConnect
+    except Exception:
+        print('警告: 没有装 SimConnect，打出来的程序读不到模拟器数据。')
+        return []
+    path = os.path.join(os.path.dirname(SimConnect.__file__), 'SimConnect.dll')
+    if not os.path.isfile(path):
+        print(f'警告: 找不到 {path}，打出来的程序读不到模拟器数据。')
+        return []
+    return [(path, 'SimConnect')]
+
+
 opus_path = find_opus()
 opus_binaries = [(opus_path, '.')] if opus_path else []
+binaries = opus_binaries + find_simconnect()
 
 a = Analysis(
     ['gui.py'],
     pathex=[],
-    binaries=opus_binaries,
+    binaries=binaries,
     # 窗口图标要随程序分发，否则打包后运行时取不到
     datas=[('favicon.ico', '.')],
     hiddenimports=[
