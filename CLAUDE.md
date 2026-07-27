@@ -146,16 +146,25 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 - **RX** → `UserState.listening_channel_add/remove` (Mumble 1.4 channel listeners), sent via `send_message(PYMUMBLE_MSG_TYPES_USERSTATE, …)`. pymumble's `ModUserState` only forwards a fixed set of fields and drops these.
 - **TX** → a `VoiceTarget` carrying **all** TX channels at once. `sound_output.set_whisper()` cannot do this: for `id == 1` pymumble copies only `targets[0]`, so multi-channel transmit has to build the message directly.
 
-**"没有权限（频道监听需要 Listen 权限）" is a server ACL problem, not a client bug.** Channel listeners need the `Listen` permission (`0x800` in `src/ACL.h`), which **Mumble 1.4 added and older default ACLs do not carry** — a server upgraded from 1.2/1.3 keeps its old root ACL, so every listener request is refused and the controller just hears silence on every frequency except the one it joined. Frequency channels are temporary children of root, so granting it once on root is enough:
+**Two client-visible errors are really the same server ACL gap.** Mumble's default root ACL does not necessarily carry everything this system needs, and in both cases the client's symptom points somewhere unhelpful:
+
+| Symptom | Missing permission | What the user sees |
+|---|---|---|
+| 管制端 "没有权限（频道监听需要 Listen 权限）" | `Listen` `0x800` | Silence on every frequency except the joined one |
+| ATIS "Channel FREQ_127800 does not exists" | `MakeTempChannel` `0x400` | Looks like a missing channel; the server actually refused to create it |
+
+`Listen` is the one that bites hardest: **Mumble 1.4 added it, so a server upgraded from 1.2/1.3 keeps an old root ACL without it**. Frequency channels are temporary children of root and inherit its ACL, so granting once on root covers all of them:
 
 ```powershell
-python server\grant_listen.py            # 看当前 ACL，不改
-python server\grant_listen.py --apply    # 真的写进去
+python server\fix_acl.py            # 只看，不改
+python server\fix_acl.py --apply    # 真的写进去
 ```
 
-Run it on the Mumble host (Ice only listens on `127.0.0.1`). It reads the root ACL, finds the `all` group entry that applies to subchannels, ORs in `Listen`, and reads back to confirm. If `Listen` is already granted and radios are still silent, the cause is the `listenersperuser` / `listenersperchannel` caps in `mumble-server.ini` instead — `voice.py`'s `PERMISSIONDENIED` callback distinguishes those three cases by denial type.
+Run it on the Mumble host (Ice only listens on `127.0.0.1`). It prints the root ACL with every permission bit spelled out, reports which of `REQUIRED` are missing and what each one breaks, ORs them into the `all` group entry that applies to subchannels, and reads back to confirm rather than trusting that `setACL` didn't throw. Bit values come from mumble's `src/ACL.h`.
 
-Note that `getACL` returns inherited ACLs too and those are read-only; the script filters them before `setACL`. On root there are none, but don't rely on that if you adapt it for another channel.
+If the permissions are all present and radios are still silent, the cause is the `listenersperuser` / `listenersperchannel` caps in `mumble-server.ini` instead — the `PERMISSIONDENIED` callbacks in `controller/voice.py` and `atis/broadcast.py` distinguish those cases by denial type.
+
+`getACL` returns inherited ACLs too and those are read-only; the script filters them before `setACL`. Root has none, but don't rely on that if you adapt it for another channel.
 
 The client still **joins** the selected radio's channel (the one marked `▸`) rather than sitting in root. That is deliberate: if the server is Mumble 1.3, the listener message is silently ignored and the controller would otherwise hear nothing at all — this way the primary frequency always works and `listeners_working` drives a warning in the status bar. Incoming audio is routed to a radio by `user["channel_id"]`, which is what makes per-frequency RX indication and per-frequency volume possible.
 
@@ -170,6 +179,8 @@ The idea worth preserving is that **every weather element has two forms**: `text
 Contractions come across too: vATIS references them as `@NAME` in a template, and each has a text and a voice form, which maps exactly onto the two-pass rendering — `render()` takes the station's contraction table and expands `@NAME` differently in each pass.
 
 Station callsigns follow vATIS: `ZSPD_ATIS`, `ZSPD_D_ATIS`, `ZSPD_A_ATIS` for combined/departure/arrival. Each station has a **code range** limiting which information letters it uses, so a departure and an arrival ATIS at one field can't be confused; the letter advances by one whenever the raw METAR text changes, and wraps within the range.
+
+**Creating the frequency channel is a round trip, not a local operation.** `new_channel()` only sends a message; the channel appears once the server echoes a `ChannelState`. `_join_channel` used to `sleep(0.2)` and then look — long enough on localhost, not on a remote server, and the failure surfaced as `Channel FREQ_127800 does not exists`, which reads like the channel *can't* be created. It now polls until `CHANNEL_TIMEOUT` and bails early if a `PermissionDenied` arrives, so a refused creation is reported as a permission problem and a slow server just waits. Pinned by `JoinChannelTest`.
 
 Audio goes out over Mumble, not AFV: `broadcast.py` opens its own connection per station as `{cid}_atis{freq6}` (the shape `server/login.py` authenticates) and opens **no** local audio device. Transmission is paced against `sound_output.get_buffer_size()` and yields the frequency if anyone else keys up. `update_text()` swaps the script for the *next* cycle rather than cutting off the current one.
 

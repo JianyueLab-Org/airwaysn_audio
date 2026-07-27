@@ -10,6 +10,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 
 import metar as metar_module
@@ -783,6 +785,136 @@ class ResampleTest(unittest.TestCase):
     def test_empty_input(self):
         import numpy as np
         self.assertEqual(len(broadcast.resample(np.zeros(0), 22050, 48000)), 0)
+
+
+class JoinChannelTest(unittest.TestCase):
+    """频率频道不存在时要新建，并且要等服务器把它回报回来。
+
+    以前是建完 sleep(0.2) 就去找，远程服务器上经常还没回来，报出来是
+    "Channel FREQ_127800 does not exists"——听着像频道建不了，其实只是没等到。
+    """
+
+    def setUp(self):
+        import sys
+        from unittest import mock
+        try:
+            import opuslib  # noqa: F401
+        except Exception:
+            for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                         "opuslib.api.encoder", "opuslib.api.info",
+                         "opuslib.exceptions"):
+                sys.modules.setdefault(name, mock.MagicMock())
+        global broadcast
+        import broadcast
+        self.broadcast = broadcast
+
+        # 不跑真的构造函数——它会拉起合成器和线程
+        self.caster = broadcast.Broadcaster.__new__(broadcast.Broadcaster)
+        self.caster.running = True
+        self.caster.stop_event = threading.Event()
+        self.caster._denial = None
+        self.caster.states = []
+        self.caster._state = lambda kind, message: self.caster.states.append(
+            (kind, message))
+        self.caster.station = type("S", (), {
+            "channel": "FREQ_127800", "frequency": "127.800",
+            "callsign": "ROAH_ATIS"})()
+
+        self.created = []
+        self.moved = []
+        self.channels = {}
+
+        caster = self.caster
+        outer = self
+
+        class Channels:
+            def find_by_name(self, name):
+                import pymumble_py3 as pymumble
+                if name in outer.channels:
+                    return outer.channels[name]
+                raise pymumble.errors.UnknownChannelError(name)
+
+            def new_channel(self, parent, name, temporary=False):
+                outer.created.append((parent, name, temporary))
+
+        class Myself:
+            def move_in(self, channel_id):
+                outer.moved.append(channel_id)
+
+        caster.mumble = type("M", (), {
+            "channels": Channels(),
+            "users": type("U", (), {"myself": Myself()})(),
+        })()
+
+    def test_existing_channel_is_used_directly(self):
+        self.channels["FREQ_127800"] = {"channel_id": 7}
+        self.assertTrue(self.caster._join_channel())
+        self.assertEqual(self.created, [], "已存在就不该再建")
+        self.assertEqual(self.moved, [7])
+
+    def test_missing_channel_is_created_as_temporary(self):
+        # 服务器"稍后"才回报：新建之后才让它出现
+        original = self.broadcast.Broadcaster._wait_for_channel
+
+        def appear(caster, name):
+            self.channels[name] = {"channel_id": 9}
+            return original(caster, name)
+
+        self.broadcast.Broadcaster._wait_for_channel = appear
+        try:
+            self.assertTrue(self.caster._join_channel())
+        finally:
+            self.broadcast.Broadcaster._wait_for_channel = original
+        self.assertEqual(self.created, [(0, "FREQ_127800", True)])
+        self.assertEqual(self.moved, [9])
+
+    def test_waits_rather_than_giving_up_immediately(self):
+        # 频道在 0.3 秒后才出现——固定 sleep(0.2) 的老写法会在这里失败
+        def appear():
+            time.sleep(0.3)
+            self.channels["FREQ_127800"] = {"channel_id": 11}
+
+        threading.Thread(target=appear, daemon=True).start()
+        self.assertTrue(self.caster._join_channel())
+        self.assertEqual(self.moved, [11])
+
+    def test_timeout_says_so_without_blaming_the_channel(self):
+        self.broadcast.CHANNEL_TIMEOUT = 0.3
+        self.assertFalse(self.caster._join_channel())
+        kind, message = self.caster.states[-1]
+        self.assertEqual(kind, "error")
+        self.assertIn("没有出现", message)
+
+    def test_permission_denial_is_reported_as_such(self):
+        # 缺 MakeTempChannel 时再等也不会有，要说清楚是权限问题
+        self.broadcast.CHANNEL_TIMEOUT = 5.0
+
+        def deny():
+            time.sleep(0.1)
+            self.caster._denial = "没有权限（建立频率频道需要根频道的 MakeTempChannel 权限）"
+
+        threading.Thread(target=deny, daemon=True).start()
+        started = time.time()
+        self.assertFalse(self.caster._join_channel())
+        self.assertLess(time.time() - started, 2.0, "被拒绝之后不该继续等满超时")
+        self.assertIn("MakeTempChannel", self.caster.states[-1][1])
+
+    def test_denial_callback_translates_the_type(self):
+        self.caster.mumble.denial_type = lambda t: "Permission"
+        self.caster._on_permission_denied(type("E", (), {"type": 1, "reason": ""})())
+        self.assertIn("MakeTempChannel", self.caster._denial)
+
+    def test_unknown_denial_type_still_reports_something(self):
+        self.caster.mumble.denial_type = lambda t: "SomethingNew"
+        self.caster._on_permission_denied(type("E", (), {"type": 9, "reason": ""})())
+        self.assertIn("SomethingNew", self.caster._denial)
+
+    def test_stopping_aborts_the_wait(self):
+        self.broadcast.CHANNEL_TIMEOUT = 30.0
+        self.caster.stop_event.set()
+        started = time.time()
+        self.assertFalse(self.caster._join_channel())
+        self.assertLess(time.time() - started, 2.0, "停止时不该继续等")
 
 
 class WeatherFetchTest(unittest.TestCase):

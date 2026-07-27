@@ -1,21 +1,25 @@
-"""给根频道的 ACL 补上 Listen 权限。
+"""检查并补齐根频道 ACL 里这套系统需要的权限。
 
-管制端报"没有权限（频道监听需要 Listen 权限）"就是缺这个。
+两个症状，同一个原因——Mumble 的默认 ACL 不一定给全这套系统要用的权限：
 
-**为什么会缺。** 管制端一个人要同时收好几个频率，用的是 Mumble 1.4 的频道监听
-（UserState.listening_channel_add）——人还在主频率的频道里，其他频率靠"监听"
-收。这需要目标频道的 `Listen` 权限（ACL 里的 0x800）。
+    管制端  "没有权限（频道监听需要 Listen 权限）"
+    情报台  "Channel FREQ_127800 does not exists"（服务器其实是拒绝了建频道）
 
-而 `Listen` 是 Mumble 1.4 才加的位，**不在旧版的默认 ACL 里**。全新装的 1.4+
-根频道默认给 all 组带上了它，但从 1.2/1.3 升级上来的服务器，数据库里那条 ACL
-还是老的，就没有——服务器照常跑，只是监听请求一律被拒，管制员看到的就是某些
-频率永远安静。
+需要哪两个：
 
-频率频道是客户端按需在根下建的临时频道，ACL 从根继承，所以在根上放开一次就够，
-不用给每个 FREQ_* 单独配。
+    Listen           0x800   管制端一个人收多个频率靠 Mumble 1.4 的频道监听
+                             （UserState.listening_channel_add），人在主频率的
+                             频道里，其他频率靠"监听"收。这个位是 1.4 才加的，
+                             从 1.2/1.3 升级上来的服务器数据库里还是老 ACL。
+    MakeTempChannel  0x400   频率频道（FREQ_xxxxxx）是客户端按需在根下现建的
+                             临时频道。没有这个权限服务器直接拒绝，而客户端只
+                             看到"频道不存在"，猜不到是权限问题。
 
-    python grant_listen.py            # 看当前 ACL，不改
-    python grant_listen.py --apply    # 真的写进去
+频率频道都是根下的临时频道，ACL 从根继承，所以在根上放开一次就够，不用给每个
+FREQ_* 单独配。
+
+    python fix_acl.py            # 只看，不改
+    python fix_acl.py --apply    # 真的写进去
 
 在 Mumble 主机上跑（Ice 只监听 127.0.0.1）。要先能 import MumbleServer，
 生成办法和 login.py 一样：
@@ -44,6 +48,10 @@ PERM_WRITE = 0x1
 PERM_TRAVERSE = 0x2
 PERM_ENTER = 0x4
 PERM_SPEAK = 0x8
+PERM_MUTE_DEAFEN = 0x10
+PERM_MOVE = 0x20
+PERM_MAKE_CHANNEL = 0x40
+PERM_LINK_CHANNEL = 0x80
 PERM_WHISPER = 0x100
 PERM_TEXT_MESSAGE = 0x200
 PERM_MAKE_TEMP_CHANNEL = 0x400
@@ -51,10 +59,16 @@ PERM_LISTEN = 0x800
 
 PERM_NAMES = [
     (PERM_WRITE, "Write"), (PERM_TRAVERSE, "Traverse"), (PERM_ENTER, "Enter"),
-    (PERM_SPEAK, "Speak"), (0x10, "MuteDeafen"), (0x20, "Move"),
-    (0x40, "MakeChannel"), (0x80, "LinkChannel"), (PERM_WHISPER, "Whisper"),
-    (PERM_TEXT_MESSAGE, "TextMessage"),
+    (PERM_SPEAK, "Speak"), (PERM_MUTE_DEAFEN, "MuteDeafen"), (PERM_MOVE, "Move"),
+    (PERM_MAKE_CHANNEL, "MakeChannel"), (PERM_LINK_CHANNEL, "LinkChannel"),
+    (PERM_WHISPER, "Whisper"), (PERM_TEXT_MESSAGE, "TextMessage"),
     (PERM_MAKE_TEMP_CHANNEL, "MakeTempChannel"), (PERM_LISTEN, "Listen"),
+]
+
+# 这套系统跑起来必须有的，以及缺了会怎样
+REQUIRED = [
+    (PERM_LISTEN, "Listen", "管制端收不到主频率以外的频率"),
+    (PERM_MAKE_TEMP_CHANNEL, "MakeTempChannel", "建不了 FREQ_* 频道，报频道不存在"),
 ]
 
 
@@ -78,7 +92,8 @@ def show(acls, groups, inherit):
             scope.append("本频道")
         if acl.applySubs:
             scope.append("子频道")
-        print(f"  [{i}] {who:12} 作用于 {'+'.join(scope) or '无'}")
+        mark = "（继承，只读）" if acl.inherited else ""
+        print(f"  [{i}] {who:12} 作用于 {'+'.join(scope) or '无'}{mark}")
         print(f"       允许: {describe(acl.allow)}")
         if acl.deny:
             print(f"       拒绝: {describe(acl.deny)}")
@@ -96,6 +111,11 @@ def find_all_group_acl(acls):
                 and acl.applySubs and not acl.inherited):
             return acl
     return None
+
+
+def missing_permissions(allow):
+    """还缺哪些。返回 (位, 名字, 缺了会怎样) 的列表。"""
+    return [(bit, name, why) for bit, name, why in REQUIRED if not allow & bit]
 
 
 def main():
@@ -131,15 +151,21 @@ def main():
                   "这不太正常，建议用 Mumble 客户端手工看一眼再决定怎么改。")
             return 1
 
-        if target.allow & PERM_LISTEN:
-            print("\nListen 权限已经放开了。管制端还报没权限的话，"
-                  "看看是不是 mumble-server.ini 里的 listenersperuser / "
-                  "listenersperchannel 限制了数量。")
+        missing = missing_permissions(target.allow)
+        if not missing:
+            print("\n需要的权限都有了。客户端还是不正常的话，看看 mumble-server.ini"
+                  " 里的 listenersperuser / listenersperchannel 是不是限制了数量。")
             return 0
 
-        print(f"\n缺 Listen（0x{PERM_LISTEN:x}）。"
-              f"打算把 all 组的允许位从 {describe(target.allow)} "
-              f"改成 {describe(target.allow | PERM_LISTEN)}。")
+        print("\n缺这些权限：")
+        for bit, name, why in missing:
+            print(f"  {name}（0x{bit:x}）—— 缺了会：{why}")
+
+        wanted = target.allow
+        for bit, _, _ in missing:
+            wanted |= bit
+        print(f"\n打算把 all 组的允许位从\n  {describe(target.allow)}\n改成\n  "
+              f"{describe(wanted)}")
 
         if not apply:
             print("\n这是预览。确认没问题就加 --apply 真的写进去。")
@@ -151,18 +177,20 @@ def main():
         if len(own) != len(acls):
             print(f"（略过 {len(acls) - len(own)} 条继承来的 ACL，它们是只读的）")
 
-        target.allow |= PERM_LISTEN
+        target.allow = wanted
         server.setACL(ROOT_CHANNEL, own, groups, inherit, context)
         print("已写入。")
 
         # 回读确认，别只信写入没抛异常
         acls, _, _ = server.getACL(ROOT_CHANNEL, context)
         again = find_all_group_acl(acls)
-        if again and again.allow & PERM_LISTEN:
-            print("回读确认：Listen 已生效。管制端重连一次即可。")
-            return 0
-        print("回读没看到 Listen，写入可能没成功。")
-        return 1
+        still = missing_permissions(again.allow if again else 0)
+        if still:
+            print("回读之后这些还是没有：" +
+                  "、".join(name for _, name, _ in still) + "，写入可能没成功。")
+            return 1
+        print("回读确认：都生效了。客户端重连一次即可。")
+        return 0
 
 
 if __name__ == "__main__":

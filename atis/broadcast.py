@@ -22,6 +22,7 @@ import pyttsx3
 from pymumble_py3 import mumble_pb2
 from pymumble_py3.constants import (
     PYMUMBLE_CLBK_CONNECTED,
+    PYMUMBLE_CLBK_PERMISSIONDENIED,
     PYMUMBLE_CLBK_SOUNDRECEIVED,
     PYMUMBLE_MSG_TYPES_REJECT,
 )
@@ -94,6 +95,10 @@ PREBUFFER_SECONDS = 0.5                      # 发送时保持的缓冲长度
 SILENCE_HOLD = 0.8                           # 频道里静默多久才算空闲
 QUIET_WAIT_TIMEOUT = 60.0
 CONNECT_TIMEOUT = 15.0
+# 建完临时频道到它出现在频道表里，要等服务器回一条 ChannelState。这是一次网络
+# 往返，固定 sleep 赌不起——远程服务器上 0.2 秒经常不够，表现出来就是
+# "Channel FREQ_xxxxxx does not exists"。
+CHANNEL_TIMEOUT = 5.0
 REPEAT_GAP = 5.0                             # 两轮播报之间的间隔
 
 # pyttsx3 在同一进程里共享同一个 SAPI 引擎，多个席位同时合成会互相打断
@@ -255,6 +260,7 @@ class Broadcaster:
 
         self._synth = Synthesizer()
         self._connected = False
+        self._denial = None          # 服务器拒绝某个动作时的说明
         self._last_other_sound = 0.0
         self._text_lock = threading.Lock()
         self._voice_text = ""
@@ -330,6 +336,8 @@ class Broadcaster:
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED, self._on_connected)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
+                                               self._on_permission_denied)
             self.mumble.start()
         except Exception as e:
             self._state('error', f"连接失败: {e}")
@@ -358,24 +366,81 @@ class Broadcaster:
 
         return self._join_channel()
 
+    def _find_channel(self, name):
+        try:
+            return self.mumble.channels.find_by_name(name)
+        except pymumble.errors.UnknownChannelError:
+            return None
+
     def _join_channel(self):
         name = self.station.channel
         try:
-            try:
-                channel = self.mumble.channels.find_by_name(name)
-            except pymumble.errors.UnknownChannelError:
+            channel = self._find_channel(name)
+            if channel is None:
+                self._denial = None
+                log.info("频道 %s 不存在，建一个临时的", name)
                 self.mumble.channels.new_channel(0, name, temporary=True)
-                time.sleep(0.2)
-                channel = self.mumble.channels.find_by_name(name)
-            if not channel:
-                self._state('error', f"无法进入频道 {name}")
+                channel = self._wait_for_channel(name)
+
+            if channel is None:
+                # 分清"服务器拒绝"和"没等到"。以前两种都报成频道不存在，
+                # 而前者再等多久也不会有。
+                if self._denial:
+                    self._state('error',
+                                f"服务器不允许建立频道 {name}：{self._denial}")
+                else:
+                    self._state('error',
+                                f"建立频道 {name} 后 {CHANNEL_TIMEOUT:.0f} 秒内"
+                                f"没有出现，服务器没有说明原因")
                 return False
+
             self.mumble.users.myself.move_in(channel["channel_id"])
             self._state('online', f"已在 {self.station.frequency} 播出")
             return True
         except Exception as e:
             self._state('error', f"进入频道失败: {e}")
             return False
+
+    def _wait_for_channel(self, name):
+        """等服务器把新建的频道回报回来。
+
+        建频道是发一条消息就返回，频道要等服务器回 ChannelState 才会进本地表。
+        服务器拒绝的话（缺 MakeTempChannel 权限）不会有 ChannelState，只有一条
+        PermissionDenied——那种情况下等下去没有意义，收到就立刻退出。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline:
+            if not self.running or self.stop_event.is_set():
+                return None
+            if self._denial:
+                return None
+            channel = self._find_channel(name)
+            if channel is not None:
+                return channel
+            time.sleep(0.1)
+        return self._find_channel(name)
+
+    def _on_permission_denied(self, event):
+        """服务器拒绝了某个动作。
+
+        建频道要根频道的 MakeTempChannel 权限（ACL 里的 0x400），Mumble 默认
+        ACL 不一定给。没有这条回报的话，只会看到"频道不存在"，完全猜不到是被
+        权限挡了。
+        """
+        try:
+            kind = self.mumble.denial_type(event.type)
+        except Exception:
+            kind = str(getattr(event, "type", "?"))
+        messages = {
+            "Permission": "没有权限（建立频率频道需要根频道的 MakeTempChannel 权限）",
+            "ChannelName": "频道名不合服务器的规矩",
+            "NestingLimit": "频道层级超过了服务器上限",
+            "ChannelCountLimit": "服务器上的频道数已达上限",
+        }
+        self._denial = messages.get(kind, f"服务器拒绝了操作: {kind}")
+        if getattr(event, "reason", ""):
+            self._denial += f"（{event.reason}）"
+        log.warning("%s: %s", self.station.callsign, self._denial)
 
     def _disconnect(self):
         if self.mumble:
