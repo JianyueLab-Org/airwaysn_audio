@@ -7,6 +7,7 @@ _python_dir = os.path.dirname(sys.executable)
 os.environ['PATH'] = _python_dir + os.pathsep + os.environ.get('PATH', '')
 
 import pymumble_py3 as pymumble
+from pymumble_py3 import messages
 import threading
 import numpy as np
 import time
@@ -16,6 +17,10 @@ import io
 import asyncio
 import edge_tts
 import re
+
+# 建完临时频道到它出现在频道表里、以及进频道到服务器确认，都要等一次网络往返。
+# 固定 sleep 赌不起——服务器忙的时候 0.1 秒远远不够。
+CHANNEL_TIMEOUT = 5.0
 
 class ATISBroadcaster(threading.Thread):
     def __init__(self, atis_id, frequency, atis_text):
@@ -56,20 +61,95 @@ class ATISBroadcaster(threading.Thread):
             self.mumble.set_receive_sound(True)
             self.mumble.start()
             time.sleep(1)  # 等待连接建立
-            
-            try:
-                channel = self.mumble.channels.find_by_name(self.channel_name)
-            except pymumble.errors.UnknownChannelError:
-                self.mumble.channels.new_channel(0, self.channel_name, temporary=True)
-                time.sleep(0.1)
-                channel = self.mumble.channels.find_by_name(self.channel_name)
-            
-            if channel:
-                self.mumble.users.myself.move_in(channel["channel_id"])
-                return True
+
+            return self._join_channel()
         except Exception as e:
             print(f"连接错误: {e}")
             return False
+
+    def _join_channel(self):
+        """进入本席位的频率频道，成功才返回 True。
+
+        和连接分开，是因为这一段全是超时和轮询，单独才测得了。
+        """
+        try:
+            channel = self._find_channel(self.channel_name)
+            if channel is None:
+                print(f"频道 {self.channel_name} 不存在，建一个临时的")
+                self._create_channel(self.channel_name)
+                channel = self._wait_for_channel(self.channel_name)
+
+            if channel is None:
+                print(f"建立频道 {self.channel_name} 后 {CHANNEL_TIMEOUT:.0f} 秒内没有出现")
+                return False
+
+            channel_id = channel["channel_id"]
+            myself = self.mumble.users.myself
+            if myself is None or myself["channel_id"] != channel_id:
+                self._move_in(channel_id)
+                if not self._wait_until_in(channel_id):
+                    print(f"发出了进入频道 {self.channel_name} 的请求，"
+                          f"但 {CHANNEL_TIMEOUT:.0f} 秒内没有生效")
+                    return False
+            return True
+        except Exception as e:
+            print(f"进入频道失败: {e}")
+            return False
+
+    def _find_channel(self, name):
+        try:
+            return self.mumble.channels.find_by_name(name)
+        except pymumble.errors.UnknownChannelError:
+            return None
+
+    def _create_channel(self, name):
+        """在根下建一个临时频道，**不要阻塞**。
+
+        pymumble 的 channels.new_channel() 走 execute_command(blocking=True)，
+        那个 acquire 没有任何超时——pymumble 自己的源码里就写着
+        "TODO: manage a timeout for blocking commands"。命令一旦没被处理，这里
+        就永远卡住，这条通播线程整个死掉：日志停在建频道那一行，既没有成功也
+        没有任何错误，而管理器还以为它在播。
+
+        自己发命令、不等锁；频道有没有建出来由 _wait_for_channel 轮询判断。
+        """
+        self.mumble.execute_command(messages.CreateChannel(0, name, True),
+                                    blocking=False)
+
+    def _move_in(self, channel_id):
+        """进频道，同样不能用 move_in()——它也走 blocking=True。"""
+        self.mumble.execute_command(
+            messages.MoveCmd(self.mumble.users.myself_session, channel_id),
+            blocking=False)
+
+    def _wait_for_channel(self, name):
+        """等服务器把新建的频道回报回来。
+
+        建频道只是发一条消息，频道要等服务器回 ChannelState 才进本地表——这是
+        一次网络往返，固定 sleep(0.1) 经常还没回来，报出来是频道不存在。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            channel = self._find_channel(name)
+            if channel is not None:
+                return channel
+            time.sleep(0.1)
+        return self._find_channel(name)
+
+    def _wait_until_in(self, channel_id):
+        """等服务器确认我们真的进了这个频道。
+
+        move 是异步的，命令发出去不等于进去了。不确认就返回 True，通播会对着
+        根频道播一整轮。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            myself = self.mumble.users.myself
+            if myself is not None and myself["channel_id"] == channel_id:
+                return True
+            time.sleep(0.1)
+        myself = self.mumble.users.myself
+        return myself is not None and myself["channel_id"] == channel_id
 
     def check_channel_silence(self):
         """检查频道是否处于静音状态"""

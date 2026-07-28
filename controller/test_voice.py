@@ -20,6 +20,7 @@ for _name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
               "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
     sys.modules.setdefault(_name, mock.MagicMock())
 
+import radiostack
 import voice
 from voice import VoiceClient
 
@@ -227,6 +228,238 @@ class RxIndicatorTest(unittest.TestCase):
         monitor.join(timeout=2)
 
         self.assertIn((118000, False), events, "超时之后应当报 RX 结束")
+
+
+class FakeChannels:
+    def __init__(self, server):
+        self.server = server
+
+    def find_by_name(self, name):
+        import pymumble_py3 as pymumble
+        with self.server.lock:
+            if name in self.server.by_name:
+                return self.server.by_name[name]
+        raise pymumble.errors.UnknownChannelError(name)
+
+    def new_channel(self, parent_id, name, temporary=False):
+        self.server.hang("channels.new_channel")
+
+
+class FakeMyself:
+    def __init__(self, server):
+        self.server = server
+
+    def __getitem__(self, key):
+        if key == "channel_id":
+            return self.server.my_channel
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if key == "channel_id":
+            return self.server.my_channel
+        return default
+
+    def move_in(self, channel_id, token=None):
+        self.server.hang("users.myself.move_in")
+
+
+class FakeUsers:
+    def __init__(self, server, session):
+        self.myself = FakeMyself(server)
+        self.myself_session = session
+
+
+class FakeServer:
+    """够用的 Mumble 替身，重点是把 pymumble 的两种接口区别开。
+
+    - ``execute_command(cmd, blocking=False)``：命令排队，假服务器在
+      ``latency`` 之后才让它生效——真实的 pymumble 就是这样，命令是异步的。
+    - ``channels.new_channel()`` / ``users.myself.move_in()``：**永远不返回**。
+      这两个入口走 ``execute_command(blocking=True)``，那个 ``lock.acquire()``
+      没有任何超时（pymumble 源码里就写着 "TODO: manage a timeout for blocking
+      commands"），服务器不处理命令时调用线程就死在那一行，而 sync() 是整条
+      电台栈同步链的入口，一起死掉。
+
+    照搬这个行为，任何还在走阻塞接口的代码都会在测试里挂住，被
+    ``join(timeout=…)`` 抓出来。
+    """
+
+    def __init__(self, latency=0.0, answers=True, my_channel=0, session=42):
+        self.lock = threading.Lock()
+        self.latency = latency
+        self.answers = answers          # False = 服务器收下命令但什么都不做
+        self.by_name = {}
+        self.my_channel = my_channel
+        self.next_id = 1
+        self.commands = []
+        self.blocking_calls = []
+        self.messages = []
+        self.channels = FakeChannels(self)
+        self.users = FakeUsers(self, session)
+        self.sound_output = FakeSoundOutput()
+
+    def hang(self, what):
+        self.blocking_calls.append(what)
+        threading.Event().wait()        # 永远不返回，和真的 pymumble 一样
+
+    def execute_command(self, cmd, blocking=True):
+        if blocking:
+            self.hang("execute_command(blocking=True)")
+        self.commands.append(cmd)
+        if self.answers:
+            timer = threading.Timer(self.latency, self._apply, args=(cmd,))
+            timer.daemon = True
+            timer.start()
+
+    def _apply(self, cmd):
+        params = cmd.parameters
+        with self.lock:
+            if "name" in params:                    # CreateChannel
+                self.by_name[params["name"]] = {
+                    "channel_id": self.next_id,
+                    "name": params["name"],
+                    "parent": params["parent"],
+                    "temporary": params["temporary"],
+                }
+                self.next_id += 1
+            elif "session" in params:               # MoveCmd
+                self.my_channel = params["channel_id"]
+
+    def send_message(self, type, message):
+        self.messages.append((type, message))
+
+    def is_alive(self):
+        return True
+
+    def created_names(self):
+        return [(c.parameters["parent"], c.parameters["name"],
+                 c.parameters["temporary"])
+                for c in self.commands if "name" in c.parameters]
+
+    def moves(self):
+        return [c.parameters["channel_id"] for c in self.commands
+                if "session" in c.parameters]
+
+
+class ChannelSwitchTest(unittest.TestCase):
+    """建频道和进频道都不能走 pymumble 的阻塞接口。
+
+    那个 ``lock.acquire()`` 没有超时，服务器不处理命令就永久卡住，调用线程整个
+    死掉——日志停在"建一个临时的"，之后既没有成功也没有任何错误。这里用一个
+    会永久挂住的替身把它逼出来。
+    """
+
+    def setUp(self):
+        self._timeout = voice.CHANNEL_TIMEOUT
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.2)
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def call(self, func, budget=None):
+        """在独立线程里跑，卡住就当场失败而不是拖死整个测试。"""
+        if budget is None:
+            budget = voice.CHANNEL_TIMEOUT * 2 + 3
+        box = {}
+
+        def work():
+            box["value"] = func()
+
+        thread = threading.Thread(target=work, daemon=True)
+        started = time.time()
+        thread.start()
+        thread.join(budget)
+        elapsed = time.time() - started
+        self.assertFalse(
+            thread.is_alive(),
+            f"{func} 在 {budget:.1f} 秒内没有返回；"
+            f"走过的阻塞接口={self.server.blocking_calls}")
+        return box.get("value"), elapsed
+
+    # ---------- 建频道 ----------
+    def test_missing_channel_is_created_and_waited_for(self):
+        result, elapsed = self.call(lambda: self.client._resolve_channel(118000))
+        self.assertEqual(self.server.created_names(), [(0, "FREQ_118000", True)])
+        self.assertEqual(result, 1)
+        self.assertGreaterEqual(elapsed, 0.2, "要等到服务器回 ChannelState")
+        self.assertEqual(self.client._channel_ids[118000], 1)
+        self.assertEqual(self.client._channel_to_khz[1], 118000)
+
+    def test_existing_channel_is_not_created_again(self):
+        self.server.by_name["FREQ_118000"] = {"channel_id": 7}
+        result, _ = self.call(lambda: self.client._resolve_channel(118000))
+        self.assertEqual(result, 7)
+        self.assertEqual(self.server.commands, [])
+
+    def test_unanswered_creation_gives_up_within_the_timeout(self):
+        voice.CHANNEL_TIMEOUT = 0.5
+        self.server.answers = False
+        result, elapsed = self.call(lambda: self.client._resolve_channel(118000))
+        self.assertIsNone(result)
+        self.assertGreaterEqual(elapsed, 0.5, "该等的还是要等满")
+        self.assertLess(elapsed, 3.0, "但必须有上界——以前这里是永久卡死")
+        self.assertEqual(self.server.blocking_calls, [],
+                         "不能再走 pymumble 那两个没有超时的阻塞接口")
+
+    def test_a_failed_resolve_is_not_cached(self):
+        """失败不能记进表里，否则频道后来建出来了也永远用不上。"""
+        voice.CHANNEL_TIMEOUT = 0.3
+        self.server.answers = False
+        self.call(lambda: self.client._resolve_channel(118000))
+        self.assertNotIn(118000, self.client._channel_ids)
+
+    # ---------- 进频道 ----------
+    def test_join_waits_until_the_move_took_effect(self):
+        result, elapsed = self.call(lambda: self.client._join(7))
+        self.assertTrue(result)
+        self.assertEqual(self.server.moves(), [7])
+        self.assertEqual(self.server.my_channel, 7)
+        self.assertGreaterEqual(elapsed, 0.2)
+
+    def test_join_reports_failure_when_the_move_never_takes_effect(self):
+        voice.CHANNEL_TIMEOUT = 0.5
+        self.server.answers = False
+        result, elapsed = self.call(lambda: self.client._join(7))
+        self.assertFalse(result)
+        self.assertEqual(self.server.moves(), [7], "命令还是要发出去的")
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertLess(elapsed, 3.0)
+
+    def test_join_does_nothing_when_already_there(self):
+        self.server.my_channel = 7
+        result, _ = self.call(lambda: self.client._join(7))
+        self.assertTrue(result)
+        self.assertEqual(self.server.commands, [])
+
+    # ---------- 整条同步链 ----------
+    def test_sync_finishes_even_if_the_server_never_answers(self):
+        """sync() 是整条链的入口，卡在这里等于电台栈永远同步不上去。"""
+        voice.CHANNEL_TIMEOUT = 0.3
+        self.server.answers = False
+        stack = radiostack.RadioStack()
+        for freq in ("118.000", "121.700"):
+            stack.add(freq)
+            stack.get(radiostack.parse_frequency(freq)).rx = True
+        stack.selected_khz = 118000
+        _, elapsed = self.call(lambda: self.client.sync(stack), budget=6.0)
+        self.assertLess(elapsed, 5.0, "两个频率各等一个超时，也该结束了")
+        self.assertEqual(self.server.blocking_calls, [])
+
+    def test_sync_joins_the_selected_frequency(self):
+        stack = radiostack.RadioStack()
+        for freq in ("118.000", "121.700"):
+            stack.add(freq)
+            stack.get(radiostack.parse_frequency(freq)).rx = True
+        stack.selected_khz = 121700
+        self.call(lambda: self.client.sync(stack), budget=8.0)
+        joined = self.client._channel_ids[121700]
+        self.assertEqual(self.server.my_channel, joined,
+                         "主频率的频道要真的进去，不然服务端不支持监听时一个"
+                         "频率都听不到")
 
 
 if __name__ == "__main__":

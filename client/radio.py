@@ -4,6 +4,7 @@ os.environ['SDL_AUDIODRIVER'] = 'dummy'
 
 from SimConnect import *
 import pymumble_py3 as pymumble
+from pymumble_py3 import messages
 
 import mumblecompat
 
@@ -21,6 +22,18 @@ import sys
 import functools
 import pygame  # pygame导入必须在设置环境变量之后
 
+# 这个文件到处 print 中文和 ✅/⚠️ 之类的符号，而中文 Windows 控制台默认是
+# GBK，编不出来就抛 UnicodeEncodeError。它抛在哪一行就打断哪一条链——实测里
+# 频道切换成功那句 print 崩掉，异常从 switch_channel 里逃出去，看起来像切换
+# 失败。日志再重要也不该有能力弄死调用它的线程。
+try:
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(errors="replace")
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 # 配置服务器信息
 SERVER_HOST = "hjdczy.top"  # Mumble服务器地址
 USERNAME = ""    # 用户名
@@ -29,6 +42,14 @@ PASSWORD = ""             # 密码（如果需要）
 # ---------- 音频采样率候选列表 ----------
 # 按优先级排序，自动检测设备支持的采样率
 SUPPORTED_SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
+
+# 建完临时频道到它出现在频道表里、以及进频道到服务器确认，都要等一次网络往返。
+# 固定 sleep 赌不起——远程服务器上经常不够。
+CHANNEL_TIMEOUT = 5.0
+
+# 根频道的 channel_id 就是 0。判断"有没有进频道"必须用 is None，写成 not 会
+# 把在根频道当成没进频道。
+ROOT_CHANNEL = 0
 
 def suppress_mumble_errors(func):
     @functools.wraps(func)
@@ -113,6 +134,9 @@ class MumbleRadioClient:
         # ---- 独立连接状态标记 ----
         # 由 pymumble 的 connected/disconnected 回调管理，不依赖 mumble 内部线程状态
         self._connection_established = threading.Event()
+        # 频道切换不能并发：GUI 线程（登录成功、重连）和监控线程都会切，两边
+        # 一起进去会各建一次频道、各报一次错
+        self._channel_lock = threading.Lock()
         # 初始频率（登录时无发现阶段，在 monitor_frequency 中读取）
         self._initial_freq = None
 
@@ -219,54 +243,112 @@ class MumbleRadioClient:
             self._connection_established.clear()
             print(f"[连接标记] 已设为 False")
 
+    def _find_channel(self, name):
+        try:
+            return self.mumble.channels.find_by_name(name)
+        except pymumble.errors.UnknownChannelError:
+            return None
+
+    def _create_channel(self, name):
+        """在根下建一个临时频道，**不要阻塞**。
+
+        pymumble 的 channels.new_channel() 走 execute_command(blocking=True)，
+        那个 acquire 没有任何超时——pymumble 自己的源码里就写着
+        "TODO: manage a timeout for blocking commands"。命令一旦没被服务器处理，
+        这里就永远卡住，调用线程整个死掉：日志停在"尝试创建临时频道"，之后既
+        没有成功也没有任何错误，因为线程根本没从这一行返回。实测的后果就是
+        飞行员一直留在根频道——发出去没人听得到，也收不到任何东西。
+
+        自己发命令、不等锁；频道有没有建出来由 _wait_for_channel 轮询判断，
+        那本来就是更可靠的判据。
+        """
+        self.mumble.execute_command(messages.CreateChannel(0, name, True),
+                                    blocking=False)
+
+    def _move_in(self, channel_id):
+        """进频道，同样不能用 move_in()——它也走 blocking=True。"""
+        self.mumble.execute_command(
+            messages.MoveCmd(self.mumble.users.myself_session, channel_id),
+            blocking=False)
+
+    def _wait_for_channel(self, name):
+        """等服务器把新建的频道回报回来。
+
+        建频道只是发一条消息，频道要等服务器回 ChannelState 才进本地表——这是
+        一次网络往返，不是本地操作。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            channel = self._find_channel(name)
+            if channel is not None:
+                return channel
+            time.sleep(0.1)
+        return self._find_channel(name)
+
+    def _wait_until_in(self, channel_id):
+        """等服务器确认我们真的进了这个频道。
+
+        move 是异步的，命令发出去不等于进去了。不确认就记 current_channel，
+        _ensure_in_correct_channel 会以为已经到位，人却还留在原地。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            myself = self.mumble.users.myself
+            if myself is not None and myself["channel_id"] == channel_id:
+                return True
+            time.sleep(0.1)
+        myself = self.mumble.users.myself
+        return myself is not None and myself["channel_id"] == channel_id
+
     def switch_channel(self, frequency, caller="unknown"):
         """切换到对应频率的频道
 
         参数:
             frequency: COM1 频率（MHz）
             caller:    调用来源名称（用于日志定位）
+
+        返回 True 表示确实已经在目标频道里了。整个过程有界：最坏各等一个
+        CHANNEL_TIMEOUT，不会像以前那样把调用线程永久挂住。
         """
         channel_name = self.get_channel_name(frequency)
         print(f"[频道切换] {caller}: 尝试切换到 {channel_name} (频率 {frequency:.3f} MHz)"
               f" | myself={'有' if self.mumble.users.myself else '无'}"
               f" | 线程存活={self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A'}")
-        try:
-            channel = self.mumble.channels.find_by_name(channel_name)
-            print(f"[频道切换] find_by_name 成功: channel_id={channel['channel_id']}")
-        except pymumble.errors.UnknownChannelError:
-            print(f"[频道切换] 频道 {channel_name} 不存在，尝试创建临时频道...")
+        with self._channel_lock:
             try:
-                self.mumble.channels.new_channel(0, channel_name, temporary=True)
-                print(f"[频道切换] 临时频道创建成功")
+                channel = self._find_channel(channel_name)
+                if channel is None:
+                    print(f"[频道切换] 频道 {channel_name} 不存在，尝试创建临时频道...")
+                    self._create_channel(channel_name)
+                    channel = self._wait_for_channel(channel_name)
+                if channel is None:
+                    print(f"[频道切换] 建立频道 {channel_name} 后 "
+                          f"{CHANNEL_TIMEOUT:.0f} 秒内没有出现，放弃这一次")
+                    return False
+
+                if not self.mumble.users.myself:
+                    print(f"[频道切换] self.mumble.users.myself 为 None，无法获取当前频道，跳过切换")
+                    return False
+                current_id = self.mumble.users.myself["channel_id"]
+                if current_id == channel["channel_id"]:
+                    print(f"[频道切换] 已在目标频道 {channel_name} 中，无需切换")
+                    self.current_channel = channel["channel_id"]
+                    return True
+                print(f"[频道切换] 当前频道 ID={current_id}，目标频道 ID={channel['channel_id']}，开始 move_in...")
+                self._move_in(channel["channel_id"])
+                # 命令是异步的，确认真的进去了再记账
+                if not self._wait_until_in(channel["channel_id"]):
+                    print(f"[频道切换] ⚠️ 发出了进入 {channel_name} 的请求，但 "
+                          f"{CHANNEL_TIMEOUT:.0f} 秒内没有生效，稍后重试")
+                    return False
+                self.current_channel = channel["channel_id"]
+                print(f"[频道切换] ✅ 成功切换到 {channel_name} (频率 {frequency:.3f} MHz)")
+                return True
             except Exception as e:
-                print(f"[频道切换] 创建临时频道失败: {type(e).__name__}: {e}")
-                return
-            try:
-                channel = self.mumble.channels.find_by_name(channel_name)
-                print(f"[频道切换] 创建后 find_by_name 成功: channel_id={channel['channel_id']}")
-            except pymumble.errors.UnknownChannelError:
-                print(f"[频道切换] 创建后仍找不到频道 {channel_name}，放弃切换")
-                return
+                print(f"[频道切换] ❌ 切换失败: {type(e).__name__}: {e}")
+                return False
 
-        if not channel:
-            print(f"[频道切换] 频道对象为空，放弃切换")
-            return
 
-        try:
-            if not self.mumble.users.myself:
-                print(f"[频道切换] self.mumble.users.myself 为 None，无法获取当前频道，跳过切换")
-                return
-            current_id = self.mumble.users.myself["channel_id"]
-            if current_id == channel["channel_id"]:
-                print(f"[频道切换] 已在目标频道 {channel_name} 中，无需切换")
-                return
-            print(f"[频道切换] 当前频道 ID={current_id}，目标频道 ID={channel['channel_id']}，开始 move_in...")
-            self.mumble.users.myself.move_in(channel["channel_id"])
-            self.current_channel = channel["channel_id"]
-            print(f"[频道切换] ✅ 成功切换到 {channel_name} (频率 {frequency:.3f} MHz)")
-        except Exception as e:
-            print(f"[频道切换] ❌ move_in 失败: {type(e).__name__}: {e}")
-    
     def _sync_ping_heartbeat(self):
         """读取 pymumble 内部 ping_stats['last_rcv'] 刷新心跳。
         
@@ -534,11 +616,26 @@ class MumbleRadioClient:
                             time.sleep(0.05)
                             continue
                             
-                        if not self.mumble.users.myself or not self.mumble.users.myself["channel_id"]:
+                        # 注意是 is None：根频道的 channel_id 就是 0，写成
+                        # not 会把"在根频道"当成"没进频道"，PTT 于是一声不吭
+                        # 地什么都不做
+                        if not self.mumble.users.myself:
+                            print("[DEBUG] 服务器还没回报我们自己的用户信息")
+                            time.sleep(0.05)
+                            continue
+                        if self.mumble.users.myself["channel_id"] is None:
                             print("[DEBUG] 未加入任何频道")
                             time.sleep(0.05)
                             continue
-                            
+                        if self.mumble.users.myself["channel_id"] == ROOT_CHANNEL:
+                            # 频率频道永远是根的子频道，人在根里就一定是切换没
+                            # 成功。这里不能附带判断 current_channel——掉线重连
+                            # 之后它停在旧值，条件不成立，话音就真的被发进根频
+                            # 道：自己频率上没人听得到，根频道里的人全听见了
+                            print("[DEBUG] 还留在根频道（频率频道没切成功），发出去没人听得到")
+                            time.sleep(0.05)
+                            continue
+
                         data = self._safe_stream_read(self.CHUNK)
                         if data:
                             audio_data = np.frombuffer(data, dtype=np.int16)

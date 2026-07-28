@@ -258,6 +258,21 @@ class RadioGUI(QMainWindow):
             self.client_thread = None
         print("客户端资源清理完成")
 
+    def _switch_channel_async(self, frequency, caller):
+        """在后台线程里切频道。
+
+        on_connected 跑在 Qt 主线程上，而切频道要建频道、等服务器回
+        ChannelState，是一次网络往返，最坏要等满 CHANNEL_TIMEOUT——在主线程上
+        干这件事窗口会直接"未响应"。switch_channel 自己有锁，和监控线程同时
+        进去也安全。
+        """
+        def work():
+            try:
+                self.radio_client.switch_channel(frequency, caller=caller)
+            except Exception as e:
+                print(f"[DEBUG-GUI] {caller} 频道切换失败: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
     def on_connected(self):
         """Mumble 连接成功后，初始化主界面并启动后台线程。"""
         try:
@@ -275,11 +290,8 @@ class RadioGUI(QMainWindow):
                 self.main_window.update_connection_status(True)
                 # 重连时也切一次频道
                 if self.radio_client and self.radio_client._initial_freq is not None:
-                    try:
-                        self.radio_client.switch_channel(
-                            self.radio_client._initial_freq, caller="GUI-重连")
-                    except Exception as e:
-                        print(f"[DEBUG-GUI] 重连频道切换失败: {e}")
+                    self._switch_channel_async(
+                        self.radio_client._initial_freq, "GUI-重连")
                 return
 
             self.main_window = MainWindow(self.radio_client)
@@ -306,10 +318,7 @@ class RadioGUI(QMainWindow):
             initial_freq = self.radio_client._initial_freq
             if initial_freq is not None:
                 print(f"[DEBUG-GUI] 连接成功，立即切换到频率 {initial_freq:.3f} MHz")
-                try:
-                    self.radio_client.switch_channel(initial_freq, caller="GUI-on_connected")
-                except Exception as e:
-                    print(f"[DEBUG-GUI] 初始频道切换异常: {e}")
+                self._switch_channel_async(initial_freq, "GUI-on_connected")
             else:
                 print(f"[DEBUG-GUI] 无初始频率，跳过首次频道切换")
 

@@ -19,7 +19,7 @@ import wave
 import numpy as np
 import pymumble_py3 as pymumble
 import pyttsx3
-from pymumble_py3 import mumble_pb2
+from pymumble_py3 import messages, mumble_pb2
 from pymumble_py3.constants import (
     PYMUMBLE_CLBK_CONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
@@ -372,6 +372,43 @@ class Broadcaster:
         except pymumble.errors.UnknownChannelError:
             return None
 
+    def _create_channel(self, name):
+        """在根下建一个临时频道，**不要阻塞**。
+
+        pymumble 的 channels.new_channel() 走 execute_command(blocking=True)，
+        那个 acquire 没有任何超时——它自己的源码里就写着
+        "TODO: manage a timeout for blocking commands"。命令一旦没被处理，这里
+        就永远卡住，连 CHANNEL_TIMEOUT 都轮不到，通播线程整个死在这一行：日志
+        停在"建一个临时的"，之后既没有成功也没有任何错误。
+
+        自己发命令、不等锁；频道有没有建出来由 _wait_for_channel 轮询判断，
+        那本来就是更可靠的判据——服务器拒绝建频道时也不会干等。
+        """
+        self.mumble.execute_command(messages.CreateChannel(0, name, True),
+                                    blocking=False)
+
+    def _move_in(self, channel_id):
+        """进频道，同样不能用 move_in()——它也走 blocking=True。"""
+        self.mumble.execute_command(
+            messages.MoveCmd(self.mumble.users.myself_session, channel_id),
+            blocking=False)
+
+    def _wait_until_in(self, channel_id):
+        """等服务器确认我们真的进了这个频道。
+
+        move 是异步的，命令发出去不等于进去了。不确认就报"已在播出"，通播会
+        对着根频道播，而界面显示一切正常。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline:
+            if not self.running or self.stop_event.is_set():
+                return False
+            myself = self.mumble.users.myself
+            if myself is not None and myself["channel_id"] == channel_id:
+                return True
+            time.sleep(0.1)
+        return False
+
     def _join_channel(self):
         name = self.station.channel
         try:
@@ -379,7 +416,7 @@ class Broadcaster:
             if channel is None:
                 self._denial = None
                 log.info("频道 %s 不存在，建一个临时的", name)
-                self.mumble.channels.new_channel(0, name, temporary=True)
+                self._create_channel(name)
                 channel = self._wait_for_channel(name)
 
             if channel is None:
@@ -394,7 +431,15 @@ class Broadcaster:
                                 f"没有出现，服务器没有说明原因")
                 return False
 
-            self.mumble.users.myself.move_in(channel["channel_id"])
+            channel_id = channel["channel_id"]
+            myself = self.mumble.users.myself
+            if myself is None or myself["channel_id"] != channel_id:
+                self._move_in(channel_id)
+                if not self._wait_until_in(channel_id):
+                    self._state('error',
+                                f"发出了进入频道 {name} 的请求，但 "
+                                f"{CHANNEL_TIMEOUT:.0f} 秒内没有生效")
+                    return False
             self._state('online', f"已在 {self.station.frequency} 播出")
             return True
         except Exception as e:

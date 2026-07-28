@@ -967,11 +967,119 @@ class ChineseVoiceTest(unittest.TestCase):
         chinese.render(metar_module.Metar("完全不是报文"))
 
 
+class FakeChannels:
+    def __init__(self, server):
+        self.server = server
+
+    def find_by_name(self, name):
+        import pymumble_py3 as pymumble
+        with self.server.lock:
+            if name in self.server.by_name:
+                return self.server.by_name[name]
+        raise pymumble.errors.UnknownChannelError(name)
+
+    def new_channel(self, parent_id, name, temporary=False):
+        self.server.hang("channels.new_channel")
+
+
+class FakeMyself:
+    def __init__(self, server):
+        self.server = server
+
+    def __getitem__(self, key):
+        if key == "channel_id":
+            return self.server.my_channel
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if key == "channel_id":
+            return self.server.my_channel
+        return default
+
+    def move_in(self, channel_id, token=None):
+        self.server.hang("users.myself.move_in")
+
+
+class FakeUsers:
+    def __init__(self, server, session):
+        self.myself = FakeMyself(server)
+        self.myself_session = session
+
+
+class FakeMumble:
+    """够用的 Mumble 替身，重点是把 pymumble 的两种接口区别开。
+
+    - ``execute_command(cmd, blocking=False)``：命令排队，假服务器在
+      ``latency`` 之后才让它生效——真实的 pymumble 就是这样，命令是异步的，
+      发出去不等于已经生效。
+    - ``channels.new_channel()`` / ``users.myself.move_in()``：**永远不返回**。
+      这两个入口走 ``execute_command(blocking=True)``，那个 ``lock.acquire()``
+      没有任何超时（pymumble 源码里就写着 "TODO: manage a timeout for blocking
+      commands"），服务器不处理命令时调用线程就死在那一行。
+
+    照搬这个行为，任何还在走阻塞接口的代码都会在测试里挂住，被
+    ``join(timeout=…)`` 抓出来——这比断言"有没有调用某个函数"结实得多。
+    """
+
+    def __init__(self, latency=0.0, answers=True, my_channel=0, session=42):
+        self.lock = threading.Lock()
+        self.latency = latency
+        self.answers = answers          # False = 服务器收下命令但什么都不做
+        self.by_name = {}
+        self.my_channel = my_channel
+        self.next_id = 1
+        self.commands = []              # 走异步接口发出去的命令
+        self.blocking_calls = []        # 有人走了阻塞接口（会挂死）
+        self.channels = FakeChannels(self)
+        self.users = FakeUsers(self, session)
+
+    def hang(self, what):
+        self.blocking_calls.append(what)
+        threading.Event().wait()        # 永远不返回，和真的 pymumble 一样
+
+    def execute_command(self, cmd, blocking=True):
+        if blocking:
+            self.hang("execute_command(blocking=True)")
+        self.commands.append(cmd)
+        if self.answers:
+            timer = threading.Timer(self.latency, self._apply, args=(cmd,))
+            timer.daemon = True
+            timer.start()
+
+    def _apply(self, cmd):
+        params = cmd.parameters
+        with self.lock:
+            if "name" in params:                    # CreateChannel
+                self.by_name[params["name"]] = {
+                    "channel_id": self.next_id,
+                    "name": params["name"],
+                    "parent": params["parent"],
+                    "temporary": params["temporary"],
+                }
+                self.next_id += 1
+            elif "session" in params:               # MoveCmd
+                self.my_channel = params["channel_id"]
+
+    # 便于断言
+    def created_names(self):
+        return [(c.parameters["parent"], c.parameters["name"],
+                 c.parameters["temporary"])
+                for c in self.commands if "name" in c.parameters]
+
+    def moves(self):
+        return [c.parameters["channel_id"] for c in self.commands
+                if "session" in c.parameters]
+
+
 class JoinChannelTest(unittest.TestCase):
     """频率频道不存在时要新建，并且要等服务器把它回报回来。
 
-    以前是建完 sleep(0.2) 就去找，远程服务器上经常还没回来，报出来是
-    "Channel FREQ_127800 does not exists"——听着像频道建不了，其实只是没等到。
+    钉两件事：
+    - 建频道 / 进频道都不能走 pymumble 的阻塞接口。那个锁没有超时，命令没被
+      处理就永久卡住，通播线程整个死掉——日志停在建频道那一行，既没有成功也
+      没有任何错误。
+    - 建完 sleep(0.2) 就去找是不够的，远程服务器上经常还没回来，报出来是
+      "Channel FREQ_127800 does not exists"——听着像频道建不了，其实只是没等到。
     """
 
     def setUp(self):
@@ -1002,70 +1110,95 @@ class JoinChannelTest(unittest.TestCase):
             "channel": "FREQ_127800", "frequency": "127.800",
             "callsign": "ROAH_ATIS"})()
 
-        self.created = []
-        self.moved = []
-        self.channels = {}
-
-        caster = self.caster
-        outer = self
-
-        class Channels:
-            def find_by_name(self, name):
-                import pymumble_py3 as pymumble
-                if name in outer.channels:
-                    return outer.channels[name]
-                raise pymumble.errors.UnknownChannelError(name)
-
-            def new_channel(self, parent, name, temporary=False):
-                outer.created.append((parent, name, temporary))
-
-        class Myself:
-            def move_in(self, channel_id):
-                outer.moved.append(channel_id)
-
-        caster.mumble = type("M", (), {
-            "channels": Channels(),
-            "users": type("U", (), {"myself": Myself()})(),
-        })()
+        self.server = FakeMumble(latency=0.3)
+        self.caster.mumble = self.server
 
     def tearDown(self):
         self.broadcast.CHANNEL_TIMEOUT = self._timeout
 
+    def join(self, budget=None):
+        """在独立线程里调 _join_channel，返回 (结果, 耗时)。
+
+        卡住的话不会拖死整个测试——线程是 daemon，join 超时就当场失败，并把
+        走过的阻塞接口打出来。
+        """
+        if budget is None:
+            budget = self.broadcast.CHANNEL_TIMEOUT * 2 + 3
+        box = {}
+
+        def work():
+            box["value"] = self.caster._join_channel()
+
+        thread = threading.Thread(target=work, daemon=True)
+        started = time.time()
+        thread.start()
+        thread.join(budget)
+        elapsed = time.time() - started
+        self.assertFalse(
+            thread.is_alive(),
+            f"_join_channel 在 {budget:.1f} 秒内没有返回；"
+            f"走过的阻塞接口={self.server.blocking_calls}")
+        return box["value"], elapsed
+
     def test_existing_channel_is_used_directly(self):
-        self.channels["FREQ_127800"] = {"channel_id": 7}
-        self.assertTrue(self.caster._join_channel())
-        self.assertEqual(self.created, [], "已存在就不该再建")
-        self.assertEqual(self.moved, [7])
+        self.server.by_name["FREQ_127800"] = {"channel_id": 7}
+        result, _ = self.join()
+        self.assertTrue(result)
+        self.assertEqual(self.server.created_names(), [], "已存在就不该再建")
+        self.assertEqual(self.server.moves(), [7])
+        self.assertEqual(self.server.my_channel, 7, "要真的进去，不是发完就算")
+
+    def test_already_in_the_channel_needs_no_command_at_all(self):
+        self.server.by_name["FREQ_127800"] = {"channel_id": 7}
+        self.server.my_channel = 7
+        result, _ = self.join()
+        self.assertTrue(result)
+        self.assertEqual(self.server.commands, [])
 
     def test_missing_channel_is_created_as_temporary(self):
-        # 服务器"稍后"才回报：新建之后才让它出现
-        original = self.broadcast.Broadcaster._wait_for_channel
-
-        def appear(caster, name):
-            self.channels[name] = {"channel_id": 9}
-            return original(caster, name)
-
-        self.broadcast.Broadcaster._wait_for_channel = appear
-        try:
-            self.assertTrue(self.caster._join_channel())
-        finally:
-            self.broadcast.Broadcaster._wait_for_channel = original
-        self.assertEqual(self.created, [(0, "FREQ_127800", True)])
-        self.assertEqual(self.moved, [9])
+        result, _ = self.join()
+        self.assertTrue(result)
+        self.assertEqual(self.server.created_names(), [(0, "FREQ_127800", True)])
+        self.assertEqual(self.server.my_channel, self.server.moves()[0])
 
     def test_waits_rather_than_giving_up_immediately(self):
-        # 频道在 0.3 秒后才出现——固定 sleep(0.2) 的老写法会在这里失败
-        def appear():
-            time.sleep(0.3)
-            self.channels["FREQ_127800"] = {"channel_id": 11}
+        # 服务器 0.3 秒后才回报频道——固定 sleep(0.2) 的老写法会在这里失败
+        self.server.latency = 0.3
+        result, elapsed = self.join()
+        self.assertTrue(result)
+        self.assertGreaterEqual(elapsed, 0.3, "至少要等到服务器回话")
 
-        threading.Thread(target=appear, daemon=True).start()
-        self.assertTrue(self.caster._join_channel())
-        self.assertEqual(self.moved, [11])
+    def test_a_server_that_never_answers_does_not_hang_the_thread(self):
+        """这才是那个 bug：阻塞接口下服务器不回话，线程永远回不来。
+
+        换成轮询之后，最坏也只是等满 CHANNEL_TIMEOUT 然后报错返回。
+        """
+        self.broadcast.CHANNEL_TIMEOUT = 0.5
+        self.server.answers = False
+        result, elapsed = self.join()
+        self.assertFalse(result)
+        self.assertGreaterEqual(elapsed, 0.5, "该等的还是要等满")
+        self.assertLess(elapsed, 3.0, "但必须有上界")
+        self.assertEqual(self.server.blocking_calls, [],
+                         "不能再走 pymumble 那两个没有超时的阻塞接口")
+
+    def test_move_that_never_takes_effect_is_not_reported_as_online(self):
+        """进频道也是异步的，没确认就报"已在播出"，通播会对着根频道播。"""
+        self.broadcast.CHANNEL_TIMEOUT = 0.5
+        self.server.by_name["FREQ_127800"] = {"channel_id": 7}
+        self.server.answers = False          # 命令收下了，但人不会被移过去
+        result, elapsed = self.join()
+        self.assertFalse(result)
+        self.assertEqual(self.server.moves(), [7], "命令还是要发出去的")
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertNotIn("online", [kind for kind, _ in self.caster.states])
+        self.assertIn("没有生效", self.caster.states[-1][1])
 
     def test_timeout_says_so_without_blaming_the_channel(self):
         self.broadcast.CHANNEL_TIMEOUT = 0.3
-        self.assertFalse(self.caster._join_channel())
+        self.server.answers = False
+        result, _ = self.join()
+        self.assertFalse(result)
         kind, message = self.caster.states[-1]
         self.assertEqual(kind, "error")
         self.assertIn("没有出现", message)
@@ -1073,15 +1206,16 @@ class JoinChannelTest(unittest.TestCase):
     def test_permission_denial_is_reported_as_such(self):
         # 缺 MakeTempChannel 时再等也不会有，要说清楚是权限问题
         self.broadcast.CHANNEL_TIMEOUT = 5.0
+        self.server.answers = False
 
         def deny():
             time.sleep(0.1)
             self.caster._denial = "没有权限（建立频率频道需要根频道的 MakeTempChannel 权限）"
 
         threading.Thread(target=deny, daemon=True).start()
-        started = time.time()
-        self.assertFalse(self.caster._join_channel())
-        self.assertLess(time.time() - started, 2.0, "被拒绝之后不该继续等满超时")
+        result, elapsed = self.join()
+        self.assertFalse(result)
+        self.assertLess(elapsed, 2.0, "被拒绝之后不该继续等满超时")
         self.assertIn("MakeTempChannel", self.caster.states[-1][1])
 
     def test_denial_callback_translates_the_type(self):
@@ -1096,10 +1230,25 @@ class JoinChannelTest(unittest.TestCase):
 
     def test_stopping_aborts_the_wait(self):
         self.broadcast.CHANNEL_TIMEOUT = 30.0
+        self.server.answers = False
         self.caster.stop_event.set()
-        started = time.time()
-        self.assertFalse(self.caster._join_channel())
-        self.assertLess(time.time() - started, 2.0, "停止时不该继续等")
+        result, elapsed = self.join(budget=5.0)
+        self.assertFalse(result)
+        self.assertLess(elapsed, 2.0, "停止时不该继续等")
+
+    def test_stopping_aborts_the_wait_for_the_move_too(self):
+        self.broadcast.CHANNEL_TIMEOUT = 30.0
+        self.server.by_name["FREQ_127800"] = {"channel_id": 7}
+        self.server.answers = False
+
+        def stop():
+            time.sleep(0.2)
+            self.caster.stop_event.set()
+
+        threading.Thread(target=stop, daemon=True).start()
+        result, elapsed = self.join(budget=5.0)
+        self.assertFalse(result)
+        self.assertLess(elapsed, 2.0, "停止时不该继续等")
 
 
 class WeatherFetchTest(unittest.TestCase):

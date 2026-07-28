@@ -20,7 +20,7 @@ import time
 import numpy as np
 import pyaudio
 import pymumble_py3 as pymumble
-from pymumble_py3 import mumble_pb2
+from pymumble_py3 import messages, mumble_pb2
 from pymumble_py3.constants import (
     PYMUMBLE_CLBK_CONNECTED,
     PYMUMBLE_CLBK_DISCONNECTED,
@@ -104,6 +104,9 @@ PTT_TARGET_ID = 1
 XC_TARGET_BASE = 10            # 每个 XC 频率一个编号，从这里往后排
 RX_TIMEOUT = 0.5               # 多久没收到话音就认为对方松开了
 CONNECT_TIMEOUT = 15.0
+# 建完临时频道到它出现在频道表里、以及进频道到服务器确认，都要等一次网络往返。
+# 固定 sleep 赌不起——远程服务器上 0.2 秒经常不够，表现出来就是频道"建不出来"。
+CHANNEL_TIMEOUT = 5.0
 PING_TIMEOUT = 5.0             # 超过这么久没有 ping 回复就认为断线
 
 # pymumble 默认 10 秒 ping 一次、断线后 10 秒才重连，掉线要很久才能被发现。
@@ -396,22 +399,61 @@ class VoiceClient:
         self.speaker_volume = max(0, min(200, int(percent)))
 
     # ---------- 频道 ----------
+    def _find_channel(self, name):
+        try:
+            return self.mumble.channels.find_by_name(name)
+        except pymumble.errors.UnknownChannelError:
+            return None
+
+    def _create_channel(self, name):
+        """在根下建一个临时频道，**不要阻塞**。
+
+        pymumble 的 channels.new_channel() 走 execute_command(blocking=True)，
+        那个 acquire 没有任何超时——它自己的源码里就写着
+        "TODO: manage a timeout for blocking commands"。命令一旦没被处理，这里
+        就永远卡住，而 sync() 是整条电台栈同步链的入口，一起死掉：日志停在
+        "建一个临时的"，之后既没有成功也没有任何错误，因为线程根本没从这一行
+        返回。
+
+        自己发命令、不等锁；频道有没有建出来由 _wait_for_channel 轮询判断，
+        那本来就是更可靠的判据。
+        """
+        self.mumble.execute_command(messages.CreateChannel(0, name, True),
+                                    blocking=False)
+
+    def _wait_for_channel(self, name):
+        """等服务器把新建的频道回报回来。
+
+        建频道只是发一条消息，频道要等服务器回 ChannelState 才进本地表——这是
+        一次网络往返。原来固定 sleep(0.2) 再找，连远程服务器时经常还没回来。
+        """
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            channel = self._find_channel(name)
+            if channel is not None:
+                return channel
+            time.sleep(0.1)
+        return self._find_channel(name)
+
     def _resolve_channel(self, khz):
         """拿到频率对应的频道 id，没有就建一个临时频道。"""
         if khz in self._channel_ids:
             return self._channel_ids[khz]
 
         name = radiostack.channel_name(khz)
-        try:
-            channel = self.mumble.channels.find_by_name(name)
-        except pymumble.errors.UnknownChannelError:
+        channel = self._find_channel(name)
+        if channel is None:
             try:
-                self.mumble.channels.new_channel(0, name, temporary=True)
-                time.sleep(0.2)
-                channel = self.mumble.channels.find_by_name(name)
+                log.info("频道 %s 不存在，建一个临时的", name)
+                self._create_channel(name)
+                channel = self._wait_for_channel(name)
             except Exception as e:
                 log.warning(f"无法创建频道 {name}: {e}")
                 return None
+        if channel is None:
+            log.warning("建立频道 %s 后 %.0f 秒内没有出现，这一轮先跳过",
+                        name, CHANNEL_TIMEOUT)
+            return None
 
         channel_id = channel["channel_id"]
         log.debug("频率 %s 对应频道 %s (id %s)",
@@ -459,10 +501,34 @@ class VoiceClient:
 
     def _join(self, channel_id):
         try:
-            if self.mumble.users.myself.get("channel_id") != channel_id:
-                self.mumble.users.myself.move_in(channel_id)
+            if self.mumble.users.myself.get("channel_id") == channel_id:
+                return True
+            # move_in() 也走 execute_command(blocking=True)，和建频道一样会
+            # 无限期卡住，同样自己发命令
+            self.mumble.execute_command(
+                messages.MoveCmd(self.mumble.users.myself_session, channel_id),
+                blocking=False)
+            # 命令是异步的，确认真的进去了再往下走——主频道没进去的话，服务端
+            # 不支持频道监听时管制员一个频率都听不到
+            if not self._wait_until_in(channel_id):
+                log.warning("发出了进入频道 %s 的请求，但 %.0f 秒内没有生效",
+                            channel_id, CHANNEL_TIMEOUT)
+                return False
+            return True
         except Exception as e:
             log.warning(f"进入频道失败: {e}")
+            return False
+
+    def _wait_until_in(self, channel_id):
+        """等服务器确认我们真的进了这个频道。"""
+        deadline = time.time() + CHANNEL_TIMEOUT
+        while time.time() < deadline and self.running:
+            myself = self.mumble.users.myself
+            if myself is not None and myself.get("channel_id") == channel_id:
+                return True
+            time.sleep(0.1)
+        myself = self.mumble.users.myself
+        return myself is not None and myself.get("channel_id") == channel_id
 
     def _set_listening(self, channel_ids):
         """频道监听。pymumble 没封装，直接发 UserState。"""
