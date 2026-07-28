@@ -26,7 +26,7 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
-Two things the pilot clients still lack that the controller and ATIS have: **logging** (they still `print`, which goes nowhere in a `console=False` build) and any tests.
+The pilot clients still lack the **logging** the controller and ATIS have — they `print`, which goes nowhere in a `console=False` build. They do now have tests: `test_radio.py` (channel switching, PTT guards) and `smoke_gui.py`, which is the only thing that touches their `gui.py` at all.
 
 ## Commands
 
@@ -51,7 +51,7 @@ pyinstaller gui.spec
 
 **Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/airwaysn-controller/`, `dist/airwaysn-atis/` and `dist/xpc-for-can/`.
 
-Tests — the controller, the ATIS client and XPC have them; each runs from its own directory and needs no server, no audio device and no network:
+Tests — every component except `server/login.py` has some; each runs from its own directory and needs no server, no audio device and no network:
 
 ```powershell
 cd controller
@@ -75,7 +75,16 @@ cd msfs
 python -m unittest test_msfs -v          # BCD squawk, SimVar units, aircraft.cfg
 python -m unittest test_msfs.RealWorldLayoutTest   # the ones a live install found
 python smoke_gui.py
+
+cd client            # 以及 xplane_client，两份基本一样
+python -m unittest test_radio -v         # 频道切换（超时/重试）、PTT 的进频道判据
+python smoke_gui.py                      # 登录/主界面/设置，以及切换不能卡 Qt 线程
+
+cd server\ATIS
+python -m unittest test_mumble -v        # 通播的建频道 / 进频道，含服务器不回话
 ```
+
+`test_xpc.py`'s `VoiceChannelTest` is mostly `inspect.getsource()` string-matching — it can only show the code *looks* right. `VoiceRuntimeTest` and `VoiceStartupFailureTest` actually run `_channel_loop`/`_run`/`start()` against a fake server, which is how the reconnect bugs above were found while every source-match assertion still passed. Put new voice coverage there, not in the string-matching class. Because `msfs/voice.py` is a byte-identical copy and is only covered through those xpc tests, `msfs/test_msfs.py`'s `SharedCopyTest` fails if the two ever drift.
 
 `test_xpc.py` loads `plugin/PI_XpcTraffic.py` directly (the plugin guards its `import xp` so it imports outside X-Plane) to check the bridge reassembler and the animation-value ordering. The rest of the plugin needs a running simulator and is not covered.
 
@@ -89,6 +98,7 @@ Three environment facts that will cost an afternoon otherwise:
 
 - **Use Python 3.12.** PyAudio has no wheel for 3.13+, and building it from source needs PortAudio headers plus MSVC.
 - **pymumble 1.6.1 does not work on Python 3.12 out of the box.** Its `connect()` builds the TLS socket with `ssl.wrap_socket()`, which was **removed in 3.12**, and its `except AttributeError` fallback calls *the same removed function* — so the exception escapes, from inside pymumble's own thread. The caller only sees `is_alive() == False` and naturally reports "server rejected the connection", which sends you hunting for a password problem while the TLS handshake never even started (the Murmur log shows a connection opening and closing milliseconds later). `mumblecompat.install()` reinstates a `wrap_socket` built on `SSLContext`. **All four components carry a copy and call it at import** — without it the voice path is dead in every packaged build, pilot clients included.
+- **pymumble's blocking commands never time out.** `channels.new_channel()` and `users.myself.move_in()` both go through `execute_command(blocking=True)`, whose `lock.acquire()` has no timeout — pymumble's own source says so (`mumble.py:587`, *"TODO: manage a timeout for blocking commands"*). If the command is never processed the calling thread dies there permanently, and the symptom is the *absence* of a log line: the log stops after "建一个临时的" with neither success nor error, because the thread never returned from that line. Confirmed to leave pilot clients stuck in the root channel (nobody hears them, they hear nobody) and is the likely real cause of the ATIS `Channel FREQ_xxxxxx does not exists` report. **No component may call those two wrappers.** Build the message yourself — `messages.CreateChannel(0, name, True)` / `messages.MoveCmd(mumble.users.myself_session, channel_id)` — send it with `execute_command(cmd, blocking=False)`, and poll for the result against `CHANNEL_TIMEOUT` (5 s): the channel appearing in the table, and `myself["channel_id"]` actually changing. Never book a move as done just because the command was sent, or the retry loop thinks it succeeded while the user is still where they were. `xpc/voice.py` is the reference; the same shape is now in `client/`, `xplane_client/`, `controller/voice.py`, `atis/broadcast.py` and `server/ATIS/mumble.py`. The tests fake it with a Mumble stub whose *blocking* entry points never return, so anything that reaches for them hangs and is caught by a `join(timeout=…)`.
 - **`msfs/gui.spec` must also bundle `SimConnect.dll`.** Same trap as opus, worse symptom. Python-SimConnect loads it with `os.path.splitext(os.path.abspath(__file__))[0] + '.dll'`, so PyInstaller never sees it, and it has to land in `_internal/SimConnect/` because the path is derived from the module's own location. Leave it out and the packaged app still starts, still scans liveries, and simply never reads the simulator — the UI just says *"连不上 MSFS（模拟器是否已启动？）"* forever, sending the user off to check MSFS instead of the installer. `--debug` distinguishes the two: a working DLL logs `Did not find Flight Simulator running`, a missing one logs a DLL load error.
 - **Every spec must bundle `opus.dll`.** `opuslib` loads it through `ctypes` at runtime, so PyInstaller's static analysis never sees it and a packaged build dies at startup on any machine that does not already have Opus. All four specs now run the same `find_opus()` (`find_library` → the component's own `opus.dll` → `pyogg`'s copy).
 - **pymumble needs the native `opus` library** (`opuslib` loads it through `ctypes` at runtime). Without it every import of `radio.py`/`voice.py` dies with `Could not find Opus library`. `controller/gui.spec` now locates `opus.dll` at build time and bundles it — via `find_library`, then `pyogg`'s copy, then `controller/opus.dll` — so a packaged build works on a machine that has never seen Opus. The other three specs do not do this yet.
@@ -115,7 +125,14 @@ freq_value = int(round(float(frequency_mhz) * 1000))     # 125.400 -> 125400
 channel_name = f"FREQ_{str(freq_value).zfill(6)}"        # -> "FREQ_125400"
 ```
 
-Channels are created at the Mumble root as `temporary=True` if missing, then `move_in`. Changing this formula breaks pilot/controller/ATIS interop simultaneously.
+Channels are created at the Mumble root as `temporary=True` if missing, then joined — via the non-blocking `CreateChannel` / `MoveCmd` path described above, never `new_channel()` / `move_in()`. Changing this formula breaks pilot/controller/ATIS interop simultaneously.
+
+**Joining a channel is not a fact you can remember.** Every voice client is built with `reconnect=True`, and after pymumble reconnects the server puts the user back in **root** — while `self.frequency`/`self.channel` still hold the pre-drop values. Two rules follow, and `xpc/voice.py` violated both until they were found by actually running `_channel_loop`:
+
+- The convergence loop must compare against the server (`myself["channel_id"]` vs the channel it thinks it is in — `_in_expected_channel()`), not against its own bookkeeping. Comparing `target == self.frequency` alone means it concludes "already there" and never rejoins; the UI stays green and the user sits in root indefinitely.
+- The PTT root guard must be **unconditional** (`myself["channel_id"] == ROOT_CHANNEL` → refuse). Qualifying it with `and self.channel is None` looks like a safety valve but is exactly wrong after a reconnect: the stale channel name makes the condition false, so audio is really transmitted into root — inaudible on the intended frequency, audible to everyone whose own switch failed, and the sent-frame counter climbs normally the whole time.
+
+**Releasing the voice resources on a failed connect is not optional.** `Voice.start()` must run its `_release()` on every failure path. Leaving PyAudio open keeps the microphone, so the *next* attempt fails with 打不开音频设备 and points the user at their sound card; leaving the `reconnect=True` Mumble object alive leaves a zombie retrying forever, and `server/login.py` rate-limits auth failures per ASN ID — one zombie can lock the account out of voice entirely, so fixing the password changes nothing until the app is restarted.
 
 **ATIS username encoding.** ATIS bots log in as `{cid}_atis{freq6}` (e.g. `1005_atis118000`). `server/login.py` matches `^.*_atis\d{6}`, authenticates the `cid` part against `https://airwaysn.org/api/v1/public/auth`, and returns the 6-digit frequency as the Murmur user id so multiple ATIS sessions per user don't collide. `server/ATIS/mumble.py` uses the reserved account `900` for its bots. Frequency `199.998` is deliberately skipped (placeholder for "no frequency").
 
