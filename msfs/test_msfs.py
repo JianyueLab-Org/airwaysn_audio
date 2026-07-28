@@ -7,6 +7,7 @@ xpc/test_xpc.py 覆盖，这里只测换掉的那一层：SimConnect 的单位�
 解析、机型匹配，以及他机注入里那段自己接管的 objectID 关联。
 """
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -591,6 +592,37 @@ class InjectorTest(unittest.TestCase):
         # 每架都是完整的飞机模型，放太多会掉帧
         self.assertLessEqual(self.inject.MAX_AIRCRAFT, 64)
         self.assertGreater(self.inject.MAX_AIRCRAFT, 0)
+
+
+class SharedCopyTest(unittest.TestCase):
+    """和 xpc 逐字节共享的那几个文件不能各改各的。
+
+    这个仓库靠复制共享代码，不靠 import。`voice.py` 的运行时测试只写在
+    xpc/test_xpc.py 里——只有这两份完全一样，那些测试才代表这一份也是对的。
+    掉线重连之后不回频率频道的 bug 就同时存在于两边。
+
+    `fsdpilot.py` 和 `applog.py` 的分叉是有意的，不在这里管。
+    """
+
+    SHARED = ("voice.py", "traffic.py", "mumblecompat.py")
+
+    def test_shared_files_are_byte_identical_to_xpc(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        there = os.path.join(os.path.dirname(here), "xpc")
+        if not os.path.isdir(there):
+            self.skipTest("边上没有 xpc 目录")
+        for name in self.SHARED:
+            mine = os.path.join(here, name)
+            theirs = os.path.join(there, name)
+            if not os.path.exists(theirs):
+                continue
+            with open(mine, "rb") as f:
+                a = f.read()
+            with open(theirs, "rb") as f:
+                b = f.read()
+            self.assertEqual(
+                hashlib.md5(a).hexdigest(), hashlib.md5(b).hexdigest(),
+                f"{name} 和 xpc 的那份不一样了——改了一边就要把另一边同步过去")
 
 
 if __name__ == "__main__":

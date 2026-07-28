@@ -12,6 +12,7 @@ import struct
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -535,6 +536,324 @@ class VoiceChannelTest(unittest.TestCase):
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_channel_loop", source)
         self.assertIn("_switch_channel", source)
+
+
+# ---------------------------------------------------------------------------
+# 上面那一堆大多是拿 inspect.getsource 对字符串，只能证明"代码长这样"，证明不了
+# "跑起来是对的"。下面这些真的把 _channel_loop / _run 跑起来——掉线重连之后不
+# 回频道那个 bug 就是这么找出来的：源码匹配全部通过，人却在根频道对着空气喊。
+# ---------------------------------------------------------------------------
+
+class FakeVoiceServer:
+    """够用的 Mumble 替身，命令异步生效，和真的一样。"""
+
+    def __init__(self, connected, missing_channel_error, latency=0.05):
+        # 这个模块里 pymumble 是替身，常量和异常类都不是真的——所以状态码和
+        # "频道不存在"的异常都从 voice 自己导入的那份拿，不要写死
+        self.connected = connected
+        self.latency = latency
+        self.by_name = {}
+        self.my_channel = 0             # 根频道
+        self.next_id = 1
+        self.commands = []
+        self.sent = []                  # 发出去的话音
+        outer = self
+
+        class Channels:
+            def find_by_name(self, name):
+                if name in outer.by_name:
+                    return outer.by_name[name]
+                raise missing_channel_error(name)
+
+        class Myself:
+            def __getitem__(self, key):
+                if key == "channel_id":
+                    return outer.my_channel
+                if key == "name":
+                    return "1000"
+                raise KeyError(key)
+
+        class Users:
+            myself = Myself()
+            myself_session = 7
+
+        class Output:
+            def add_sound(self, pcm):
+                outer.sent.append(pcm)
+
+        self.channels = Channels()
+        self.users = Users()
+        self.sound_output = Output()
+
+    def execute_command(self, cmd, blocking=True):
+        assert not blocking, "阻塞接口没有超时，不能用"
+        self.commands.append(cmd)
+        timer = threading.Timer(self.latency, self._apply, args=(cmd,))
+        timer.daemon = True
+        timer.start()
+
+    def _apply(self, cmd):
+        params = cmd.parameters
+        if "name" in params:
+            self.by_name[params["name"]] = {"channel_id": self.next_id,
+                                            "name": params["name"]}
+            self.next_id += 1
+        elif "session" in params:
+            self.my_channel = params["channel_id"]
+
+
+class FakeCommand:
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+
+class FakeMessages:
+    """pymumble.messages 的替身。
+
+    这个模块把 pymumble 整个换成了 MagicMock，`messages.CreateChannel(...)` 于是
+    只会返回一个 MagicMock，`parameters` 里什么都没有。这里照抄 pymumble
+    messages.py 里那两个命令的真实字段，假服务器才认得出发的是什么。
+
+    真实字段名由 atis / controller / client 那几套测试盯着——它们用的是真的
+    pymumble，构造出来的就是真命令。
+    """
+
+    @staticmethod
+    def CreateChannel(parent, name, temporary):
+        return FakeCommand({"parent": parent, "name": name,
+                            "temporary": temporary})
+
+    @staticmethod
+    def MoveCmd(session, channel_id):
+        return FakeCommand({"session": session, "channel_id": channel_id})
+
+
+class FakeStream:
+    def __init__(self):
+        self.reads = 0
+
+    def read(self, frames, exception_on_overflow=False):
+        self.reads += 1
+        time.sleep(0.005)
+        return b"\x01\x02" * frames
+
+    def write(self, data):
+        pass
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class VoiceRuntimeTest(unittest.TestCase):
+    """把 Voice 真的跑起来：切频道、发话音、掉线重连之后还能不能用。"""
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice_module = voice
+        # pymumble 是替身，errors.UnknownChannelError 不是真的异常类——换成一个
+        # 真的，_find_channel 的 except 才接得住
+        missing = type("UnknownChannelError", (Exception,), {})
+        voice.pymumble.errors.UnknownChannelError = missing
+        self._real_messages = voice.messages
+        voice.messages = FakeMessages
+        self.server = FakeVoiceServer(voice.PYMUMBLE_CONN_STATE_CONNECTED, missing)
+        self.voice = voice.Voice(
+            "host", "1000", "pw",
+            settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100))
+        self.voice.mumble = self.server
+        self.voice.running = True
+        self.voice._input = FakeStream()
+        self.voice._output = FakeStream()
+        self.voice._chunk = 960
+        self.threads = []
+
+    def tearDown(self):
+        self.voice.running = False
+        self.voice._channel_wanted.set()
+        for thread in self.threads:
+            thread.join(timeout=2)
+        self.voice_module.messages = self._real_messages
+
+    def run_loops(self):
+        for target in (self.voice._channel_loop, self.voice._run):
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    def wait_until(self, predicate, timeout=4.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def transmit(self, seconds=0.4):
+        self.server.sent.clear()
+        self.voice.set_transmitting(True)
+        time.sleep(seconds)
+        self.voice.set_transmitting(False)
+        return list(self.server.sent)
+
+    def test_tuning_creates_the_channel_and_joins_it(self):
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel == "FREQ_118000"),
+                        "没能进入频率频道")
+        self.assertEqual(self.server.my_channel,
+                         self.server.by_name["FREQ_118000"]["channel_id"],
+                         "服务器那边要真的把人挪过去")
+
+    def test_ptt_actually_sends_audio(self):
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel is not None))
+        self.assertTrue(self.transmit(), "按住 PTT 应当发出话音")
+
+    def test_retuning_moves_to_the_new_channel(self):
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel == "FREQ_118000"))
+        self.voice.set_frequency(121.7)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel == "FREQ_121700"))
+        self.assertEqual(self.server.my_channel,
+                         self.server.by_name["FREQ_121700"]["channel_id"])
+
+    def test_it_rejoins_after_the_server_puts_us_back_in_root(self):
+        """掉线重连之后必须自己回到频率频道。
+
+        pymumble 是 reconnect=True 建的，重连之后服务器把人放回根频道，而
+        self.frequency / self.channel 还停在旧值。只比对这两个的话，收敛循环
+        会认为"已经到位"而再也不切——界面一直显示已连接，人却在根频道。
+        """
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel == "FREQ_118000"))
+        joined = self.server.my_channel
+
+        self.server.my_channel = self.voice_module.ROOT_CHANNEL   # 重连了
+        self.assertTrue(
+            self.wait_until(lambda: self.server.my_channel == joined),
+            "被放回根频道之后没有重新进入频率频道")
+
+    def test_it_does_not_transmit_into_the_root_channel(self):
+        """在根频道发话音，等于对着空气喊，还会打扰根频道里所有人。
+
+        判据原来附带 `and self.channel is None`，重连之后 self.channel 停在旧
+        值，条件不成立——话音就真的进了根频道，而帧数一路在涨，看着完全正常。
+        """
+        self.run_loops()
+        self.voice.set_frequency(118.0)
+        self.assertTrue(self.wait_until(lambda: self.voice.channel == "FREQ_118000"))
+
+        # 卡住重连逻辑，专门制造"人在根频道但 self.channel 还是旧值"的一刻
+        self.voice._channel_lock.acquire()
+        try:
+            self.server.my_channel = self.voice_module.ROOT_CHANNEL
+            self.assertEqual(self.transmit(), [],
+                             "留在根频道时一帧都不该发出去")
+            self.assertIn("根频道", self.voice._skip_reason)
+        finally:
+            self.voice._channel_lock.release()
+
+
+class VoiceStartupFailureTest(unittest.TestCase):
+    """连接失败必须把资源放掉，否则第二次连接根本连不成。"""
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice_module = voice
+        self.audios = []
+        self.stopped = []
+        outer = self
+
+        class FakeAudio:
+            def __init__(self):
+                self.terminated = False
+                outer.audios.append(self)
+
+            def terminate(self):
+                self.terminated = True
+
+        class FakeMumble:
+            connected = 3               # PYMUMBLE_CONN_STATE_FAILED
+            callbacks = types.SimpleNamespace(set_callback=lambda *a: None)
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def set_receive_sound(self, value):
+                pass
+
+            def start(self):
+                pass
+
+            def is_ready(self):
+                pass
+
+            def stop(self):
+                outer.stopped.append(self)
+
+        self._real_mumble = voice.pymumble.Mumble
+        voice.pymumble.Mumble = FakeMumble
+        self.FakeAudio = FakeAudio
+
+    def tearDown(self):
+        self.voice_module.pymumble.Mumble = self._real_mumble
+
+    def make_voice(self):
+        states = []
+        voice = self.voice_module.Voice(
+            "host", "1000", "wrong-password",
+            settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100),
+            on_status=lambda state, message: states.append(state))
+        voice._open_audio = lambda: (
+            setattr(voice, "_audio", self.FakeAudio()),
+            setattr(voice, "_input", FakeStream()),
+            setattr(voice, "_output", FakeStream()))
+        return voice, states
+
+    def test_a_rejected_login_releases_the_microphone(self):
+        """不放掉的话，PyAudio 还占着麦克风。
+
+        用户把密码改对再连一次，新的 Voice 在 _open_audio() 就失败，界面说
+        "打不开音频设备"——把人指向声卡，而真正的原因是上一次登录失败。
+        """
+        voice, states = self.make_voice()
+        voice.start()
+        self.assertEqual(states[-1], 'error')
+        self.assertEqual(len(self.audios), 1)
+        self.assertTrue(self.audios[0].terminated, "PyAudio 没有 terminate")
+        self.assertIsNone(voice._input)
+
+    def test_a_rejected_login_stops_the_mumble_connection(self):
+        """pymumble 是 reconnect=True 建的，扔着不管它会一直重连下去。
+
+        服务端 login.py 对认证失败按账号限流，一个后台不停重试的僵尸连接足以
+        把这个账号的语音锁死——密码改对了也连不上，直到重启程序。
+        """
+        voice, _ = self.make_voice()
+        voice.start()
+        self.assertEqual(len(self.stopped), 1, "失败之后必须 stop() 掉连接")
+        self.assertIsNone(voice.mumble)
+
+    def test_repeated_failures_do_not_pile_up(self):
+        voice, _ = self.make_voice()
+        for _ in range(3):
+            voice.start()
+        self.assertEqual(len(self.audios), 3)
+        self.assertTrue(all(a.terminated for a in self.audios),
+                        "每一次失败都要收干净，不能越攒越多")
+        self.assertEqual(len(self.stopped), 3)
 
 
 class ChannelNameTest(unittest.TestCase):

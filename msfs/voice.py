@@ -199,6 +199,7 @@ class Voice:
             self._open_audio()
         except Exception as e:
             self.running = False
+            self._release()
             self._status('error', f"打不开音频设备: {e}")
             return
 
@@ -212,6 +213,7 @@ class Voice:
             self.mumble.is_ready()
         except Exception as e:
             self.running = False
+            self._release()
             self._status('error', f"语音服务器连接失败: {e}")
             return
 
@@ -221,6 +223,7 @@ class Voice:
         # "语音已连接"，然后一切都莫名其妙地不工作。
         if not self.connected:
             self.running = False
+            self._release()
             self._status('error',
                          f"语音服务器拒绝了 {self.username}（用户名或密码不对？）")
             return
@@ -259,16 +262,39 @@ class Voice:
             if target is None:
                 self._note_stuck("还没有拿到 COM1 频率")
                 continue
-            if target == self.frequency:
-                self._stuck_reason = ""      # 到位了
-                continue
             if not self.connected:
                 self._note_stuck("语音服务器还没连上")
                 continue
+            if target == self.frequency:
+                if self._in_expected_channel():
+                    self._stuck_reason = ""      # 到位了
+                    continue
+                # 只比对记下来的频率是不够的。pymumble 是 reconnect=True 建的，
+                # 掉线重连之后服务器把人放回根频道，而 self.frequency /
+                # self.channel 还停在旧值——于是这里认为"已经到位"，再也不切，
+                # 人就永远留在根频道：界面显示已连接，帧数也在涨，就是没人听得到。
+                log.warning("服务器上我们已经不在 %s 了（多半是掉线重连过），重新进入",
+                            self.channel)
+                self.frequency = None
+                self.channel = None
             try:
                 self._switch_channel(target)
             except Exception as e:
                 log.warning("切换频道出错: %s", e)
+
+    def _in_expected_channel(self):
+        """服务器上我们真的还在自己记着的那个频道里吗？
+
+        这是"以为在"和"确实在"的区别。记账是本地的，频道是服务器说了算的，两者
+        之间隔着一次掉线重连就会不一致。
+        """
+        if not self.channel or not self.mumble:
+            return False
+        channel = self._find_channel(self.channel)
+        myself = self.mumble.users.myself
+        if channel is None or myself is None:
+            return False
+        return myself["channel_id"] == channel["channel_id"]
 
     def _note_stuck(self, reason):
         """迟迟切不过去时说明原因。
@@ -281,18 +307,18 @@ class Voice:
         self._stuck_reason = reason
         log.warning("还没能进入频率频道：%s", reason)
 
-    def stop(self):
-        self.running = False
+    def _release(self):
+        """把音频设备和 Mumble 连接放掉。start() 失败和 stop() 都必须走这里。
 
-        # 先收线程再动 PyAudio。反过来的话发送线程可能正卡在 stream.read()
-        # 里，C 层被 terminate 掉是直接崩，Python 的 try/except 接不住。
-        self._channel_wanted.set()      # 叫醒切换线程好让它看到 running=False
-        for thread in (self._thread, self._channel_thread):
-            if (thread and thread.is_alive()
-                    and thread is not threading.current_thread()):
-                thread.join(timeout=2)
-        self._thread = self._channel_thread = None
+        漏掉任何一条路径都不是"少收一点资源"那么轻：
 
+        - PyAudio 还占着麦克风。用户把密码改对了再点一次连接，新的 Voice 在
+          _open_audio() 就可能直接失败，界面说"打不开音频设备"——真正的原因是
+          上一次登录失败，指向的地方完全不对。
+        - pymumble 是 reconnect=True 建的。扔着不管，它会在后台一直重连下去，
+          而服务端 login.py 对认证失败按账号限流，一个不停重试的僵尸连接足以
+          把这个账号的语音锁死，之后怎么连都连不上。
+        """
         for stream in (self._input, self._output):
             try:
                 if stream:
@@ -314,6 +340,20 @@ class Voice:
             except Exception:
                 pass
             self.mumble = None
+
+    def stop(self):
+        self.running = False
+
+        # 先收线程再动 PyAudio。反过来的话发送线程可能正卡在 stream.read()
+        # 里，C 层被 terminate 掉是直接崩，Python 的 try/except 接不住。
+        self._channel_wanted.set()      # 叫醒切换线程好让它看到 running=False
+        for thread in (self._thread, self._channel_thread):
+            if (thread and thread.is_alive()
+                    and thread is not threading.current_thread()):
+                thread.join(timeout=2)
+        self._thread = self._channel_thread = None
+
+        self._release()
         self._status('stopped', "语音已断开")
 
     # ---------- 频率 ----------
@@ -520,9 +560,12 @@ class Voice:
                     self._skip("还没有进入任何频道")
                     time.sleep(0.05)
                     continue
-                if myself["channel_id"] == ROOT_CHANNEL and self.channel is None:
-                    # 还在根频道说明频道切换没成功。发出去也没人听得到，而且
-                    # 会打扰根频道里的人——说清楚，别让它看起来像正常工作。
+                if myself["channel_id"] == ROOT_CHANNEL:
+                    # 频率频道永远是根的子频道，人在根里就一定是切换没成功。
+                    # 这里原来还附带 `and self.channel is None`，可掉线重连之后
+                    # self.channel 停在旧值，条件不成立——于是话音真的被发进了
+                    # 根频道：自己频率上没人听得到，根频道里的人倒是全听见了，
+                    # 而帧数一路在涨，看起来一切正常。
                     self._skip("还留在根频道（频率频道没切成功），发出去没人听得到")
                     time.sleep(0.05)
                     continue
