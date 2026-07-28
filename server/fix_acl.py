@@ -31,6 +31,8 @@ import sys
 
 import Ice
 
+import serverconf
+
 try:
     import MumbleServer as MumbleIce          # Mumble 1.5+
 except ImportError:                            # 1.4 及更早叫 Murmur
@@ -38,8 +40,8 @@ except ImportError:                            # 1.4 及更早叫 Murmur
 
 # 和 login.py 保持一致
 ICE_PROXY = "Meta:tcp -h 127.0.0.1 -p 6502"
-ICE_SECRET = "yoyo14185721"
 SERVER_ID = 1
+# 口令不写在这里，和 login.py 走同一套（serverconf.py）
 
 ROOT_CHANNEL = 0
 
@@ -127,6 +129,12 @@ def main():
     init_data.properties.setProperty("Ice.Default.EncodingVersion", "1.0")
     init_data.properties.setProperty("Ice.MessageSizeMax", "65536")
 
+    try:
+        ice_secret = serverconf.ice_secret()
+    except serverconf.MissingSecret as e:
+        print(f"启动失败: {e}")
+        return 1
+
     with Ice.initialize(init_data) as communicator:
         meta = MumbleIce.MetaPrx.checkedCast(
             communicator.stringToProxy(ICE_PROXY))
@@ -135,7 +143,7 @@ def main():
             return 1
 
         # 所有 Ice 调用都要带 secret，否则抛 InvalidSecretException
-        context = {"secret": ICE_SECRET}
+        context = {"secret": ice_secret}
         server = meta.getServer(SERVER_ID, context)
         if not server:
             print(f"拿不到 {SERVER_ID} 号虚拟服务器")

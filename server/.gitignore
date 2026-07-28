@@ -6,3 +6,6 @@ MumbleServer.ice
 Murmur
 Murmur_ice.py
 Murmur.ice
+
+# 口令：只在服务器上放一份，永远不要提交
+server_secrets.json

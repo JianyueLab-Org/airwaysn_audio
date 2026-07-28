@@ -6,6 +6,11 @@ import sys
 _python_dir = os.path.dirname(sys.executable)
 os.environ['PATH'] = _python_dir + os.pathsep + os.environ.get('PATH', '')
 
+# 口令和 login.py 走同一套，共用上一层的 serverconf——两边比对的是同一个值，
+# 各存一份迟早会对不上，那时的症状是通播登不上而普通用户一切正常
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import serverconf
+
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
 import threading
@@ -22,14 +27,18 @@ import re
 # 固定 sleep 赌不起——服务器忙的时候 0.1 秒远远不够。
 CHANNEL_TIMEOUT = 5.0
 
+# 收一条通播线程最多等多久。裸的 join() 会让一个卡住的席位把整队拖死。
+JOIN_TIMEOUT = 10.0
+
 class ATISBroadcaster(threading.Thread):
     def __init__(self, atis_id, frequency, atis_text):
         super().__init__()
         freq_value = int(round(float(frequency) * 1000))
         channel_name = f"FREQ_{str(freq_value).zfill(6)}"
         self.channel_name = channel_name
-        self.user = f"900_atis{str(freq_value).zfill(6)}"
-        self.password = "p@ssw0rd"
+        # 口令不写在这里，见 server/serverconf.py
+        self.user = f"{serverconf.atis_account()}_atis{str(freq_value).zfill(6)}"
+        self.password = serverconf.atis_password(required=True)
         self.running = False
         self.mumble = None
         
@@ -304,14 +313,37 @@ class ATISManager:
         self.update_thread = threading.Thread(target=self._update_loop)
         self.update_thread.start()
 
+    def _retire(self, callsign):
+        """收掉一个通播席位。**join 必须带超时。**
+
+        原来是裸的 join()：一条卡住的通播线程会把调用方一起拖死。而调用方是
+        每 30 秒跑一轮的管理线程——它一死，之后所有席位都不再新建、换稿或撤下，
+        整个机队就停在那里，外面还看不出任何异常。
+
+        一个收不掉的线程只是漏一个线程，把整队拖死是另一回事。超时就放手，
+        并且说清楚是哪一个，好去查它卡在哪。
+        """
+        broadcaster = self.broadcasters.pop(callsign, None)
+        if broadcaster is None:
+            return
+        try:
+            broadcaster.stop()
+        except Exception as e:
+            print(f"停止 {callsign} 出错: {e}")
+        broadcaster.join(timeout=JOIN_TIMEOUT)
+        if broadcaster.is_alive():
+            print(f"警告: {callsign} 的通播线程 {JOIN_TIMEOUT:.0f} 秒内没有退出，"
+                  f"不再等它（线程会留着，但不影响其余席位）")
+
     def stop(self):
         """停止所有ATIS广播"""
         self._stop_flag = True
         if self.update_thread:
-            self.update_thread.join()
-        for broadcaster in self.broadcasters.values():
-            broadcaster.stop()
-            broadcaster.join()
+            self.update_thread.join(timeout=JOIN_TIMEOUT)
+            if self.update_thread.is_alive():
+                print(f"警告: 管理线程 {JOIN_TIMEOUT:.0f} 秒内没有退出")
+        for callsign in list(self.broadcasters.keys()):
+            self._retire(callsign)
         self.broadcasters.clear()
 
     def _update_loop(self):
@@ -325,9 +357,7 @@ class ATISManager:
                     # 停止不再活跃的ATIS
                     for callsign in list(self.broadcasters.keys()):
                         if callsign not in current_atis:
-                            self.broadcasters[callsign].stop()
-                            self.broadcasters[callsign].join()
-                            del self.broadcasters[callsign]
+                            self._retire(callsign)
                     
                     # 更新或启动新的ATIS
                     for callsign, atis in current_atis.items():

@@ -230,5 +230,80 @@ class JoinChannelTest(unittest.TestCase):
         self.assertLess(elapsed, 2.0, "停止之后不该继续等")
 
 
+class RetireBroadcasterTest(unittest.TestCase):
+    """一个卡住的席位不能把整队拖死。
+
+    管理线程每 30 秒一轮，撤下席位时会 join 它。原来那个 join 没有超时——通播
+    线程一旦卡住（比如卡在 pymumble 的阻塞命令里），管理线程就跟着永久卡死，
+    之后所有席位都不再新建、换稿或撤下，而外面完全看不出异常。
+    """
+
+    def setUp(self):
+        self._timeout = mumble_module.JOIN_TIMEOUT
+        mumble_module.JOIN_TIMEOUT = 0.3        # 测试里不真的等
+        self.manager = mumble_module.ATISManager()
+
+    def tearDown(self):
+        mumble_module.JOIN_TIMEOUT = self._timeout
+
+    def make_broadcaster(self, stuck):
+        """stuck=True 的线程永远不退出，和真的卡死一样。"""
+        release = threading.Event()
+
+        class Broadcaster(threading.Thread):
+            def __init__(self):
+                super().__init__(daemon=True)
+                self.stopped = False
+
+            def run(self):
+                release.wait()          # stuck 时永远等下去
+
+            def stop(self):
+                self.stopped = True
+                if not stuck:
+                    release.set()
+
+        broadcaster = Broadcaster()
+        broadcaster.start()
+        broadcaster._release = release
+        return broadcaster
+
+    def test_a_healthy_station_is_retired_cleanly(self):
+        broadcaster = self.make_broadcaster(stuck=False)
+        self.manager.broadcasters["ZSPD_ATIS"] = broadcaster
+        self.manager._retire("ZSPD_ATIS")
+        self.assertTrue(broadcaster.stopped)
+        self.assertNotIn("ZSPD_ATIS", self.manager.broadcasters)
+        self.assertFalse(broadcaster.is_alive())
+
+    def test_a_stuck_station_does_not_block_the_manager(self):
+        broadcaster = self.make_broadcaster(stuck=True)
+        self.manager.broadcasters["ZSPD_ATIS"] = broadcaster
+        started = time.time()
+        self.manager._retire("ZSPD_ATIS")
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 3.0, "卡住的席位把管理线程一起拖死了")
+        self.assertGreaterEqual(elapsed, 0.3, "该等的还是要等满")
+        self.assertNotIn("ZSPD_ATIS", self.manager.broadcasters,
+                         "等不到也要从表里摘掉，否则每一轮都重来一次")
+        broadcaster._release.set()
+
+    def test_one_stuck_station_does_not_stop_the_others_from_being_retired(self):
+        stuck = self.make_broadcaster(stuck=True)
+        healthy = self.make_broadcaster(stuck=False)
+        self.manager.broadcasters["ZSPD_ATIS"] = stuck
+        self.manager.broadcasters["ZBAA_ATIS"] = healthy
+
+        started = time.time()
+        self.manager.stop()
+        self.assertLess(time.time() - started, 4.0)
+        self.assertTrue(healthy.stopped, "另一个席位照样要被收掉")
+        self.assertEqual(self.manager.broadcasters, {})
+        stuck._release.set()
+
+    def test_retiring_something_that_is_not_there_is_harmless(self):
+        self.manager._retire("不存在的席位")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
