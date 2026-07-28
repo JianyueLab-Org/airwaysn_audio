@@ -26,7 +26,7 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
-The pilot clients still lack the **logging** the controller and ATIS have — they `print`, which goes nowhere in a `console=False` build. They do now have tests: `test_radio.py` (channel switching, PTT guards) and `smoke_gui.py`, which is the only thing that touches their `gui.py` at all.
+The pilot clients now carry `applog.py` too, so all five GUI components log rather than `print` — which matters because the packaged builds are `console=False` and a bare `print` goes nowhere. They also have tests: `test_radio.py` (channel switching, PTT guards) and `smoke_gui.py`, which is the only thing that touches their `gui.py` at all.
 
 ## Commands
 

@@ -5,6 +5,7 @@ settings.py — X-Plane 客户端设置管理
 """
 
 import os
+import logging
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
 from PyQt6.QtWidgets import (
@@ -15,6 +16,8 @@ from PyQt6.QtCore import Qt, QTimer
 import json
 import pygame
 import threading
+
+log = logging.getLogger("设置")
 
 
 class Settings:
@@ -48,9 +51,9 @@ class Settings:
                 safe = dict(data)
                 if "password" in safe:
                     safe["password"] = "***"
-                print(f"[DEBUG-Settings] 设置加载成功: {safe}")
+                log.debug("设置加载成功: %s", safe)
         except Exception as e:
-            print(f"[DEBUG-Settings] 加载设置失败: {e}")
+            log.error("加载设置失败: %s", e)
 
     def save_settings(self):
         try:
@@ -66,9 +69,9 @@ class Settings:
             }
             with open(self.config_file, "w") as f:
                 json.dump(data, f)
-            print("[DEBUG-Settings] 设置保存成功")
+            log.info("设置保存成功")
         except Exception as e:
-            print(f"[DEBUG-Settings] 保存设置失败: {e}")
+            log.error("保存设置失败: %s", e)
 
 
 class SettingsDialog(QDialog):
@@ -228,7 +231,7 @@ class SettingsDialog(QDialog):
                     self.joy_timer.timeout.connect(self.check_joystick_button)
                 self.joy_timer.start(50)
             except Exception as e:
-                print(f"[DEBUG-Settings] 摇杆初始化失败: {e}")
+                log.debug("摇杆初始化失败: %s", e)
                 self.joy_ptt_input.setText("初始化失败")
 
     def check_joystick_button(self):
@@ -255,7 +258,7 @@ class SettingsDialog(QDialog):
                                 self.joy_timer.stop()
                             return
             except Exception as e:
-                print(f"[DEBUG-Settings] 检查摇杆按键时出错: {e}")
+                log.debug("检查摇杆按键时出错: %s", e)
 
     def clear_joystick_ptt(self):
         self.settings.joystick_ptt = None
@@ -277,7 +280,7 @@ class SettingsDialog(QDialog):
             self.settings.save_settings()
             self.accept()
         except Exception as e:
-            print(f"[DEBUG-Settings] 保存设置时出错: {e}")
+            log.error("保存设置时出错: %s", e)
             self.reject()
 
     def reject(self):

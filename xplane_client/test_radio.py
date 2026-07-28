@@ -288,12 +288,28 @@ class PttChannelGuardTest(unittest.TestCase):
         radio.keyboard.is_pressed = self._is_pressed
 
     def capture_ptt(self, seconds=0.3):
-        """跑一轮 PTT 并收下 handle_voice 打出来的诊断。"""
-        import contextlib, io as _io
-        buffer = _io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        """跑一轮 PTT 并收下 handle_voice 记下的诊断。
+
+        这些话是用户唯一的线索，所以直接盯日志，不盯 print——radio.py 已经
+        整体改用 logging 了。
+        """
+        import logging
+        records = []
+
+        class Collector(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = Collector()
+        level = radio.log.level
+        radio.log.addHandler(handler)
+        radio.log.setLevel(logging.DEBUG)
+        try:
             self.run_ptt(seconds)
-        return buffer.getvalue()
+        finally:
+            radio.log.removeHandler(handler)
+            radio.log.setLevel(level)
+        return "\n".join(records)
 
     def run_ptt(self, seconds=0.3):
         # 每轮都重新开张，一个用例里可以跑好几次

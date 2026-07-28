@@ -2,6 +2,7 @@ import os
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 os.environ['SDL_AUDIODRIVER'] = 'dummy'
 
+import logging
 from SimConnect import *
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
@@ -22,17 +23,7 @@ import sys
 import functools
 import pygame  # pygame导入必须在设置环境变量之后
 
-# 这个文件到处 print 中文和 ✅/⚠️ 之类的符号，而中文 Windows 控制台默认是
-# GBK，编不出来就抛 UnicodeEncodeError。它抛在哪一行就打断哪一条链——实测里
-# 频道切换成功那句 print 崩掉，异常从 switch_channel 里逃出去，看起来像切换
-# 失败。日志再重要也不该有能力弄死调用它的线程。
-try:
-    if sys.stdout is not None:
-        sys.stdout.reconfigure(errors="replace")
-    if sys.stderr is not None:
-        sys.stderr.reconfigure(errors="replace")
-except Exception:
-    pass
+log = logging.getLogger("无线电")
 
 # 配置服务器信息
 SERVER_HOST = "hjdczy.top"  # Mumble服务器地址
@@ -91,7 +82,7 @@ class MumbleRadioClient:
             self.settings.username = username or ""
             self.settings.password = password or ""
         except Exception as e:
-            print(f"[DEBUG] 同步账号到设置失败: {e}")
+            log.error("同步账号到设置失败: %s", e)
 
         # 确保音量在合理范围内
         self.settings.mic_volume = max(0, min(200, self.settings.mic_volume))
@@ -101,7 +92,7 @@ class MumbleRadioClient:
         self.audio = pyaudio.PyAudio()
         self.RATE = self._find_best_sample_rate()
         self.CHUNK = int(self.RATE * 0.02)
-        print(f"[Audio] 使用采样率: {self.RATE} Hz, CHUNK: {self.CHUNK}")
+        log.info("使用采样率: %s Hz, CHUNK: %s", self.RATE, self.CHUNK)
         self.stream = self.audio.open(
             format=self.FORMAT,
             channels=self.CHANNELS,
@@ -165,7 +156,7 @@ class MumbleRadioClient:
         self.pygame_initialized = False
         try:
             with self.pygame_lock:
-                print("[DEBUG] 开始初始化 pygame 子系统")
+                log.debug("开始初始化 pygame 子系统")
                 if not pygame.get_init():
                     pygame.init()
                 if not pygame.display.get_init():
@@ -173,15 +164,15 @@ class MumbleRadioClient:
                 if not pygame.joystick.get_init():
                     pygame.joystick.init()
                 self.pygame_initialized = True
-                print(f"[DEBUG] pygame初始化完成，检测到 {pygame.joystick.get_count()} 个摇杆")
+                log.debug("pygame初始化完成，检测到 %d 个摇杆", pygame.joystick.get_count())
                 
                 self.joystick = None
                 if pygame.joystick.get_count() > 0:
                     self.joystick = pygame.joystick.Joystick(0)
                     self.joystick.init()
-                    print(f"[DEBUG] 摇杆初始化完成: {self.joystick.get_name()}")
+                    log.debug("摇杆初始化完成: %s", self.joystick.get_name())
         except Exception as e:
-            print(f"[DEBUG] 摇杆初始化失败: {e}")
+            log.debug("摇杆初始化失败: %s", e)
             self.pygame_initialized = False
             self.joystick = None
 
@@ -219,10 +210,10 @@ class MumbleRadioClient:
                 if not output_ok:
                     output_ok = _test_rate(rate, None, False)
             if input_ok and output_ok:
-                print(f"[Audio] 使用采样率: {rate} Hz")
+                log.info("使用采样率: %s Hz", rate)
                 return rate
 
-        print(f"[Audio] 所有候选采样率均失败，使用 48000 Hz")
+        log.info("所有候选采样率均失败，使用 48000 Hz")
         return 48000
 
     def convert_frequency(self, frequency):
@@ -238,10 +229,10 @@ class MumbleRadioClient:
         """由外部（gui.py 回调）调用，设置独立连接标记。"""
         if connected:
             self._connection_established.set()
-            print(f"[连接标记] 已设为 True | thread_alive={self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A'}")
+            log.info("连接标记已设为 True | thread_alive=%s", self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A')
         else:
             self._connection_established.clear()
-            print(f"[连接标记] 已设为 False")
+            log.info("连接标记已设为 False")
 
     def _find_channel(self, name):
         try:
@@ -311,41 +302,43 @@ class MumbleRadioClient:
         CHANNEL_TIMEOUT，不会像以前那样把调用线程永久挂住。
         """
         channel_name = self.get_channel_name(frequency)
-        print(f"[频道切换] {caller}: 尝试切换到 {channel_name} (频率 {frequency:.3f} MHz)"
-              f" | myself={'有' if self.mumble.users.myself else '无'}"
-              f" | 线程存活={self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A'}")
+        log.info("频道切换 %s: 尝试切换到 %s (频率 %.3f MHz) | myself=%s | 线程存活=%s",
+                 caller, channel_name, frequency,
+                 '有' if self.mumble.users.myself else '无',
+                 self.mumble.is_alive() if hasattr(self.mumble, 'is_alive') else 'N/A')
         with self._channel_lock:
             try:
                 channel = self._find_channel(channel_name)
                 if channel is None:
-                    print(f"[频道切换] 频道 {channel_name} 不存在，尝试创建临时频道...")
+                    log.info("频道切换 频道 %s 不存在，尝试创建临时频道...", channel_name)
                     self._create_channel(channel_name)
                     channel = self._wait_for_channel(channel_name)
                 if channel is None:
-                    print(f"[频道切换] 建立频道 {channel_name} 后 "
-                          f"{CHANNEL_TIMEOUT:.0f} 秒内没有出现，放弃这一次")
+                    log.warning("频道切换 建立频道 %s 后 %.0f 秒内没有出现，放弃这一次",
+                                channel_name, CHANNEL_TIMEOUT)
                     return False
 
                 if not self.mumble.users.myself:
-                    print(f"[频道切换] self.mumble.users.myself 为 None，无法获取当前频道，跳过切换")
+                    log.info("频道切换 self.mumble.users.myself 为 None，无法获取当前频道，跳过切换")
                     return False
                 current_id = self.mumble.users.myself["channel_id"]
                 if current_id == channel["channel_id"]:
-                    print(f"[频道切换] 已在目标频道 {channel_name} 中，无需切换")
+                    log.info("频道切换 已在目标频道 %s 中，无需切换", channel_name)
                     self.current_channel = channel["channel_id"]
                     return True
-                print(f"[频道切换] 当前频道 ID={current_id}，目标频道 ID={channel['channel_id']}，开始 move_in...")
+                log.info("频道切换 当前频道 ID=%s，目标频道 ID=%s，开始进入...",
+                         current_id, channel['channel_id'])
                 self._move_in(channel["channel_id"])
                 # 命令是异步的，确认真的进去了再记账
                 if not self._wait_until_in(channel["channel_id"]):
-                    print(f"[频道切换] ⚠️ 发出了进入 {channel_name} 的请求，但 "
-                          f"{CHANNEL_TIMEOUT:.0f} 秒内没有生效，稍后重试")
+                    log.warning("频道切换 发出了进入 %s 的请求，但 %.0f 秒内没有生效，稍后重试",
+                                channel_name, CHANNEL_TIMEOUT)
                     return False
                 self.current_channel = channel["channel_id"]
-                print(f"[频道切换] ✅ 成功切换到 {channel_name} (频率 {frequency:.3f} MHz)")
+                log.info("成功切换到 %s (频率 %.3f MHz)", channel_name, frequency)
                 return True
             except Exception as e:
-                print(f"[频道切换] ❌ 切换失败: {type(e).__name__}: {e}")
+                log.warning("频道切换 失败: %s: %s", type(e).__name__, e)
                 return False
 
 
@@ -368,23 +361,23 @@ class MumbleRadioClient:
         """确保用户在正确的频道中，如果不在则重新加入"""
         try:
             if not self._connection_established.is_set():
-                print(f"[频道检查] 未连接，跳过")
+                log.info("频道检查 未连接，跳过")
                 return
             if not self.mumble.users.myself:
-                print(f"[频道检查] myself 尚未就绪，跳过")
+                log.info("频道检查 myself 尚未就绪，跳过")
                 return
             channel_name = self.get_channel_name(frequency)
             current_channel_id = self.mumble.users.myself["channel_id"]
-            print(f"[频道检查] 当前channel_id={current_channel_id!r}, 目标={channel_name}")
+            log.info("频道检查 当前channel_id=%r, 目标=%s", current_channel_id, channel_name)
 
             # channel_id=0 => Root 频道，必须重新加入
             if current_channel_id == 0:
-                print(f"[频道检查] ⚠️ 用户处于 Root 频道! 重新加入 {channel_name}")
+                log.info("频道检查 用户处于 Root 频道! 重新加入 %s", channel_name)
                 self.switch_channel(frequency, caller="频道检查-Root")
                 return
 
             if current_channel_id is None:
-                print(f"[频道检查] 未加入任何频道，重新加入 {channel_name}")
+                log.info("频道检查 未加入任何频道，重新加入 %s", channel_name)
                 self.switch_channel(frequency, caller="频道检查-无频道")
                 return
 
@@ -392,17 +385,15 @@ class MumbleRadioClient:
                 current_channel = self.mumble.channels[current_channel_id]
                 current_name = current_channel["name"]
                 if current_name != channel_name:
-                    print(f"[频道检查] 频道不匹配 ({current_name} -> {channel_name})，重新加入")
+                    log.info("频道检查 频道不匹配 (%s -> %s)，重新加入", current_name, channel_name)
                     self.switch_channel(frequency, caller="频道检查-不匹配")
                 else:
-                    print(f"[频道检查] ✅ 频道匹配 ({current_name})")
+                    log.info("频道检查 频道匹配 (%s)", current_name)
             except (KeyError, Exception) as e:
-                print(f"[频道检查] 频道 ID {current_channel_id} 无效 ({e})，重新加入 {channel_name}")
+                log.info("频道检查 频道 ID %s 无效 (%s)，重新加入 %s", current_channel_id, e, channel_name)
                 self.switch_channel(frequency, caller="频道检查-ID无效")
         except Exception as e:
-            import traceback
-            print(f"[频道检查] 错误: {e}")
-            traceback.print_exc()
+            log.error("频道检查 错误: %s", e, exc_info=True)
 
     def monitor_frequency(self):
         """监控COM1频率变化和连接/频道状态"""
@@ -435,20 +426,27 @@ class MumbleRadioClient:
                     except:
                         chan_name = "<无效ID>"
 
-                print(f"[监控 T{tick}] 连接标记={mumble_connected}"
-                      f" | pymumble.connected={pymumble_connected_raw}"
-                      f" | thread_alive={thread_alive}"
-                      f" | channel_id={my_channel_id}"
-                      f" | channel_name={chan_name!r}"
-                      f" | ping_ago={ping_ago:.1f}s"
-                      f"{' ⚠️线程死亡' if not thread_alive else ''}"
-                      f"{' ⚠️超时' if ping_timeout else ''}")
+                log.info("监控 T%d 连接标记=%s"
+                      " | pymumble.connected=%s"
+                      " | thread_alive=%s"
+                      " | channel_id=%s"
+                      " | channel_name=%r"
+                      " | ping_ago=%.1fs"
+                      "%s%s",
+                      tick, mumble_connected,
+                      pymumble_connected_raw,
+                      thread_alive,
+                      my_channel_id,
+                      chan_name,
+                      ping_ago,
+                      ' ⚠️线程死亡' if not thread_alive else '',
+                      ' ⚠️超时' if ping_timeout else '')
 
                 # ★ 不再根据 thread_alive 主动标记断连！仅记录日志供诊断
                 # 连接状态变化由回调管理，通知 UI
                 if mumble_connected != last_connected:
                     last_connected = mumble_connected
-                    print(f"[监控 T{tick}] 连接状态变化: {not mumble_connected} -> {mumble_connected}")
+                    log.info("监控 T%d 连接状态变化: %s -> %s", tick, not mumble_connected, mumble_connected)
                     if self.on_connection_change:
                         self.on_connection_change(mumble_connected)
 
@@ -457,31 +455,29 @@ class MumbleRadioClient:
                     if com1_active is not None:
                         freq_read_fail_count = 0
                         if com1_active != last_frequency:
-                            print(f"[监控 T{tick}] 频率变化: {last_frequency} -> {com1_active}")
+                            log.info("监控 T%d 频率变化: %s -> %s", tick, last_frequency, com1_active)
                             self.switch_channel(com1_active, caller=f"监控-T{tick}-变")
                             last_frequency = com1_active
                         else:
                             self._ensure_in_correct_channel(com1_active)
                     else:
                         freq_read_fail_count += 1
-                        print(f"[监控 T{tick}] ⚠️ 读频率返回 None (连续{freq_read_fail_count}次)")
+                        log.info("监控 T%d 读频率返回 None (连续%d次)", tick, freq_read_fail_count)
                         if last_frequency is not None:
-                            print(f"[监控 T{tick}] 用 last_frequency={last_frequency} 做频道检查")
+                            log.info("监控 T%d 用 last_frequency=%s 做频道检查", tick, last_frequency)
                             self._ensure_in_correct_channel(last_frequency)
                         else:
-                            print(f"[监控 T{tick}] 无 last_frequency 可用，跳过频道检查")
+                            log.info("监控 T%d 无 last_frequency 可用，跳过频道检查", tick)
 
                     if not channel_switch_attempted and last_frequency is not None:
                         channel_switch_attempted = True
-                        print(f"[监控 T{tick}] 首次连接后的频道切换已完成")
+                        log.info("监控 T%d 首次连接后的频道切换已完成", tick)
                 else:
-                    print(f"[监控 T{tick}] 未连接，跳过频率读取")
+                    log.info("监控 T%d 未连接，跳过频率读取", tick)
 
             except Exception as e:
-                import traceback
                 if self.running:
-                    print(f"[监控 T{tick}] 错误: {e}")
-                    traceback.print_exc()
+                    log.error("监控 T%d 错误: %s", tick, e, exc_info=True)
             time.sleep(1)
     
     def update_volumes(self):
@@ -497,14 +493,14 @@ class MumbleRadioClient:
                     return (np.frombuffer(audio_data, dtype=np.int16) * volume_scale).astype(np.int16).tobytes()
                 self.audio_processor = volume_modifier
         except Exception as e:
-            print(f"更新音量设置时出错: {e}")
+            log.error("更新音量设置时出错: %s", e)
 
     def ensure_pygame_initialized(self):
         """确保pygame在当前线程中正确初始化"""
         with self.pygame_lock:
             try:
                 if not pygame.get_init():
-                    print("[DEBUG] 重新初始化pygame")
+                    log.debug("重新初始化pygame")
                     pygame.init()
                 if not pygame.display.get_init():
                     pygame.display.init()
@@ -515,15 +511,15 @@ class MumbleRadioClient:
                     if not self.joystick or not self.joystick.get_init():
                         self.joystick = pygame.joystick.Joystick(0)
                         self.joystick.init()
-                        print(f"[DEBUG] 摇杆重新初始化: {self.joystick.get_name()}")
+                        log.debug("摇杆重新初始化: %s", self.joystick.get_name())
                 return True
             except Exception as e:
-                print(f"[DEBUG] pygame重新初始化失败: {e}")
+                log.debug("pygame重新初始化失败: %s", e)
                 return False
 
     def reinitialize_joystick(self):
         """重新初始化摇杆"""
-        print("[DEBUG] 尝试重新初始化摇杆")
+        log.debug("尝试重新初始化摇杆")
         with self.pygame_lock:
             try:
                 # 关闭现有摇杆
@@ -546,15 +542,15 @@ class MumbleRadioClient:
                 if pygame.joystick.get_count() > 0:
                     self.joystick = pygame.joystick.Joystick(0)
                     self.joystick.init()
-                    print(f"[DEBUG] 摇杆重新初始化成功: {self.joystick.get_name()}")
+                    log.debug("摇杆重新初始化成功: %s", self.joystick.get_name())
                     return True
             except Exception as e:
-                print(f"[DEBUG] 摇杆重新初始化失败: {e}")
+                log.debug("摇杆重新初始化失败: %s", e)
                 return False
 
     def handle_voice(self):
         """处理按键说话功能"""
-        print("[DEBUG] 开始语音处理线程")
+        log.debug("开始语音处理线程")
         self.ensure_pygame_initialized()
         last_ptt_state = False
         
@@ -580,13 +576,13 @@ class MumbleRadioClient:
                                 self.settings.joystick_ptt < self.joystick.get_numbuttons()):
                                 joystick_ptt = self.joystick.get_button(self.settings.joystick_ptt)
                     except Exception as e:
-                        print(f"[DEBUG] 摇杆读取错误: {e}")
+                        log.debug("摇杆读取错误: %s", e)
                 
                 is_speaking = keyboard_ptt or joystick_ptt
                 
                 # 状态改变时更新和打印
                 if is_speaking != last_ptt_state:
-                    print(f"[DEBUG] PTT状态改变: {is_speaking} (键盘: {keyboard_ptt}, 摇杆: {joystick_ptt})")
+                    log.debug("PTT状态改变: %s (键盘: %s, 摇杆: %s)", is_speaking, keyboard_ptt, joystick_ptt)
                     last_ptt_state = is_speaking
                     self.is_talking = is_speaking
                     if self.on_ptt_change:
@@ -595,24 +591,24 @@ class MumbleRadioClient:
                 # 如果PTT被按下，检查是否可以发送音频
                 if self.is_talking:
                     if not self.stream or not self.mumble:
-                        print("[DEBUG] 音频发送失败：设备未就绪")
+                        log.debug("音频发送失败：设备未就绪")
                         time.sleep(0.05)
                         continue
                     
                     try:
                         # ★ 先检查独立连接标记（比 mumble.connected 更可靠）
                         if not self._connection_established.is_set():
-                            print("[DEBUG] 连接标记已清除，跳过音频发送")
+                            log.debug("连接标记已清除，跳过音频发送")
                             time.sleep(0.05)
                             continue
 
                         if not self.mumble.connected > 0:
-                            print("[DEBUG] Mumble未连接")
+                            log.debug("Mumble未连接")
                             time.sleep(0.05)
                             continue
                             
                         if not self.mumble.channels:
-                            print("[DEBUG] Mumble频道列表为空")
+                            log.debug("Mumble频道列表为空")
                             time.sleep(0.05)
                             continue
                             
@@ -620,11 +616,11 @@ class MumbleRadioClient:
                         # not 会把"在根频道"当成"没进频道"，PTT 于是一声不吭
                         # 地什么都不做
                         if not self.mumble.users.myself:
-                            print("[DEBUG] 服务器还没回报我们自己的用户信息")
+                            log.debug("服务器还没回报我们自己的用户信息")
                             time.sleep(0.05)
                             continue
                         if self.mumble.users.myself["channel_id"] is None:
-                            print("[DEBUG] 未加入任何频道")
+                            log.debug("未加入任何频道")
                             time.sleep(0.05)
                             continue
                         if self.mumble.users.myself["channel_id"] == ROOT_CHANNEL:
@@ -632,7 +628,7 @@ class MumbleRadioClient:
                             # 成功。这里不能附带判断 current_channel——掉线重连
                             # 之后它停在旧值，条件不成立，话音就真的被发进根频
                             # 道：自己频率上没人听得到，根频道里的人全听见了
-                            print("[DEBUG] 还留在根频道（频率频道没切成功），发出去没人听得到")
+                            log.warning("还留在根频道（频率频道没切成功），发出去没人听得到")
                             time.sleep(0.05)
                             continue
 
@@ -641,16 +637,16 @@ class MumbleRadioClient:
                             audio_data = np.frombuffer(data, dtype=np.int16)
                             audio_data = (audio_data * (self.settings.mic_volume / 100.0)).astype(np.int16)
                             if not any(audio_data):
-                                print("[DEBUG] 检测到静音数据")
+                                log.debug("检测到静音数据")
                             else:
                                 self.mumble.sound_output.add_sound(audio_data.tobytes())
                                 
                     except Exception as e:
-                        print(f"[DEBUG] 音频处理错误: {e}")
+                        log.debug("音频处理错误: %s", e)
                 
                 time.sleep(0.01)
             except Exception as e:
-                print(f"[DEBUG] 语音处理错误: {e}")
+                log.debug("语音处理错误: %s", e)
                 time.sleep(0.1)
 
     def handle_incoming_audio(self, user, soundchunk):
@@ -671,14 +667,14 @@ class MumbleRadioClient:
                 audio_data = (audio_data * (self.settings.speaker_volume / 100.0)).astype(np.int16)
                 self._safe_stream_write(audio_data.tobytes())
             except Exception as e:
-                print(f"音频输出错误: {e}")
+                log.error("音频输出错误: %s", e)
 
     def _safe_stream_read(self, chunk):
         """线程安全地读取音频流，处理流被外部关闭的竞态。"""
         try:
             return self.stream.read(chunk, exception_on_overflow=False)
         except (OSError, IOError, Exception) as e:
-            print(f"[DEBUG] 音频流读取错误（可能已被重初始化）: {e}")
+            log.debug("音频流读取错误（可能已被重初始化）: %s", e)
             return None
 
     def _safe_stream_write(self, data):
@@ -686,7 +682,7 @@ class MumbleRadioClient:
         try:
             self.output_stream.write(data)
         except (OSError, IOError, Exception) as e:
-            print(f"[DEBUG] 音频流写入错误（可能已被重初始化）: {e}")
+            log.debug("音频流写入错误（可能已被重初始化）: %s", e)
 
     def reinitialize_audio(self):
         """重新初始化音频设备"""
@@ -702,7 +698,7 @@ class MumbleRadioClient:
             # 重新检测采样率（设备可能已更改）
             self.RATE = self._find_best_sample_rate()
             self.CHUNK = int(self.RATE * 0.02)
-            print(f"[Audio] 重新初始化使用采样率: {self.RATE} Hz, CHUNK: {self.CHUNK}")
+            log.info("重新初始化使用采样率: %s Hz, CHUNK: %s", self.RATE, self.CHUNK)
 
             # 重新创建音频流
             self.stream = self.audio.open(
@@ -724,9 +720,9 @@ class MumbleRadioClient:
             
             # 更新音量设置
             self.update_volumes()
-            print("音频设备重新初始化完成")
+            log.info("音频设备重新初始化完成")
         except Exception as e:
-            print(f"重新初始化音频设备失败: {e}")
+            log.error("重新初始化音频设备失败: %s", e)
             raise
 
     def show_settings(self):
@@ -803,7 +799,7 @@ class MumbleRadioClient:
             pygame.quit()
                 
         except Exception as e:
-            print(f"清理资源时出错: {e}")
+            log.error("清理资源时出错: %s", e)
             pass  # 确保清理过程中的错误不会影响程序
 
 
@@ -813,13 +809,13 @@ if __name__ == "__main__":
         client = MumbleRadioClient(SERVER_HOST, USERNAME, PASSWORD)
         client.run()
     except KeyboardInterrupt:
-        print("\n程序被用户中断")
+        log.info("程序被用户中断")
     except Exception as e:
-        print(f"\n程序发生错误: {e}")
+        log.error("程序发生错误: %s", e)
     finally:
         if client:
             client.cleanup()
-        print("\n按回车键退出...")
+        log.info("按回车键退出...")
         try:
             input()
         except:
