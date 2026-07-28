@@ -1262,5 +1262,87 @@ class WeatherFetchTest(unittest.TestCase):
             weather.fetch_metar("ZS")
 
 
+class WeatherRetryTest(unittest.TestCase):
+    """气象源在 CDN 后面，偶发一次连接/TLS 抖动不该让席位整整 5 分钟没天气。
+
+    实测遇到过一次 `CERTIFICATE_VERIFY_FAILED: certificate has expired`，而
+    服务器证书本身是好的（有效期还有两个月），几分钟后自己就恢复了。
+    """
+
+    def setUp(self):
+        self._delay = weather.RETRY_DELAY
+        weather.RETRY_DELAY = 0.0        # 测试里不真的等
+        self.calls = []
+
+    def tearDown(self):
+        weather.RETRY_DELAY = self._delay
+
+    def urlopen(self, *outcomes):
+        """按 outcomes 依次应答：异常就抛，字符串就当成报文返回。"""
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body.encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake(request, timeout=None):
+            self.calls.append(request.full_url)
+            outcome = outcomes[min(len(self.calls) - 1, len(outcomes) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return Response(outcome)
+        return fake
+
+    def test_a_transient_failure_is_retried_and_succeeds(self):
+        from unittest import mock
+        blip = OSError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate has expired")
+        with mock.patch("urllib.request.urlopen", self.urlopen(blip, ZSPD)):
+            self.assertEqual(weather.fetch_metar("ZSPD"), ZSPD)
+        self.assertEqual(len(self.calls), 2, "第一次失败之后应当再试一次")
+
+    def test_it_gives_up_after_the_retries(self):
+        from unittest import mock
+        blip = OSError("boom")
+        with mock.patch("urllib.request.urlopen", self.urlopen(blip)):
+            with self.assertRaises(weather.WeatherError):
+                weather.fetch_metar("ZSPD")
+        self.assertEqual(len(self.calls), weather.RETRIES + 1,
+                         "不能无限重试，那会把气象源打死")
+
+    def test_a_bad_icao_is_not_retried(self):
+        from unittest import mock
+        with mock.patch("urllib.request.urlopen", self.urlopen(ZSPD)):
+            with self.assertRaises(weather.WeatherError):
+                weather.fetch_metar("ZS")
+        self.assertEqual(self.calls, [], "ICAO 写错了，重试多少遍都一样")
+
+    def test_certificate_failures_say_what_to_check(self):
+        """原文只会让人以为服务器坏了，实际能动的是本机时间和根证书。"""
+        from unittest import mock
+        blip = OSError("<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] "
+                       "certificate verify failed: certificate has expired>")
+        with mock.patch("urllib.request.urlopen", self.urlopen(blip)):
+            with self.assertRaises(weather.WeatherError) as caught:
+                weather.fetch_metar("ZSPD")
+        message = str(caught.exception)
+        self.assertIn("ZSPD", message)
+        self.assertIn("本机时间", message)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", message, "原文也要留着")
+
+    def test_the_url_is_the_configured_one(self):
+        from unittest import mock
+        with mock.patch("urllib.request.urlopen", self.urlopen(ZSPD)):
+            weather.fetch_metar("ZSPD", "https://例子/q?id=")
+        self.assertEqual(self.calls, ["https://例子/q?id=ZSPD"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

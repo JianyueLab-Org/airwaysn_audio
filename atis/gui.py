@@ -229,6 +229,7 @@ class AtisWindow(QMainWindow):
         self.fsd_clients = {}           # callsign -> FSDClient（网络在线与文字通播）
         self.metars = {}                # callsign -> Metar
         self.raw_metars = {}            # callsign -> 原始电码，用来判断变没变
+        self._weather_errors = {}       # callsign -> 还没恢复的取天气错误
 
         self.signals = AtisSignals()
         self.signals.state.connect(self.on_broadcast_state)
@@ -533,8 +534,12 @@ class AtisWindow(QMainWindow):
                     raw = weather.fetch_metar(icao, url)
                 signals.metar.emit(callsign, metar_module.Metar(raw), "")
             except weather.WeatherError as e:
+                # 这条以前只进状态栏。打包是 console=False，用户报"取不到天气"
+                # 时手里什么都没有，只能截图状态栏——日志里必须留一份
+                log.warning("%s 取天气失败: %s", callsign, e)
                 signals.metar.emit(callsign, None, str(e))
             except Exception as e:
+                log.warning("%s 取天气出错: %s", callsign, e, exc_info=True)
                 signals.metar.emit(callsign, None, f"取天气出错: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -557,19 +562,35 @@ class AtisWindow(QMainWindow):
         if not station:
             return
         if error or parsed is None:
-            self.status_label.setText(error or '没有取到天气')
+            message = error or '没有取到天气'
+            self._weather_errors[callsign] = message
+            self.status_label.setText(message)
             return
+
+        # 这个席位取到了：把它之前那条错误撤掉。不撤的话，一次抖动留下的报错
+        # 会一直挂在状态栏上——后面每次成功刷新都是静默的，没有谁会去改写它，
+        # 于是天气早就正常了，界面还在喊失败。
+        recovered = self._weather_errors.pop(callsign, None)
 
         changed = self.raw_metars.get(callsign) not in (None, parsed.raw)
         first = callsign not in self.raw_metars
         self.raw_metars[callsign] = parsed.raw
         self.metars[callsign] = parsed
 
+        note = ''
         if changed:
             # 报文变了就换一格情报字母，这是 ATIS 的基本约定
             station.advance_letter()
             self.profile.save()
-            self.status_label.setText(f'{callsign} 天气更新，情报字母推进到 {station.letter}')
+            note = f'{callsign} 天气更新，情报字母推进到 {station.letter}'
+        elif recovered:
+            note = f'{callsign} 天气已恢复'
+
+        # 还没恢复的错误优先于流水账。反过来的话，一个席位取不到天气这件事会
+        # 被另一个席位的"天气更新"盖掉，再也没人看得见。
+        outstanding = next(iter(self._weather_errors.values()), None)
+        if outstanding or note:
+            self.status_label.setText(outstanding or note)
 
         if station is self.current_station():
             self.metar_label.setText(f'METAR: {parsed.raw}')

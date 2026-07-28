@@ -110,6 +110,40 @@ def main():
 
     check("手动推进字母", lambda: window.advance_letter())
 
+    print("取天气失败：")
+
+    def failure_shows_up():
+        import metar as metar_module
+        station = window.current_station()
+        window.on_metar(station.callsign, None,
+                        "取 ZSPD 的 METAR 失败: 证书校验没过")
+        assert "失败" in window.status_label.text(), window.status_label.text()
+    check("失败会显示出来", failure_shows_up)
+
+    def recovery_clears_the_stale_error():
+        """一次抖动留下的报错不能一直挂着。
+
+        取天气成功是静默的（只有报文变了才写状态栏），所以没有谁会去改写它，
+        天气早就正常了界面还在喊失败——用户只能截图状态栏来问。
+        """
+        import metar as metar_module
+        station = window.current_station()
+        # 喂一份和上次一样的报文：这一路是完全静默的，最容易漏
+        window.on_metar(station.callsign,
+                        metar_module.Metar(window.raw_metars[station.callsign]), "")
+        assert "失败" not in window.status_label.text(), window.status_label.text()
+    check("恢复之后撤掉旧报错", recovery_clears_the_stale_error)
+
+    def other_stations_errors_survive():
+        """两个席位各自失败，好了一个不该把另一个的错误也抹掉。"""
+        import metar as metar_module
+        first, second = list(window.profile)[0], list(window.profile)[1]
+        window.on_metar(first.callsign, None, f"取 {first.callsign} 失败")
+        window.on_metar(second.callsign, None, f"取 {second.callsign} 失败")
+        window.on_metar(first.callsign, metar_module.Metar(ZSPD), "")
+        assert second.callsign in window.status_label.text(), window.status_label.text()
+    check("只撤掉自己的那条", other_stations_errors_survive)
+
     print("中文语音：")
 
     def chinese_script_is_generated():
