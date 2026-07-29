@@ -33,6 +33,11 @@ concurrency:
 
 env:
   SERIES: "2.0"          # 自动递增只在这个系列里进行
+  # runner 的 stdout 默认是 cp1252，而这个仓库的日志和 print 全是中文——
+  # server/login.py 的 print(f"认证用户: {name}")、version.freeze() 的
+  # print(f"版本 …")，都会直接 UnicodeEncodeError。测试那边表现为十几个用例
+  # 一起挂、看着像认证逻辑坏了；打包那边表现为 spec 执行到一半退出。
+  PYTHONUTF8: '1'
 
 jobs:
   version:
@@ -76,6 +81,14 @@ jobs:
       - name: 单元测试
         shell: pwsh
         run: |
+          # opuslib 是运行时用 ctypes 加载 opus 的。组件目录里各自带了一份
+          # opus.dll，但那不在 DLL 搜索路径上，CI 上 find_library 也找不到系统
+          # 的——client / xplane_client / server\ATIS 的测试会在收集阶段就
+          # "Could not find Opus library" 整个模块失败。pyogg 的 wheel 里带着
+          # Windows 版的，指给它。
+          $pyogg = python -c "import os, pyogg; print(os.path.dirname(pyogg.__file__))"
+          $env:PATH = "$pyogg;$env:PATH"
+
           $dirs = @("atis", "client", "controller", "msfs", "server",
                     "server/ATIS", "xpc", "xplane_client")
           $failed = @()
@@ -94,6 +107,9 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen   # CI 上没有显示器
         run: |
+          $pyogg = python -c "import os, pyogg; print(os.path.dirname(pyogg.__file__))"
+          $env:PATH = "$pyogg;$env:PATH"
+
           foreach ($d in @("atis", "controller", "client", "msfs", "xpc", "xplane_client")) {
             Write-Output "::group::$d smoke"
             Push-Location $d
