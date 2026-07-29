@@ -33,6 +33,7 @@ from pymumble_py3.constants import (
 
 import mumblecompat
 import radiostack
+from i18n import t
 
 # pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
 # 否则连接线程一起来就抛 AttributeError
@@ -43,16 +44,15 @@ log = logging.getLogger("语音")
 # Mumble 服务器拒绝时给的类型，逐条翻译成人能看懂的原因。
 # 全都笼统说成"用户名或密码"会把人引到错误的方向——比如认证器挂了的时候，
 # 用户会一直去改密码。
-REJECT_REASONS = {
-    "WrongUserPW": "密码错误",
-    "WrongServerPW": "服务器密码错误",
-    "InvalidUsername": "用户名不符合服务器的规则",
-    "UsernameInUse": "这个用户名已经在线了",
-    "ServerFull": "服务器已满",
-    "NoCertificate": "服务器要求证书",
-    "AuthenticatorFail": "服务端认证器故障（服务器上的 login.py 可能没在运行）",
-    "WrongVersion": "客户端版本不被服务器接受",
-}
+# 服务器认得的 Reject 类型。文字在 i18n 里，这里只留类型名——**取的时候才翻**，
+# 否则模块导入时语言还没定，永远是默认语言。
+REJECT_TYPES = ("WrongUserPW", "WrongServerPW", "InvalidUsername", "UsernameInUse",
+                "ServerFull", "NoCertificate", "AuthenticatorFail", "WrongVersion")
+
+
+def reject_reason(reject_type):
+    """把服务器给的拒绝类型翻成人能看懂的话，不认识就返回 None。"""
+    return t(f"reject.{reject_type}") if reject_type in REJECT_TYPES else None
 
 class RejectAwareMumble(pymumble.Mumble):
     """截下服务器的 Reject 消息，把拒绝类型留下来。
@@ -85,9 +85,9 @@ class RejectAwareMumble(pymumble.Mumble):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
         if not self.reject_type and not self.reject_reason:
             return None
-        reason = REJECT_REASONS.get(self.reject_type)
+        reason = reject_reason(self.reject_type)
         if reason and self.reject_reason:
-            return f"{reason}（服务器附言：{self.reject_reason}）"
+            return t("reject.with_note", reason=reason, note=self.reject_reason)
         if reason:
             return reason
         if self.reject_reason:
@@ -168,6 +168,9 @@ class VoiceClient:
         # sound_output.target 是全局的一个字段，PTT 和交叉耦合都要改，
         # 不串起来的话话音会发到错误的频率上
         self._audio_lock = threading.Lock()
+        # 电台栈每变一次界面就新起一个线程调 sync，而 sync 会阻塞好几秒，
+        # 两个同时推会把监听列表和发话目标写乱
+        self._sync_lock = threading.Lock()
         self._volumes = {}               # frequency_khz -> 0-100
         self._last_rx = {}               # frequency_khz -> 最后收到话音的时间
 
@@ -175,6 +178,7 @@ class VoiceClient:
         self._rx_monitor = None
         self._connection_thread = None
         self._last_connected = False
+        self._stack = None               # 最近一次 sync 用的电台栈，重连后重推
         self._last_ping_rcv = time.time()
 
     # ---------- 状态回报 ----------
@@ -189,7 +193,7 @@ class VoiceClient:
     # ---------- 连接 ----------
     def connect(self):
         """阻塞式连接。成功返回 True。"""
-        self._state('connecting', f"正在以 {self.cid} 连接 {self.server} …")
+        self._state('connecting', t("voice.connecting", cid=self.cid, server=self.server))
         try:
             self.audio = pyaudio.PyAudio()
             self.RATE = self._find_best_sample_rate()
@@ -205,7 +209,7 @@ class VoiceClient:
                                                self._on_permission_denied)
             self.mumble.start()
         except Exception as e:
-            self._state('error', f"连接失败: {e}")
+            self._state('error', t("voice.connect_failed", error=e))
             return False
 
         deadline = time.time() + CONNECT_TIMEOUT
@@ -214,22 +218,22 @@ class VoiceClient:
                 # 线程死了说明服务器主动拒绝了，把真实原因说出来
                 reason = self.mumble.rejection()
                 self._state('error',
-                            f"语音服务器拒绝了 {self.cid}：{reason}" if reason else
-                            f"到 {self.server} 的连接意外中断，"
-                            f"服务器没有说明原因（详见日志）")
+                            t("voice.rejected", cid=self.cid, reason=reason) if reason
+                            else t("voice.rejected_plain", server=self.server))
                 return False
             time.sleep(0.1)
 
         if not self.connected:
             reason = self.mumble.rejection()
-            self._state('error', f"连接 {self.server} 超时" +
-                        (f"：{reason}" if reason else "，服务器没有响应"))
+            self._state('error',
+                        t("voice.timeout_reason", server=self.server, reason=reason)
+                        if reason else t("voice.no_response", server=self.server))
             return False
 
         try:
             self.setup_audio()
         except Exception as e:
-            self._state('error', f"音频设备打开失败: {e}")
+            self._state('error', t("voice.audio_failed", error=e))
             return False
 
         self.running = True
@@ -242,7 +246,7 @@ class VoiceClient:
         self._connection_thread = threading.Thread(target=self._connection_monitor, daemon=True)
         self._connection_thread.start()
 
-        self._state('online', f"已连接，账号 {self.cid}")
+        self._state('online', t("voice.online", cid=self.cid))
         if self.on_connection_change:
             self.on_connection_change(True)
         return True
@@ -252,7 +256,7 @@ class VoiceClient:
 
     def _on_disconnected(self):
         if self.running:
-            self._state('error', "与语音服务器的连接已断开")
+            self._state('error', t("voice.dropped"))
         self.connected = False
         if self.on_connection_change:
             self.on_connection_change(False)
@@ -279,15 +283,45 @@ class VoiceClient:
                     log.info(f"ping 超时 {time.time() - self._last_ping_rcv:.1f}s，判定断线")
 
                 if alive != self._last_connected:
+                    reconnected = alive and not self._last_connected
                     self._last_connected = alive
                     self.connected = alive
                     log.info(f"连接状态变化: {alive}")
                     if self.on_connection_change:
                         self.on_connection_change(alive)
+                    if reconnected:
+                        self._resync_after_reconnect()
             except Exception as e:
                 if self.running:
                     log.warning(f"连接监控出错: {e}")
             time.sleep(1)
+
+    def _resync_after_reconnect(self):
+        """重连之后把整个电台栈重新推一遍。
+
+        客户端是 reconnect=True 建的，掉线后 pymumble 自己会连回来——但服务器
+        把重连上来的用户放回**根频道**，而频道监听和 VoiceTarget 都是跟会话走的
+        注册，一起没了。这边只把界面上的灯点回绿色，就成了 CLAUDE.md 里写的那种
+        最糟的情况：显示一切正常，人却待在根频道，一个频率都收不到，PTT 也发不
+        出去。
+
+        本地缓存必须一并作废，光调 sync 是不够的：
+        - `_listening` 还记着断线前监听了哪些频道，diff 出来是空的，一条监听
+          消息都不会再发；
+        - `_sent_target` 会让发话目标的去重逻辑以为已经设好了；
+        - `_channel_ids` 里的频道号可能已经失效——临时频道空了就被服务器销毁，
+          再建回来是个新号。
+        """
+        log.info("重连成功，重新推送电台栈（频道、监听、发话目标都要重来）")
+        self._channel_ids.clear()
+        self._channel_to_khz.clear()
+        self._listening = set()
+        self._sent_target = None
+        self._xc_targets = {}
+        stack = self._stack
+        if stack is None:
+            return
+        threading.Thread(target=self.sync, args=(stack,), daemon=True).start()
 
     def _on_permission_denied(self, event):
         """服务器拒绝某个动作时说明白原因。
@@ -302,14 +336,12 @@ class VoiceClient:
         except Exception:
             kind = str(getattr(event, "type", "?"))
 
-        messages = {
-            "UserListenerLimit": "服务器限制了每个用户能监听的频道数，部分频率收不到",
-            "ChannelListenerLimit": "服务器限制了单个频道的监听人数，这个频率收不到",
-            "Permission": "没有权限（频道监听需要 Listen 权限）",
-        }
-        reason = messages.get(kind, f"服务器拒绝了操作: {kind}")
+        known = ("UserListenerLimit", "ChannelListenerLimit", "Permission")
+        reason = t(f"denied.{kind}") if kind in known else t("denied.other", kind=kind)
         if getattr(event, "reason", ""):
-            reason += f"（{event.reason}）"
+            # 括号也得跟着语言走，直接拼中文全角括号的话，英文界面上会冒出
+            # "Not permitted (…)（server said…）" 这种中英混排
+            reason = t("denied.with_note", reason=reason, note=event.reason)
         self._state('denied', reason)
 
     def disconnect(self):
@@ -337,7 +369,7 @@ class VoiceClient:
             except Exception as e:
                 log.warning(f"断开连接出错: {e}")
             self.mumble = None
-        self._state('stopped', "已断开")
+        self._state('stopped', t("voice.stopped"))
 
     # ---------- 音频设备 ----------
     def _find_best_sample_rate(self):
@@ -463,7 +495,22 @@ class VoiceClient:
         return channel_id
 
     def sync(self, stack):
-        """把电台栈的状态推到服务器：进主频道、监听其余 RX、设好 TX 目标。"""
+        """把电台栈的状态推到服务器：进主频道、监听其余 RX、设好 TX 目标。
+
+        串行执行。界面每改一次电台栈就新起一个线程调这里，而这个函数里
+        `_resolve_channel` 每个新频道最多要等 CHANNEL_TIMEOUT 秒，也就是说它会
+        活好几秒；两个 sync 交错着写 `_join` / 监听列表 / `_tx_channels`，最后
+        留下的组合可能跟任何一次栈状态都对不上。数据源那条 60 秒的定时器现在会
+        自己往栈里加频率，这种交错已经不需要用户点任何东西就会发生。
+
+        排队而不是丢弃：每一轮都重新读栈，所以后来的那次自然覆盖前面的结果。
+        """
+        # 记下来，重连之后要照着它重推一遍
+        self._stack = stack
+        with self._sync_lock:
+            self._sync(stack)
+
+    def _sync(self, stack):
         if not self.connected or not self.mumble:
             return
 

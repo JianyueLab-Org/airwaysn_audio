@@ -16,6 +16,8 @@ XC（cross couple，交叉耦合）指把这个频率和其它同样开了 XC �
 
 import logging
 
+from i18n import t
+
 log = logging.getLogger("电台栈")
 
 
@@ -23,13 +25,13 @@ def parse_frequency(text):
     """把 "118.000" 这样的频率解析成整数千赫（118000）。"""
     value = str(text).strip()
     if not value:
-        raise ValueError("频率不能为空")
+        raise ValueError(t("stack.freq_empty"))
     try:
         khz = int(round(float(value) * 1000))
     except (TypeError, ValueError):
-        raise ValueError(f"频率格式无效: {text}")
+        raise ValueError(t("stack.freq_bad", text=text))
     if not 100000 <= khz <= 199999:
-        raise ValueError(f"频率超出甚高频范围: {text}")
+        raise ValueError(t("stack.freq_range", text=text))
     return khz
 
 
@@ -142,7 +144,7 @@ class RadioStack:
         """加一部电台。频率重复时抛 ValueError。"""
         khz = parse_frequency(frequency) if not isinstance(frequency, int) else frequency
         if self.get(khz):
-            raise ValueError(f"{format_frequency(khz)} 已经在电台栈里了")
+            raise ValueError(t("stack.duplicate", frequency=format_frequency(khz)))
 
         radio = Radio(khz, callsign.strip().upper())
         self._radios.append(radio)

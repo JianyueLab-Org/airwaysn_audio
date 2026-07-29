@@ -9,6 +9,8 @@ from PyQt6.QtCore import Qt
 from pynput import keyboard
 
 import applog
+import i18n
+from i18n import t
 
 log = logging.getLogger("设置")
 
@@ -24,6 +26,10 @@ class Settings:
         self.last_username = ""
         # 电台栈：上次用的那组频率，下次启动接着用
         self.radios = []
+        # 窗口置顶。管制员多半把语音压在雷达/模拟器上面用，这个开关要能记住
+        self.always_on_top = False
+        # 界面语言。空字符串表示"还没选过"，第一次启动跟系统走
+        self.language = ""
         self.debug = False
         self.load_settings()
 
@@ -39,6 +45,8 @@ class Settings:
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
                     self.radios = data.get("radios", [])
+                    self.always_on_top = bool(data.get("always_on_top", False))
+                    self.language = data.get("language", "") or ""
                     self.debug = bool(data.get("debug", False))
         except Exception as e:
             log.warning(f"加载设置失败: {e}")
@@ -53,6 +61,8 @@ class Settings:
                 "output_device_index": self.output_device_index,
                 "last_username": self.last_username,
                 "radios": self.radios,
+                "always_on_top": self.always_on_top,
+                "language": self.language,
                 "debug": self.debug,
             }
             with open(self.config_file, "w", encoding="utf-8") as f:
@@ -65,7 +75,7 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("设置")
+        self.setWindowTitle(t("settings.title"))
         self.listening_for_key = False
         self.keyboard_listener = None
         self.setup_ui()
@@ -73,7 +83,7 @@ class SettingsDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout()
 
-        volume_label = QLabel("音量")
+        volume_label = QLabel(t("settings.volume"))
         volume_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(volume_label)
 
@@ -83,7 +93,7 @@ class SettingsDialog(QDialog):
         self.mic_slider.setValue(self.settings.mic_volume)
         self.mic_value = QLabel(f"{self.settings.mic_volume}%")
         self.mic_slider.valueChanged.connect(lambda v: self.mic_value.setText(f"{v}%"))
-        mic_layout.addWidget(QLabel("麦克风:"))
+        mic_layout.addWidget(QLabel(t("settings.mic")))
         mic_layout.addWidget(self.mic_slider)
         mic_layout.addWidget(self.mic_value)
         layout.addLayout(mic_layout)
@@ -94,7 +104,7 @@ class SettingsDialog(QDialog):
         self.speaker_slider.setValue(self.settings.speaker_volume)
         self.speaker_value = QLabel(f"{self.settings.speaker_volume}%")
         self.speaker_slider.valueChanged.connect(lambda v: self.speaker_value.setText(f"{v}%"))
-        speaker_layout.addWidget(QLabel("主音量:"))
+        speaker_layout.addWidget(QLabel(t("settings.speaker")))
         speaker_layout.addWidget(self.speaker_slider)
         speaker_layout.addWidget(self.speaker_value)
         layout.addLayout(speaker_layout)
@@ -102,43 +112,53 @@ class SettingsDialog(QDialog):
         ptt_layout = QHBoxLayout()
         self.ptt_input = QLineEdit(self.settings.ptt_key)
         self.ptt_input.setReadOnly(True)
-        self.ptt_reset_btn = QPushButton("重设")
+        self.ptt_reset_btn = QPushButton(t("settings.ptt_reset"))
         self.ptt_reset_btn.clicked.connect(self.start_key_capture)
-        ptt_layout.addWidget(QLabel("PTT 按键:"))
+        ptt_layout.addWidget(QLabel(t("settings.ptt_key")))
         ptt_layout.addWidget(self.ptt_input)
         ptt_layout.addWidget(self.ptt_reset_btn)
         layout.addLayout(ptt_layout)
 
+        language_layout = QHBoxLayout()
+        self.language_combo = QComboBox()
+        for code, name in i18n.available().items():
+            self.language_combo.addItem(name, code)
+        index = self.language_combo.findData(i18n.current())
+        if index >= 0:
+            self.language_combo.setCurrentIndex(index)
+        language_layout.addWidget(QLabel(t("settings.language")))
+        language_layout.addWidget(self.language_combo)
+        layout.addLayout(language_layout)
+
         input_layout = QHBoxLayout()
         self.input_combo = QComboBox()
         self.populate_audio_devices(self.input_combo, True)
-        input_layout.addWidget(QLabel("输入设备:"))
+        input_layout.addWidget(QLabel(t("settings.input")))
         input_layout.addWidget(self.input_combo)
         layout.addLayout(input_layout)
 
         output_layout = QHBoxLayout()
         self.output_combo = QComboBox()
         self.populate_audio_devices(self.output_combo, False)
-        output_layout.addWidget(QLabel("输出设备:"))
+        output_layout.addWidget(QLabel(t("settings.output")))
         output_layout.addWidget(self.output_combo)
         layout.addLayout(output_layout)
 
         # 日志：出问题时让用户能一键找到文件，而不是去解释路径
         log_layout = QHBoxLayout()
-        self.debug_checkbox = QCheckBox("记录调试信息（重启后生效）")
+        self.debug_checkbox = QCheckBox(t("settings.debug"))
         self.debug_checkbox.setChecked(self.settings.debug)
-        self.debug_checkbox.setToolTip(
-            "打开后会把协议细节也写进日志，排查连不上、听不到时用")
-        open_log = QPushButton("打开日志")
+        self.debug_checkbox.setToolTip(t("settings.debug_tip"))
+        open_log = QPushButton(t("settings.open_log"))
         open_log.clicked.connect(lambda: applog.open_log_folder())
         log_layout.addWidget(self.debug_checkbox)
         log_layout.addWidget(open_log)
         layout.addLayout(log_layout)
 
         button_layout = QHBoxLayout()
-        save_button = QPushButton("保存")
+        save_button = QPushButton(t("settings.save"))
         save_button.clicked.connect(self.save_and_close)
-        cancel_button = QPushButton("取消")
+        cancel_button = QPushButton(t("settings.cancel"))
         cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(save_button)
         button_layout.addWidget(cancel_button)
@@ -150,7 +170,7 @@ class SettingsDialog(QDialog):
     def populate_audio_devices(self, combo_box, is_input):
         import pyaudio
         p = pyaudio.PyAudio()
-        combo_box.addItem("系统默认", None)
+        combo_box.addItem(t("settings.system_default"), None)
         for i in range(p.get_device_count()):
             info = p.get_device_info_by_index(i)
             channels = 'maxInputChannels' if is_input else 'maxOutputChannels'
@@ -165,7 +185,7 @@ class SettingsDialog(QDialog):
 
     def start_key_capture(self):
         self.listening_for_key = True
-        self.ptt_input.setText("请按下按键...")
+        self.ptt_input.setText(t("settings.ptt_press"))
         self.ptt_reset_btn.setEnabled(False)
 
         def on_press(key):
@@ -200,5 +220,7 @@ class SettingsDialog(QDialog):
         self.settings.input_device_index = self.input_combo.currentData()
         self.settings.output_device_index = self.output_combo.currentData()
         self.settings.debug = self.debug_checkbox.isChecked()
+        self.settings.language = self.language_combo.currentData()
+        i18n.set_language(self.settings.language)
         self.settings.save_settings()
         self.accept()

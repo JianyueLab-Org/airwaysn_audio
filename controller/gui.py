@@ -2,6 +2,12 @@
 
 界面按 TrackAudio 的电台栈组织：一个席位可以同时加多个频率，每个频率一行，各自
 有 RX / TX / XC 开关和音量，按住 PTT 时对所有开了 TX 的频率一起发话。
+
+外观用 qfluentwidgets（Fluent / Win11 风格），深色主题——管制类工具基本都是深色，
+长时间盯着不累，而且频率行上的 RX/TX 高亮在深底上对比度更好。
+
+**颜色只在这里定义一次**（下面那组常量）。散在各处写死颜色的话，换主题时改不干净，
+留下几处和整体配色打架的绿字红字——这正是改造前的样子。
 """
 
 import logging
@@ -10,15 +16,23 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import Qt, QObject, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QObject, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QLineEdit,
-                             QStackedWidget, QFrame, QMessageBox, QSlider,
-                             QScrollArea, QSizePolicy)
+                             QHBoxLayout, QLabel, QLayout, QPushButton,
+                             QStackedWidget, QMessageBox)
 from pynput import keyboard
+from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
+                            InfoBar, InfoBarPosition, LineEdit, PasswordLineEdit,
+                            PrimaryPushButton, PushButton, ScrollArea, Slider,
+                            StrongBodyLabel, SubtitleLabel, Theme,
+                            TogglePushButton, TransparentToolButton,
+                            setTheme, setThemeColor)
 
 import applog
+import datafeed
+import i18n
+from i18n import t
 import radiostack
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
@@ -27,6 +41,50 @@ from voice import VoiceClient
 log = logging.getLogger("界面")
 
 SERVER = "hjdczy.top"
+
+# 数据源多久查一次：上了席位之后自动把频率捡回来，同时刷新 CID→呼号 对照表。
+# 席位不会秒变，60 秒足够及时，也不至于把数据源打太狠。
+DATAFEED_INTERVAL = 60
+# 顶部输入框的最大宽度。频率卡片是流式排布的，屏幕越宽一行放得越多（这点照
+# TrackAudio，不限宽），但输入框没必要跟着拉到一米长。
+INPUT_WIDTH = 340
+
+# ---------- 配色 ----------
+# 取自 TrackAudio（src/renderer/src/style/variables.scss）。管制员多半两边都开着，
+# 配色一致能省掉一次心智切换。
+#
+# 关键是**三态用同一套语义色**，而不是每个开关一个颜色：
+#     关 = 蓝灰      开 = 绿      正在响 = 琥珀
+# RX / TX / XC 都是这三态，学一次就够。而且"正在响"是**色相**变化，不是把绿色调亮
+# ——管制员盯着别处时，余光对色相远比对亮度敏感。
+OFF_COLOR = "#436384"       # $primary：开关关着
+ON_COLOR = "#28a745"        # $success：开着
+ACTIVE_COLOR = "#c7861d"    # $warning：此刻正在收/发
+MUTED_COLOR = "#dc3545"     # $danger：静音
+THEME_COLOR = "#5eb1bf"     # $alias：强调色（选中的主频率、主按钮）
+ONLINE_COLOR = ON_COLOR
+OFFLINE_COLOR = MUTED_COLOR
+IDLE_COLOR = "#8b90a4"      # 次要文字
+WINDOW_BG = "#2c2f45"       # $bg-color：偏蓝紫的深底，不是中性灰
+SURFACE_BG = "#252839"      # 卡片底
+
+# 频率用等宽字体：一屏十几个频率时数字能对齐，扫视快得多。TrackAudio 整个界面
+# 都是 Ubuntu Mono，这里只给频率用——中文用等宽会很难看。
+MONO_FONT = "Consolas"
+
+# 卡片尺寸。TrackAudio 是 205×90 的网格，这里稍宽一点放中文和"最后通话"。
+CARD_WIDTH = 232
+CARD_HEIGHT = 116
+
+
+class VoiceSignals(QObject):
+    """pymumble 的回调在库线程里跑，必须经信号回到界面线程。"""
+    state = pyqtSignal(str, str)
+    rx = pyqtSignal(int, bool, str)
+    tx = pyqtSignal(bool)
+    connection = pyqtSignal(bool)
+    # 数据源也是在后台线程取的，同样要过信号
+    datafeed = pyqtSignal(object)
 
 
 def resource_path(name):
@@ -43,122 +101,299 @@ def resource_path(name):
 icon_path = resource_path("favicon.ico")
 
 
-class VoiceSignals(QObject):
-    """pymumble 的回调在库线程里跑，必须经信号回到界面线程。"""
-    state = pyqtSignal(str, str)
-    rx = pyqtSignal(int, bool, str)
-    tx = pyqtSignal(bool)
-    connection = pyqtSignal(bool)
+class Dot(QWidget):
+    """一个纯色圆点。连接状态和 PTT 都用它。
+
+    单独做成控件是为了让颜色只有一个来源——原来是每处各写一串 setStyleSheet，
+    改配色要挨个找。
+    """
+
+    def __init__(self, color=IDLE_COLOR, size=10, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self.setFixedSize(size, size)
+        self.set_color(color)
+
+    def set_color(self, color):
+        self.setStyleSheet(
+            f"background-color: {color}; border-radius: {self._size // 2}px;")
 
 
-class RadioRow(QFrame):
+class FlowLayout(QLayout):
+    """从左到右排、排满换行的布局。
+
+    对应 TrackAudio 的 `.radio-grid`（CSS 的 `repeat(auto-fill, minmax(205px,1fr))`）。
+    Qt 没有内置的流式布局，而这正是那份设计的关键：频率是**卡片**不是整宽的行，
+    所以窗口拉宽只会一行多放几张，不会把一个频率抻成一米长——那正是原来最大化
+    之后标题在最左、开关在最右、中间一片空白的原因。
+    """
+
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self._items = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def insertWidget(self, index, widget):
+        """把控件插到第 index 位。
+
+        QLayout 没有 insertWidget（那是 QBoxLayout 才有的），但电台栈是**按频率
+        排过序**的（radiostack.add 每次都 sort），所以卡片必须能插进中间——一律
+        addWidget 追加的话，加一个 119.000 会排到 121.700 后面，屏幕上的频率就
+        不是升序了。先让 QLayout.addWidget 走完认领控件那套（reparent + addItem
+        追加到末尾），再把它挪到正确的位置。
+        """
+        self.addWidget(widget)
+        item = self._items.pop()
+        self._items.insert(max(0, min(index, len(self._items))), item)
+        self.invalidate()
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._layout(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(),
+                            margins.top() + margins.bottom())
+
+    def _layout(self, rect, apply):
+        """返回排完之后的总高度。apply=False 时只算不摆。"""
+        margins = self.contentsMargins()
+        left = rect.x() + margins.left()
+        top = rect.y() + margins.top()
+        right = rect.right() - margins.right()
+        x, y, row_height = left, top, 0
+        space = self.spacing()
+
+        for item in self._items:
+            hint = item.sizeHint()
+            if x > left and x + hint.width() > right:
+                x = left
+                y += row_height + space
+                row_height = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + space
+            row_height = max(row_height, hint.height())
+        return y + row_height - rect.y() + margins.bottom()
+
+
+class StateToggle(QPushButton):
+    """RX / TX / XC 的三态开关：关 / 开 / 正在响。
+
+    配色照 TrackAudio 的语义走（radio.tsx）：关 = primary，开 = success，
+    正在收/发 = warning。三个开关同一套，不是每个一个颜色。
+
+    **自绘，不用 qfluentwidgets 的按钮。** 试过 TogglePushButton + setStyleSheet：
+    样式确实设上了，但库自己会用 FluentStyleSheet 重新 apply，把 checked 状态
+    一律画成主题色——三个不同含义渲染成同一个颜色，等于管制员看不出哪个频率
+    开着、哪个正在响，而这是这个界面上最要紧的信息。
+    """
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.active = False              # 这一刻真的在收/发
+        self.muted = False               # 只有 RX 用：静音时整个变红
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_state(self, checked, active=False, muted=False):
+        changed = (checked != self.isChecked() or active != self.active
+                   or muted != self.muted)
+        self.setChecked(checked)
+        self.active = active
+        self.muted = muted
+        if changed:
+            self.update()
+
+    def _fill(self):
+        if self.muted:
+            return QColor(MUTED_COLOR)
+        if not self.isChecked():
+            return QColor(OFF_COLOR)
+        return QColor(ACTIVE_COLOR if self.active else ON_COLOR)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        fill = self._fill()
+        painter.setPen(QPen(fill.darker(140), 1))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, 4, 4)
+
+        font = self.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class RadioRow(CardWidget):
     """电台栈里的一行。"""
 
     def __init__(self, radio, window, parent=None):
         super().__init__(parent)
         self.khz = radio.frequency_khz
         self.window = window
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setBorderRadius(6)
+        # 点整张卡片就把这个频率设成主频率（真正进入的那个 Mumble 频道）。
+        # 用 CardWidget 自己的 clicked，别覆盖 mousePressEvent——那会把它的
+        # 按下动画一起弄没。
+        self.clicked.connect(lambda: self.window.select_radio(self.khz))
         self.setup_ui(radio)
 
     def setup_ui(self, radio):
+        self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(10, 8, 8, 8)
+        layout.setSpacing(6)
 
-        top = QHBoxLayout()
-        self.title = QLabel()
-        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        self.title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        top.addWidget(self.title)
+        # ---- 上半：左边频率/呼号，右边 RX/TX ----
+        # 照 TrackAudio 的 radio-content：左右各约一半，RX/TX 是右侧两个大按钮，
+        # 点击目标大，急着切频率时不容易点歪
+        upper = QHBoxLayout()
+        upper.setSpacing(8)
 
-        self.rx_button = self._toggle("RX", lambda: self.window.toggle_rx(self.khz),
-                                      "接收这个频率")
-        self.tx_button = self._toggle("TX", lambda: self.window.toggle_tx(self.khz),
-                                      "PTT 按下时对这个频率发话")
-        self.xc_button = self._toggle("XC", lambda: self.window.toggle_xc(self.khz),
-                                      "和其它开了 XC 的频率交叉耦合")
-        for button in (self.rx_button, self.tx_button, self.xc_button):
-            top.addWidget(button)
+        left = QVBoxLayout()
+        left.setSpacing(0)
+        self.freq_label = QLabel()
+        self.freq_label.setFont(QFont(MONO_FONT, 17, QFont.Weight.DemiBold))
+        self.freq_label.setStyleSheet("color: #e6e8f0;")
+        left.addWidget(self.freq_label)
 
-        self.remove_button = QPushButton("×")
-        self.remove_button.setFixedWidth(28)
-        self.remove_button.setToolTip("从电台栈移除")
-        self.remove_button.clicked.connect(lambda: self.window.remove_radio(self.khz))
-        top.addWidget(self.remove_button)
-        layout.addLayout(top)
+        self.callsign_label = QLabel()
+        self.callsign_label.setStyleSheet(f"color: {IDLE_COLOR}; font-size: 12px;")
+        left.addWidget(self.callsign_label)
+        left.addStretch()
+        upper.addLayout(left, 1)
 
-        bottom = QHBoxLayout()
-        self.last_rx = QLabel("")
-        self.last_rx.setStyleSheet("color: #666666;")
-        self.last_rx.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        bottom.addWidget(self.last_rx)
+        right = QVBoxLayout()
+        right.setSpacing(4)
+        self.rx_button = self._toggle("RX", lambda: self.window.toggle_rx(self.khz))
+        self.tx_button = self._toggle("TX", lambda: self.window.toggle_tx(self.khz))
+        for button in (self.rx_button, self.tx_button):
+            button.setFixedSize(52, 26)
+            right.addWidget(button)
+        upper.addLayout(right)
+        layout.addLayout(upper)
 
-        self.mute_button = QPushButton("静音")
-        self.mute_button.setCheckable(True)
-        self.mute_button.setFixedWidth(52)
+        # ---- 下半：XC / 静音 / 移除，再下面是音量 ----
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        self.xc_button = self._toggle("XC", lambda: self.window.toggle_xc(self.khz))
+        self.xc_button.setFixedSize(36, 22)
+        controls.addWidget(self.xc_button)
+
+        # TrackAudio 把静音做成 RX 的右键，这里保留一个显式按钮：中文用户里
+        # 没人会去猜右键，而误静音了又完全没有提示
+        self.mute_button = StateToggle("", self)
+        self.mute_button.setFixedSize(46, 22)
         self.mute_button.clicked.connect(
             lambda checked: self.window.set_muted(self.khz, checked))
-        bottom.addWidget(self.mute_button)
+        controls.addWidget(self.mute_button)
 
-        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume = Slider(Qt.Orientation.Horizontal, self)
         self.volume.setRange(0, 100)
-        self.volume.setFixedWidth(110)
+        self.volume.setFixedHeight(18)
         self.volume.valueChanged.connect(
             lambda value: self.window.set_volume(self.khz, value))
-        bottom.addWidget(self.volume)
-        layout.addLayout(bottom)
+        controls.addWidget(self.volume, 1)
 
+        self.remove_button = TransparentToolButton(self)
+        self.remove_button.setIcon(FluentIcon.CLOSE)
+        self.remove_button.setFixedSize(22, 22)
+        self.remove_button.clicked.connect(
+            lambda: self.window.remove_radio(self.khz))
+        controls.addWidget(self.remove_button)
+        layout.addLayout(controls)
+
+        self.last_rx = QLabel("")
+        self.last_rx.setStyleSheet(f"color: {IDLE_COLOR}; font-size: 11px;")
+        layout.addWidget(self.last_rx)
+
+        # 老测试和外部代码认 title 这个名字，留一个只读的合成标签
+        self.title = self.freq_label
+        self.retranslate()
         self.refresh(radio)
 
-    def _toggle(self, text, handler, tooltip):
-        button = QPushButton(text)
-        button.setCheckable(True)
-        button.setFixedWidth(46)
-        button.setToolTip(tooltip)
+    def _toggle(self, text, handler):
+        button = StateToggle(text, self)
         button.clicked.connect(lambda: handler())
         return button
+
+    def retranslate(self):
+        """卡片上不随状态变化的那些文字。
+
+        单独拎出来是因为 refresh() 每收到一次话音就会跑一遍，而这些字一次都不会
+        变；反过来换语言时 refresh() 又碰不到它们——卡片是复用的（rebuild_rows
+        只对已有的行调 refresh），于是切到英文之后按钮上还写着"静音"、RX 的悬停
+        提示还是中文。
+        """
+        self.rx_button.setToolTip(t("radio.rx_tip"))
+        self.tx_button.setToolTip(t("radio.tx_tip"))
+        self.xc_button.setToolTip(t("radio.xc_tip"))
+        self.mute_button.setText(t("radio.mute"))
+        self.mute_button.setToolTip(t("radio.mute_tip"))
+        self.remove_button.setToolTip(t("radio.remove_tip"))
 
     def refresh(self, radio):
         selected = self.window.stack.selected_khz == radio.frequency_khz
         marker = "▸ " if selected else ""
-        self.title.setText(f"{marker}{radio.label}")
+        self.freq_label.setText(f"{marker}{radio.frequency}")
+        self.callsign_label.setText(radio.callsign or t("radio.no_callsign"))
 
-        self.rx_button.setChecked(radio.rx)
-        self.tx_button.setChecked(radio.tx)
-        self.xc_button.setChecked(radio.xc)
-
-        # 正在收/发的时候把按钮点亮，和 TrackAudio 一样一眼能看出哪个频率在响
-        self.rx_button.setStyleSheet(self._style(radio.rx, radio.currently_rx, "#00cc00"))
-        self.tx_button.setStyleSheet(self._style(radio.tx, radio.currently_tx, "#ff3b30"))
-        self.xc_button.setStyleSheet(self._style(radio.xc, False, "#ff9500"))
+        # 三态和 TrackAudio 一致：关 / 开 / 正在响，静音时 RX 整个变红
+        self.rx_button.set_state(radio.rx, radio.currently_rx, radio.muted)
+        self.tx_button.set_state(radio.tx, radio.currently_tx)
+        self.xc_button.set_state(radio.xc)
+        self.mute_button.set_state(radio.muted, muted=radio.muted)
 
         self.volume.blockSignals(True)
         self.volume.setValue(radio.volume)
         self.volume.blockSignals(False)
-        self.mute_button.setChecked(radio.muted)
 
         if radio.last_received_callsign:
+            # 存的是 Mumble 的用户名（纯数字 CID），显示时才查表翻成呼号——
+            # 这样数据源晚一步到齐，之前记下的那条也会跟着变过来
+            who = self.window.callsign_for(radio.last_received_callsign)
             stamp = time.strftime('%H:%M:%S', time.localtime(radio.last_received_at))
-            self.last_rx.setText(f"最后通话: {radio.last_received_callsign}  {stamp}")
+            self.last_rx.setText(t("radio.last_rx", who=who, stamp=stamp))
         else:
-            self.last_rx.setText("最后通话: --")
+            self.last_rx.setText(t("radio.last_rx_none"))
 
-        self.setStyleSheet("QFrame { border: 2px solid #1e90ff; border-radius: 4px; }"
-                           if selected else "")
-
-    @staticmethod
-    def _style(enabled, active, color):
-        if active:
-            return f"background-color: {color}; color: white; font-weight: bold;"
-        if enabled:
-            return f"background-color: {color}; color: white;"
-        return ""
-
-    def mousePressEvent(self, event):
-        # 点标题把这个频率设成主频率（真正进入的那个 Mumble 频道）
-        self.window.select_radio(self.khz)
-        super().mousePressEvent(event)
+        # 主频率用主题色描边，比原来那圈蓝框更贴合整体
+        self.setStyleSheet(
+            f"RadioRow {{ border: 1px solid {THEME_COLOR}; }}" if selected else "")
 
 
 class ControllerWindow(QMainWindow):
@@ -166,27 +401,46 @@ class ControllerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(icon_path))
-        self.setWindowTitle('管制语音 - Airwaysn')
-        self.setMinimumSize(520, 420)
+        self.setWindowTitle(t("app.title"))
+        self.setMinimumSize(620, 480)
 
         self.settings = Settings()
+        # 语言：存过就用存的，第一次启动跟系统走
+        i18n.set_language(self.settings.language or i18n.system_language())
         self.voice = None
+        self.cid = ""
         self.rows = {}
         self.stack = RadioStack(on_change=self.on_stack_changed)
+
+        # CID → 呼号。Mumble 的用户名是纯数字的 ASN 号，靠这张表才能把
+        # "最后通话: 1005" 显示成 "最后通话: CES2345"
+        self.roster = {}
+        self._user_removed = set()    # 用户自己删掉的，别再自动加回去跟他较劲
 
         self.signals = VoiceSignals()
         self.signals.state.connect(self.on_voice_state)
         self.signals.rx.connect(self.on_voice_rx)
         self.signals.tx.connect(self.on_voice_tx)
         self.signals.connection.connect(self.on_connection_change)
+        self.signals.datafeed.connect(self.on_datafeed)
+
+        self.datafeed_timer = QTimer(self)
+        self.datafeed_timer.timeout.connect(self.refresh_datafeed)
 
         self.setup_ui()
         self.setup_ptt()
+        # 上次开着置顶的话，这次起来就是置顶的
+        self.apply_always_on_top()
 
         self.stack.load(self.settings.radios)
 
     # ---------- 界面 ----------
     def setup_ui(self):
+        # 主题只管 qfluentwidgets 的控件，普通 QWidget 的底色还得自己给，
+        # 否则深色控件会浮在一片白底上
+        self.setStyleSheet(f"QMainWindow, QStackedWidget {{ background-color: {WINDOW_BG}; }}"
+                           f"QWidget#page {{ background-color: {WINDOW_BG}; }}")
+
         self.pages = QStackedWidget()
         self.setCentralWidget(self.pages)
 
@@ -197,115 +451,241 @@ class ControllerWindow(QMainWindow):
 
     def build_login_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.addStretch()
+        page.setObjectName("page")
+        outer = QVBoxLayout(page)
+        outer.addStretch()
 
-        for label, attr, echo in (('用户名:', 'username_input', False),
-                                  ('密码:', 'password_input', True)):
-            row = QHBoxLayout()
-            field = QLineEdit()
-            if echo:
-                field.setEchoMode(QLineEdit.EchoMode.Password)
-            setattr(self, attr, field)
-            row.addWidget(QLabel(label))
-            row.addWidget(field)
-            layout.addLayout(row)
+        # 登录框收进一张卡片，居中——原来是几行光秃秃的输入框贴在窗口上
+        card = CardWidget()
+        card.setBorderRadius(8)
+        card.setFixedWidth(340)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
 
-        self.connect_button = QPushButton('连接')
+        self.login_title = title = SubtitleLabel(t("app.name"))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        self.username_input = LineEdit()
+        self.username_input.setPlaceholderText(t("login.username"))
+        self.username_input.setClearButtonEnabled(True)
+        layout.addWidget(self.username_input)
+
+        self.password_input = PasswordLineEdit()
+        self.password_input.setPlaceholderText(t("login.password"))
+        self.password_input.returnPressed.connect(self.connect_voice)
+        layout.addWidget(self.password_input)
+
+        self.connect_button = PrimaryPushButton()
+        self.connect_button.setText(t("login.connect"))
         self.connect_button.clicked.connect(self.connect_voice)
         layout.addWidget(self.connect_button)
 
-        self.login_status = QLabel('未连接')
+        self.login_status = CaptionLabel(t("login.disconnected"))
         self.login_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.login_status.setStyleSheet(f"color: {IDLE_COLOR};")
+        self.login_status.setWordWrap(True)
         layout.addWidget(self.login_status)
-        layout.addStretch()
+
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(card)
+        row.addStretch()
+        outer.addLayout(row)
+        outer.addStretch()
         return page
 
     def build_main_page(self):
         page = QWidget()
+        page.setObjectName("page")
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(12)
 
+        # ---- 顶栏：连接状态 + 席位 + 操作 ----
         top = QHBoxLayout()
-        # 连接状态指示灯：掉线要能一眼看出来，不然管制员会对着死掉的连接一直喊
-        self.conn_indicator = QLabel()
-        self.conn_indicator.setFixedSize(14, 14)
-        self.conn_label = QLabel('已连接')
-        self._set_connection_style(True)
+        top.setSpacing(8)
+        # 掉线要能一眼看出来，不然管制员会对着死掉的连接一直喊
+        self.conn_indicator = Dot(ONLINE_COLOR)
+        self.conn_label = BodyLabel(t("main.connected"))
         top.addWidget(self.conn_indicator)
         top.addWidget(self.conn_label)
         top.addSpacing(12)
 
-        self.session_label = QLabel('未连接')
-        self.session_label.setStyleSheet("font-weight: bold;")
+        self.session_label = StrongBodyLabel(t("login.disconnected"))
         top.addWidget(self.session_label)
         top.addStretch()
-        settings_button = QPushButton('设置')
+
+        # 置顶：管制员多半把语音压在雷达/模拟器上面用，被别的窗口盖住就等于
+        # 看不见谁在呼叫。做成常驻的开关而不是塞进设置对话框——它是要频繁切的。
+        self.top_button = TogglePushButton()
+        self.top_button.setText(t("main.pin"))
+        self.top_button.setIcon(FluentIcon.PIN)
+        self.top_button.setToolTip(t("main.pin_tip"))
+        self.top_button.setChecked(self.settings.always_on_top)
+        self.top_button.clicked.connect(self.toggle_always_on_top)
+        top.addWidget(self.top_button)
+
+        self.settings_button = settings_button = PushButton()
+        settings_button.setText(t("main.settings"))
+        settings_button.setIcon(FluentIcon.SETTING)
         settings_button.clicked.connect(self.open_settings)
         top.addWidget(settings_button)
-        disconnect_button = QPushButton('断开')
+
+        self.disconnect_button = disconnect_button = PushButton()
+        disconnect_button.setText(t("main.disconnect"))
+        disconnect_button.setIcon(FluentIcon.POWER_BUTTON)
         disconnect_button.clicked.connect(self.disconnect_voice)
         top.addWidget(disconnect_button)
         layout.addLayout(top)
 
+        # ---- 添加频率 ----
         add_row = QHBoxLayout()
-        self.freq_input = QLineEdit()
-        self.freq_input.setPlaceholderText('频率，例如 118.000')
+        add_row.setSpacing(8)
+        self.freq_input = LineEdit()
+        self.freq_input.setPlaceholderText(t("main.freq_hint"))
+        self.freq_input.setFixedWidth(180)
         self.freq_input.returnPressed.connect(self.add_radio)
-        self.callsign_input = QLineEdit()
-        self.callsign_input.setPlaceholderText('呼号，例如 ZSPD_TWR（可留空）')
-        add_button = QPushButton('添加频率')
+        self.callsign_input = LineEdit()
+        self.callsign_input.setPlaceholderText(t("main.callsign_hint"))
+        self.callsign_input.setFixedWidth(INPUT_WIDTH)
+        self.callsign_input.returnPressed.connect(self.add_radio)
+        self.add_button = add_button = PrimaryPushButton()
+        add_button.setText(t("main.add"))
+        add_button.setIcon(FluentIcon.ADD)
         add_button.clicked.connect(self.add_radio)
         add_row.addWidget(self.freq_input)
         add_row.addWidget(self.callsign_input)
         add_row.addWidget(add_button)
+        add_row.addStretch()
         layout.addLayout(add_row)
 
-        self.stack_area = QScrollArea()
+        # ---- 电台栈 ----
+        self.stack_area = ScrollArea()
         self.stack_area.setWidgetResizable(True)
+        self.stack_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         holder = QWidget()
-        self.stack_layout = QVBoxLayout(holder)
-        self.stack_layout.setSpacing(6)
-        self.stack_layout.addStretch()
+        holder.setStyleSheet("background: transparent;")
+        # 流式网格：卡片排满一行就换行，窗口拉宽只是一行多放几张
+        self.stack_layout = FlowLayout(holder, spacing=8)
         self.stack_area.setWidget(holder)
         layout.addWidget(self.stack_area)
 
-        self.empty_hint = QLabel('电台栈是空的，先在上面加一个频率')
+        self.empty_hint = BodyLabel(t("main.empty"))
         self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_hint.setStyleSheet("color: #888888;")
+        self.empty_hint.setStyleSheet(f"color: {IDLE_COLOR};")
         layout.addWidget(self.empty_hint)
 
+        # ---- 底栏：PTT + 状态 ----
         bottom = QHBoxLayout()
-        self.ptt_indicator = QLabel('PTT')
-        self.ptt_indicator.setFixedWidth(44)
-        self.ptt_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._set_ptt_style(False)
+        bottom.setSpacing(8)
+        self.ptt_indicator = Dot(IDLE_COLOR, size=12)
         bottom.addWidget(self.ptt_indicator)
-        self.status_label = QLabel('就绪')
-        self.status_label.setStyleSheet("color: #555555;")
-        bottom.addWidget(self.status_label)
-        bottom.addStretch()
+        self.ptt_label = CaptionLabel('PTT')
+        bottom.addWidget(self.ptt_label)
+        bottom.addSpacing(10)
+        self.status_label = CaptionLabel(t("status.ready"))
+        self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
+        self.status_label.setWordWrap(True)
+        bottom.addWidget(self.status_label, 1)
         layout.addLayout(bottom)
         return page
 
     def _set_connection_style(self, connected):
-        color = "#00cc00" if connected else "#cc0000"
-        self.conn_indicator.setStyleSheet(
-            f"background-color: {color}; border-radius: 7px;")
-        self.conn_label.setText('已连接' if connected else '已断开')
+        color = ONLINE_COLOR if connected else OFFLINE_COLOR
+        self.conn_indicator.set_color(color)
+        self.conn_label.setText(t("main.connected") if connected else t("main.disconnected"))
         self.conn_label.setStyleSheet(f"color: {color};")
 
     def _set_ptt_style(self, active):
-        color = "#ff3b30" if active else "#808080"
-        self.ptt_indicator.setStyleSheet(
-            f"background-color: {color}; color: white; border-radius: 4px; padding: 4px;")
+        self.ptt_indicator.set_color(ACTIVE_COLOR if active else IDLE_COLOR)
+        self.ptt_label.setStyleSheet(
+            f"color: {ACTIVE_COLOR}; font-weight: bold;" if active
+            else f"color: {IDLE_COLOR};")
+
+    def toggle_always_on_top(self, checked=None):
+        """切换窗口置顶。
+
+        Windows 上改 window flag 会把窗口**隐藏**掉，必须再 show() 一次，否则
+        用户点一下置顶、整个窗口就没了。而 show() 又会把最大化状态丢掉，所以
+        先记下来再还原——不然最大化的人一点置顶，窗口就缩回小尺寸。
+        """
+        if checked is None:
+            checked = not self.settings.always_on_top
+            self.top_button.setChecked(checked)
+        self.settings.always_on_top = bool(checked)
+        self.settings.save_settings()
+        self.apply_always_on_top()
+
+    def apply_always_on_top(self):
+        on = bool(self.settings.always_on_top)
+        if bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) == on:
+            return
+        # 可见性和最大化都要在改 flag **之前**问：setWindowFlag 本身就会把窗口
+        # 隐藏掉，改完再问 isHidden() 永远是 True，show() 就被跳过了，表现出来
+        # 正是"点一下置顶窗口就没了"。
+        was_visible = self.isVisible()
+        maximised = self.isMaximized()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        # 启动时还没 show 过就别抢焦点
+        if was_visible:
+            self.showMaximized() if maximised else self.show()
+        log.info("窗口置顶: %s", "开" if on else "关")
+
+    def retranslate(self):
+        """换语言之后把界面上的字全部重刷一遍。
+
+        不做这一步就得让用户重启才能看到新语言——一个只在设置里生效、要重启才
+        看得见的开关，用户第一反应是"是不是没保存"。
+
+        运行时才产生的文字（语音层报上来的错误）留到下一次事件自然更新，卡片这里
+        主动重刷一次，因为"最后通话"可能停在屏幕上很久。
+        """
+        self.setWindowTitle(t("app.title"))
+        self.login_title.setText(t("app.name"))
+        self.username_input.setPlaceholderText(t("login.username"))
+        self.password_input.setPlaceholderText(t("login.password"))
+        self.connect_button.setText(t("login.connect"))
+        self.top_button.setText(t("main.pin"))
+        self.top_button.setToolTip(t("main.pin_tip"))
+        self.settings_button.setText(t("main.settings"))
+        self.disconnect_button.setText(t("main.disconnect"))
+        self.add_button.setText(t("main.add"))
+        self.freq_input.setPlaceholderText(t("main.freq_hint"))
+        self.callsign_input.setPlaceholderText(t("main.callsign_hint"))
+        self.empty_hint.setText(t("main.empty"))
+        self._set_connection_style(bool(self.voice))
+        if not self.voice:
+            self.login_status.setText(t("login.disconnected"))
+            self.session_label.setText(t("login.disconnected"))
+        # 不能无条件写"就绪"：频道监听的警告要是正挂着，换个语言就被抹掉了，
+        # 而问题一点没变。update_hint 会按当前状态重新决定写哪一条。
+        if self.voice:
+            self.update_hint()
+        else:
+            self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
+            self.status_label.setText(t("status.ready"))
+        for row in self.rows.values():
+            row.retranslate()
+        self.rebuild_rows()
+
+    def warn(self, title, content):
+        """轻提示。
+
+        频率填错这种校验用不着模态对话框——弹一个会打断输入，还得伸手去点。
+        InfoBar 从右上角滑出来、自己消失，不挡任何操作。
+        """
+        InfoBar.warning(title=title, content=content, parent=self,
+                        position=InfoBarPosition.TOP_RIGHT, duration=4000)
 
     # ---------- 电台栈 ----------
     def on_stack_changed(self):
         """栈变了：重画界面、推给服务器、存盘。"""
         self.rebuild_rows()
         if self.voice:
-            # sync 要建频道、发协议消息，新频道那里还有 0.2 秒等待——放在界面
-            # 线程里做的话，每加一个频率界面就会卡一下
+            # sync 要建频道、发协议消息，还要等服务器回话——放在界面线程里做的话，
+            # 每加一个频率界面就会卡一下
             threading.Thread(target=self.voice.sync, args=(self.stack,),
                              daemon=True).start()
         self.settings.radios = self.stack.to_list()
@@ -320,6 +700,8 @@ class ControllerWindow(QMainWindow):
                 self.stack_layout.removeWidget(row)
                 row.deleteLater()
 
+        # 按栈的顺序插，不能一律追加：栈是按频率排过序的，新加的频率可能要插到
+        # 中间去，追加会让屏幕上的频率不再是升序
         for index, radio in enumerate(self.stack):
             row = self.rows.get(radio.frequency_khz)
             if row is None:
@@ -335,13 +717,68 @@ class ControllerWindow(QMainWindow):
         try:
             self.stack.add(self.freq_input.text(), self.callsign_input.text())
         except ValueError as e:
-            QMessageBox.warning(self, '添加失败', str(e))
+            self.warn(t("main.add_failed"), str(e))
             return
         self.freq_input.clear()
         self.callsign_input.clear()
 
     def remove_radio(self, khz):
+        # 记下来：用户手动删掉的频率，就算数据源上他还挂着这个席位，也不要再
+        # 自动加回去——每 60 秒跟用户抢一次是最招人烦的那种"智能"
+        self._user_removed.add(khz)
         self.stack.remove(khz)
+
+    # ---------- 数据源（席位频率 / 呼号） ----------
+    def callsign_for(self, name):
+        """把 Mumble 报上来的名字翻成呼号。
+
+        语音层给的是 user["name"]，而按 server/login.py 的设计那就是纯数字的
+        ASN 号。查不到就原样返回——数据源没拉到、或者对方刚上线还没进数据源时，
+        显示个数字也比显示空白强。
+        """
+        return self.roster.get(str(name), name)
+
+    def refresh_datafeed(self):
+        """去数据源要一次。网络在后台线程做，结果过信号回来。"""
+        if not self.cid:
+            return
+
+        def work():
+            self.signals.datafeed.emit(datafeed.fetch())
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_datafeed(self, data):
+        """数据源回来了（已在界面线程）。"""
+        if not data:
+            return
+        self.roster = datafeed.roster(data)
+        # 之前记下的是 CID，重画一次就变成呼号了——晚到的对照表也能补上
+        self.rebuild_rows()
+        self.adopt_controlled_frequency(data)
+
+    def adopt_controlled_frequency(self, data):
+        """本人在网上上了席位的话，把那个频率自动加进电台栈。"""
+        entry = datafeed.controller_for(self.cid, data)
+        if not entry:
+            return
+        khz = datafeed.frequency_khz(entry)
+        if khz is None or khz in self._user_removed:
+            return
+        if self.stack.get(khz):
+            return
+        callsign = str(entry.get("callsign", "")).strip()
+        try:
+            self.stack.add(khz, callsign)
+        except ValueError as e:
+            log.warning("自动加入席位频率失败: %s", e)
+            return
+        log.info("按数据源上的席位 %s 自动加入 %s",
+                 callsign, radiostack.format_frequency(khz))
+        self.status_label.setStyleSheet(f"color: {ON_COLOR};")
+        self.status_label.setText(t(
+            "status.adopted", callsign=callsign,
+            frequency=radiostack.format_frequency(khz)))
 
     def select_radio(self, khz):
         self.stack.select(khz)
@@ -366,11 +803,13 @@ class ControllerWindow(QMainWindow):
         username = self.username_input.text().strip()
         password = self.password_input.text()
         if not username or not password:
-            self.login_status.setText('请填写用户名和密码')
+            self.login_status.setText(t("login.need_credentials"))
+            self.login_status.setStyleSheet(f"color: {OFFLINE_COLOR};")
             return
 
         self.connect_button.setEnabled(False)
-        self.login_status.setText('正在连接…')
+        self.login_status.setStyleSheet(f"color: {IDLE_COLOR};")
+        self.login_status.setText(t("login.connecting"))
         QApplication.processEvents()
 
         self.voice = VoiceClient(
@@ -394,12 +833,17 @@ class ControllerWindow(QMainWindow):
             return
 
         self.connect_button.setEnabled(True)
+        self.cid = username
         self.settings.last_username = username
         self.settings.save_settings()
         self.session_label.setText(f'{username} · {SERVER}')
+        self._set_connection_style(True)
         self.pages.setCurrentIndex(1)
         threading.Thread(target=self.voice.sync, args=(self.stack,),
                          daemon=True).start()
+        # 立刻查一次（上了席位就把频率捡回来），之后按周期刷
+        self.refresh_datafeed()
+        self.datafeed_timer.start(DATAFEED_INTERVAL * 1000)
         self.update_hint()
 
     def update_hint(self):
@@ -411,13 +855,15 @@ class ControllerWindow(QMainWindow):
         if not self.voice:
             return
         if len(self.stack.rx_frequencies()) > 1 and not self.voice.listeners_confirmed:
-            self.status_label.setText(
-                '多频率接收需要服务器支持频道监听（Mumble 1.4+）；'
-                '若只听得到主频率（▸），说明服务器不支持')
+            self.status_label.setStyleSheet(f"color: {ACTIVE_COLOR};")
+            self.status_label.setText(t("status.listeners"))
         else:
-            self.status_label.setText('就绪')
+            self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
+            self.status_label.setText(t("status.ready"))
 
     def disconnect_voice(self):
+        self.datafeed_timer.stop()
+        self.cid = ""
         if self.voice:
             self.voice.disconnect()
             self.voice = None
@@ -426,22 +872,25 @@ class ControllerWindow(QMainWindow):
             radio.currently_tx = False
         self.rebuild_rows()
         self.pages.setCurrentIndex(0)
-        self.login_status.setText('未连接')
+        self.login_status.setStyleSheet(f"color: {IDLE_COLOR};")
+        self.login_status.setText(t("login.disconnected"))
 
     # ---------- 语音回调（已在界面线程） ----------
     def on_voice_state(self, state, message):
         if state == 'error':
+            self.status_label.setStyleSheet(f"color: {OFFLINE_COLOR};")
             self.status_label.setText(message)
+            self.login_status.setStyleSheet(f"color: {OFFLINE_COLOR};")
             self.login_status.setText(message)
             if self.pages.currentIndex() == 0:
-                QMessageBox.critical(self, '连接失败', message)
+                QMessageBox.critical(self, t("login.failed"), message)
         elif state == 'denied':
             # 服务器挡了某个动作（多半是监听频道的上限），红字留在状态栏
+            self.status_label.setStyleSheet(f"color: {OFFLINE_COLOR};")
             self.status_label.setText(message)
-            self.status_label.setStyleSheet("color: #cc0000;")
         else:
+            self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
             self.status_label.setText(message)
-            self.status_label.setStyleSheet("color: #555555;")
 
     def on_voice_rx(self, khz, active, callsign):
         self.stack.set_currently_rx(khz, active, callsign, time.time())
@@ -489,6 +938,7 @@ class ControllerWindow(QMainWindow):
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():
+            self.retranslate()
             if hasattr(self, 'ptt_listener'):
                 self.ptt_listener.stop()
             self.setup_ptt()
@@ -499,7 +949,7 @@ class ControllerWindow(QMainWindow):
                     self.voice.setup_audio(self.settings.input_device_index,
                                            self.settings.output_device_index)
                 except Exception as e:
-                    QMessageBox.warning(self, '音频设备', f'切换设备失败: {e}')
+                    QMessageBox.warning(self, t("status.audio_device"), t("status.audio_failed", error=e))
 
     def closeEvent(self, event):
         try:
@@ -513,6 +963,12 @@ class ControllerWindow(QMainWindow):
             event.accept()
 
 
+def apply_theme():
+    """深色 Fluent。放在建窗口之前调用。"""
+    setTheme(Theme.DARK)
+    setThemeColor(THEME_COLOR)
+
+
 if __name__ == '__main__':
     # --debug 会把协议层面的细节也记进日志（进出的频道、发话目标、断线判定）。
     # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
@@ -522,6 +978,7 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))
+    apply_theme()
     window = ControllerWindow()
     window.show()
     sys.exit(app.exec())

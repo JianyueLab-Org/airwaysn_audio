@@ -462,5 +462,88 @@ class ChannelSwitchTest(unittest.TestCase):
                          "频率都听不到")
 
 
+class ReconnectTest(unittest.TestCase):
+    """重连之后必须把整个电台栈重新推一遍。
+
+    客户端是 reconnect=True 建的，掉线后 pymumble 自己会连回来，但服务器把重连
+    上来的用户放回**根频道**，频道监听和 VoiceTarget 这些跟会话走的注册也一并
+    没了。只把界面的灯点回绿色的话，就成了最糟的那种情况：显示一切正常，人却
+    待在根频道，一个频率都收不到，PTT 也发不出去。
+    """
+
+    def setUp(self):
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.05)
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+        self.stack = radiostack.RadioStack()
+        self.stack.add(118000)
+        self.stack.add(121700)
+        for radio in self.stack:
+            radio.rx = True
+            radio.tx = True
+        self.stack.select(118000)
+
+    def sync_and_wait(self):
+        thread = threading.Thread(target=self.client.sync, args=(self.stack,),
+                                  daemon=True)
+        thread.start()
+        thread.join(voice.CHANNEL_TIMEOUT * 4 + 5)
+        self.assertFalse(thread.is_alive(), "sync 没有在预算内返回")
+
+    def test_reconnect_rejoins_and_reprograms_everything(self):
+        self.sync_and_wait()
+        primary = self.client._channel_ids[118000]
+        self.assertEqual(self.server.my_channel, primary, "前提：先进了主频道")
+
+        # 服务器把重连上来的用户放回根频道，会话级的注册全部作废
+        self.server.my_channel = 0
+        moves_before = len(self.server.moves())
+        messages_before = len(self.server.messages)
+
+        self.client._resync_after_reconnect()
+        # 重推是在后台线程里做的，等它把该发的都发完
+        deadline = time.time() + voice.CHANNEL_TIMEOUT * 4 + 5
+        while time.time() < deadline and not (
+                self.server.my_channel != 0
+                and len(self.server.messages) > messages_before):
+            time.sleep(0.05)
+
+        self.assertNotEqual(self.server.my_channel, 0,
+                            "重连之后没有回到频率频道，人还在根频道")
+        self.assertGreater(len(self.server.moves()), moves_before,
+                           "重连之后没有重新发进频道的命令")
+        self.assertGreater(len(self.server.messages), messages_before,
+                           "重连之后没有重新发频道监听 / 发话目标")
+
+    def test_stale_caches_do_not_suppress_the_resend(self):
+        """光调 sync 不够，本地缓存必须一起作废。
+
+        `_listening` 还记着断线前监听了哪些频道，diff 出来是空的，一条监听消息
+        都不会再发；`_sent_target` 会让发话目标的去重逻辑以为已经设好了。两个
+        加起来的效果就是：重连后看着一切正常，实际上一个频率都收不到。
+        """
+        self.sync_and_wait()
+        self.assertTrue(self.client._listening or self.client._sent_target,
+                        "前提：第一次同步之后本地是有缓存的")
+
+        # 把重推挡掉，单看"作废缓存"这一步——否则后台那次 sync 会立刻把缓存
+        # 填回来，断言到底看到的是清掉之前还是之后全凭手速
+        resynced = []
+        self.client.sync = lambda stack: resynced.append(stack)
+        self.client._resync_after_reconnect()
+
+        self.assertEqual(self.client._listening, set())
+        self.assertIsNone(self.client._sent_target)
+        self.assertEqual(self.client._channel_ids, {},
+                         "临时频道空了会被销毁，再建是新号，旧的频道号不能留")
+        deadline = time.time() + 5
+        while time.time() < deadline and not resynced:
+            time.sleep(0.02)
+        self.assertEqual(resynced, [self.stack], "作废了缓存却没有重新推一遍")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

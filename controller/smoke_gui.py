@@ -8,10 +8,18 @@
 
 import os
 import sys
+import tempfile
 import time
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# 挪到临时目录再跑。Settings.config_file 是 "radio_settings.json" 这样的裸文件名，
+# 相对当前目录解析——直接在 controller 目录下跑的话，这个测试会**读到开发者真实
+# 的电台栈**（于是 "应该有两部电台" 在你存过频率时必然失败），跑完还会把它清空。
+# gui.resource_path 走的是 __file__，applog 这里也没启动，所以换目录是安全的。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.chdir(tempfile.mkdtemp(prefix="airwaysn-smoke-"))
 
 # pymumble 需要本机的 opus 原生库来编解码音频。这里不碰音频，缺库时放个替身
 # 让导入过去；pymumble 本身仍然是真的。
@@ -33,9 +41,15 @@ for _name in ("warning", "critical", "information"):
     setattr(QMessageBox, _name,
             staticmethod(lambda *args, _n=_name: _dialogs.append((_n, args[2] if len(args) > 2 else ""))))
 
+# 校验类提示改用了 InfoBar（不模态，从右上角滑出来自己消失）。它不会挂住测试，
+# 但要能断言"确实提示了"，所以同样记一笔。
+gui.ControllerWindow.warn = lambda self, title, content: _dialogs.append(
+    ("infobar", content))
+
 
 def main():
     app = QApplication(sys.argv)
+    gui.apply_theme()          # 和 __main__ 里一样，主题要在建窗口之前设
     failures = []
 
     def check(name, fn):
@@ -48,6 +62,11 @@ def main():
 
     print("主窗口：")
     window = gui.ControllerWindow()
+    # 语言必须钉在**建完窗口之后**，否则断言会跟着开发机的系统语言飘：
+    # ControllerWindow.__init__ 自己会按 设置/系统语言 调一次 set_language，
+    # 在它之前设的会被它盖掉（英文系统上卡片就是拿英文建出来的）。
+    gui.i18n.set_language("zh")
+    window.retranslate()
     check("建立主窗口", lambda: window)
     check("切到电台栈页", lambda: window.pages.setCurrentIndex(1))
 
@@ -63,9 +82,12 @@ def main():
         assert len(window.rows) == 2, "应该画出两行"
     check("添加两个频率", add_two)
 
-    check("呼号大写并显示", lambda: (_ for _ in ()).throw(AssertionError(
-        window.rows[118000].title.text()))
-        if "ZSPD_TWR 118.000" not in window.rows[118000].title.text() else None)
+    def callsign_is_upper_and_shown():
+        # 照 TrackAudio 的排法，频率在上（等宽大字）、呼号在下（小字、暗色）
+        row = window.rows[118000]
+        assert "118.000" in row.freq_label.text(), row.freq_label.text()
+        assert row.callsign_label.text() == "ZSPD_TWR", row.callsign_label.text()
+    check("呼号大写并显示", callsign_is_upper_and_shown)
 
     def reject_duplicate():
         _dialogs.clear()
@@ -93,6 +115,57 @@ def main():
     check("音量", lambda: window.set_volume(118000, 40))
     check("静音", lambda: window.set_muted(118000, True))
 
+    print("状态配色（采真实渲染出来的像素）：")
+
+    def rx_tx_colours_are_actually_painted():
+        """RX/TX 开没开、正不正在响，必须真的画出不同的颜色。
+
+        这条不是多余的：改用 qfluentwidgets 时 RX/TX/XC 的高亮整个失效过一次
+        ——setStyleSheet 设上了，却被库自己的 FluentStyleSheet 重新 apply 盖掉，
+        三个开关一律灰色。而当时上面那二十多项冒烟**全绿**，因为它们只验证
+        控件建得出来、信号连得上。管制员一眼看不出哪个频率在响，是这个界面
+        最核心的信息丢了，所以这里直接采像素。
+        """
+        from PyQt6.QtCore import QPoint
+        window.resize(760, 560)
+        window.pages.setCurrentIndex(1)
+        window.show()
+        app.processEvents()
+
+        khz = sorted(r.frequency_khz for r in window.stack)[0]
+        row = window.rows[khz]
+        radio = window.stack.get(khz)
+
+        def fill(button):
+            image = window.grab().toImage()
+            centre = button.rect().center()
+            # 采左内侧，正中间是文字，会把白色笔画混进来
+            point = button.mapTo(window, QPoint(centre.x() - 18, centre.y()))
+            return image.pixelColor(point).name()
+
+        radio.muted = False       # 静音会把 RX 整个染红，会盖掉要测的三态
+        radio.rx = False
+        row.refresh(radio)
+        app.processEvents()
+        off = fill(row.rx_button)
+
+        radio.rx = True
+        row.refresh(radio)
+        app.processEvents()
+        on = fill(row.rx_button)
+
+        radio.currently_rx = True
+        row.refresh(radio)
+        app.processEvents()
+        active = fill(row.rx_button)
+
+        assert on != off, f"RX 开和关画出来是同一个颜色（{on}）"
+        assert on == gui.ON_COLOR, f"RX 开的颜色是 {on}，应当是 {gui.ON_COLOR}"
+        assert active != on, f"正在收听时没有变亮（都是 {on}）"
+        radio.currently_rx = False
+        row.refresh(radio)
+    check("RX 三态画出来确实不同色", rx_tx_colours_are_actually_painted)
+
     print("运行时状态：")
     check("收到话音", lambda: window.on_voice_rx(118000, True, "CES2345"))
     check("话音结束", lambda: window.on_voice_rx(118000, False, ""))
@@ -106,10 +179,221 @@ def main():
     def disconnect_indicator():
         window.on_voice_rx(118000, True, "CES2345")     # 先弄成"正在通话"
         window.on_connection_change(False)
-        assert "断开" in window.conn_label.text()
+        assert window.conn_label.text() == gui.t("main.disconnected"),             window.conn_label.text()
         assert not window.stack.get(118000).currently_rx, "掉线后不该还停在正在通话"
     check("掉线指示并清掉收发状态", disconnect_indicator)
     check("恢复连接", lambda: window.on_connection_change(True))
+
+    print("数据源：席位频率与呼号")
+
+    def feed(controllers=(), pilots=()):
+        return {"general": {}, "pilots": list(pilots),
+                "controllers": list(controllers), "atis": []}
+
+    def adopts_my_position_frequency():
+        """在网上上了席位，语音这边不该还要手动敲一遍频率。"""
+        window.cid = "1000"
+        before = len(window.stack)
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_APP",
+            "frequency": "125.900", "facility": 5}]))
+        assert len(window.stack) == before + 1, "没有把席位频率加进来"
+        radio = window.stack.get(125900)
+        assert radio is not None and radio.callsign == "ZSPD_APP", radio
+    check("上了席位自动加频率", adopts_my_position_frequency)
+
+    def does_not_add_it_twice():
+        before = len(window.stack)
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_APP",
+            "frequency": "125.900", "facility": 5}]))
+        assert len(window.stack) == before, "同一个席位被重复加了"
+    check("不会重复加", does_not_add_it_twice)
+
+    def respects_a_manual_removal():
+        """用户手动删掉之后，别每 60 秒跟他抢一次。"""
+        window.remove_radio(125900)
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_APP",
+            "frequency": "125.900", "facility": 5}]))
+        assert window.stack.get(125900) is None, "用户删掉的频率又被加回来了"
+    check("用户删掉就不再自动加", respects_a_manual_removal)
+
+    def ignores_the_no_frequency_placeholder():
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_DEL",
+            "frequency": "199.998", "facility": 5}]))
+        assert window.stack.get(199998) is None, "199.998 是占位，不能当频率用"
+    check("199.998 不当频率", ignores_the_no_frequency_placeholder)
+
+    def resolves_cid_to_callsign():
+        """语音层报上来的是纯数字 CID，界面上要显示成呼号。"""
+        khz = sorted(r.frequency_khz for r in window.stack)[0]
+        window.on_voice_rx(khz, True, "2001")          # Mumble 用户名 = ASN 号
+        window.on_datafeed(feed(pilots=[
+            {"cid": "2001", "callsign": "CES2345", "name": "某人"}]))
+        text = window.rows[khz].last_rx.text()
+        assert "CES2345" in text, text
+        assert "2001" not in text, f"还在显示 CID：{text}"
+    check("CID 显示成呼号", resolves_cid_to_callsign)
+
+    def unknown_cid_still_shows_something():
+        khz = sorted(r.frequency_khz for r in window.stack)[0]
+        window.on_voice_rx(khz, True, "9999")          # 不在数据源里
+        text = window.rows[khz].last_rx.text()
+        assert "9999" in text, f"查不到呼号时至少要显示 CID：{text}"
+    check("查不到呼号就显示 CID", unknown_cid_still_shows_something)
+
+    def a_dead_datafeed_changes_nothing():
+        before = len(window.stack)
+        window.on_datafeed(None)          # 取不到就是 None
+        assert len(window.stack) == before
+    check("数据源挂了不影响别的", a_dead_datafeed_changes_nothing)
+
+    print("多语言：")
+
+    def switching_language_changes_the_visible_text():
+        """换语言之后界面上的字要当场变。
+
+        只改设置、要重启才生效的话，用户第一反应是"是不是没保存"。
+        """
+        gui.i18n.set_language("zh")
+        window.retranslate()
+        chinese = window.add_button.text()
+        gui.i18n.set_language("en")
+        window.retranslate()
+        english = window.add_button.text()
+        assert chinese != english, f"换了语言但界面没变（都是 {chinese}）"
+        assert english == "Add", english
+        # 占位符类的也要跟着变
+        assert window.freq_input.placeholderText() != "频率，例如 118.000"
+        gui.i18n.set_language("zh")
+        window.retranslate()
+        assert window.add_button.text() == "添加频率"
+    check("换语言当场生效", switching_language_changes_the_visible_text)
+
+    def radio_cards_are_retranslated_too():
+        """电台卡片上的字也得跟着换。
+
+        卡片是**复用**的（rebuild_rows 对已有的行只调 refresh），所以按钮上的
+        文字和悬停提示这类"建的时候设一次"的字，不主动重刷就会一直停在旧语言上
+        ——切到英文之后卡片上还写着"静音"。
+        """
+        khz = sorted(r.frequency_khz for r in window.stack)[0]
+        row = window.rows[khz]
+        gui.i18n.set_language("en")
+        window.retranslate()
+        assert "最后通话" not in row.last_rx.text(), f"卡片没重译: {row.last_rx.text()}"
+        assert row.mute_button.text() == "Mute", \
+            f"静音按钮没跟着换语言: {row.mute_button.text()!r}"
+        assert "Receive" in row.rx_button.toolTip(), \
+            f"RX 悬停提示没跟着换语言: {row.rx_button.toolTip()!r}"
+        assert "Remove" in row.remove_button.toolTip(), \
+            f"移除的悬停提示没跟着换语言: {row.remove_button.toolTip()!r}"
+        gui.i18n.set_language("zh")
+        window.retranslate()
+        assert row.mute_button.text() == "静音", row.mute_button.text()
+    check("电台卡片也重译", radio_cards_are_retranslated_too)
+
+    def retranslating_does_not_wipe_a_live_warning():
+        """换语言不能把状态栏上正挂着的警告抹成"就绪"。
+
+        频道监听的警告是服务器不支持时唯一的线索，被"就绪"盖掉之后，管制员会
+        以为一切正常，而实际上除主频率外一个都收不到。
+        """
+        window.voice = mock.MagicMock()
+        window.voice.listeners_confirmed = False
+        for radio in window.stack:
+            radio.rx = True
+        window.update_hint()
+        assert window.status_label.text() == gui.t("status.listeners"), \
+            f"前提不成立: {window.status_label.text()!r}"
+        window.retranslate()
+        assert window.status_label.text() == gui.t("status.listeners"), \
+            f"retranslate 把监听警告抹掉了: {window.status_label.text()!r}"
+        window.voice = None
+    check("换语言不抹掉状态栏警告", retranslating_does_not_wipe_a_live_warning)
+
+    def cards_are_shown_in_frequency_order():
+        """卡片的顺序要和电台栈一致。
+
+        栈是按频率排过序的（radiostack.add 每次都 sort），而卡片一律往流式布局
+        末尾追加的话，后加的低频率会排到高频率后面——屏幕上的频率就不是升序了，
+        而这个界面就是拿来扫视的。
+        """
+        window.freq_input.setText("119.000")     # 排序上落在已有两个频率中间
+        window.add_radio()
+        layout = window.stack_layout
+        on_screen = [layout.itemAt(i).widget().khz for i in range(layout.count())]
+        assert on_screen == sorted(on_screen), \
+            f"屏幕上的频率不是升序: {on_screen}"
+        assert on_screen == [r.frequency_khz for r in window.stack], \
+            f"卡片顺序和电台栈对不上: {on_screen}"
+        window.remove_radio(119000)
+    check("卡片按频率升序排列", cards_are_shown_in_frequency_order)
+
+    def every_key_used_by_the_window_exists():
+        """漏定义的键会在界面上直接显示成 key，这里提前抓出来。"""
+        missing = [key for key in gui.i18n.TEXT
+                   if not gui.i18n.TEXT[key].get("zh")]
+        assert not missing, missing
+        # 界面上任何一处都不该出现裸的 key（形如 a.b）
+        for widget_text in (window.add_button.text(), window.top_button.text(),
+                            window.settings_button.text(),
+                            window.empty_hint.text()):
+            assert "." not in widget_text or " " in widget_text, \
+                f"这看起来是没翻出来的键: {widget_text}"
+    check("界面上没有漏翻的键", every_key_used_by_the_window_exists)
+
+    print("窗口置顶：")
+
+    def toggle_puts_the_flag_on_and_off():
+        from PyQt6.QtCore import Qt as _Qt
+        flag = _Qt.WindowType.WindowStaysOnTopHint
+        window.toggle_always_on_top(True)
+        assert bool(window.windowFlags() & flag), "置顶标志没设上"
+        assert window.settings.always_on_top is True
+        window.toggle_always_on_top(False)
+        assert not (window.windowFlags() & flag), "取消置顶没生效"
+        assert window.settings.always_on_top is False
+    check("开关都生效", toggle_puts_the_flag_on_and_off)
+
+    def the_window_is_still_visible_afterwards():
+        """Windows 上改 window flag 会把窗口隐藏掉。
+
+        忘了补 show() 的话，用户点一下置顶整个窗口就消失了——而且不会有任何
+        报错，看起来就像程序崩了。
+        """
+        window.show()
+        app.processEvents()
+        window.toggle_always_on_top(True)
+        app.processEvents()
+        assert not window.isHidden(), "点了置顶之后窗口不见了"
+        window.toggle_always_on_top(False)
+        app.processEvents()
+        assert not window.isHidden(), "取消置顶之后窗口不见了"
+    check("切换之后窗口还在", the_window_is_still_visible_afterwards)
+
+    def maximised_state_survives():
+        """show() 会把最大化状态丢掉，最大化的人一点置顶窗口就缩回去了。"""
+        window.showMaximized()
+        app.processEvents()
+        if not window.isMaximized():
+            return                    # 离屏平台不一定支持最大化，跳过
+        window.toggle_always_on_top(True)
+        app.processEvents()
+        assert window.isMaximized(), "置顶之后窗口从最大化缩回去了"
+        window.toggle_always_on_top(False)
+        window.showNormal()
+    check("最大化状态不丢", maximised_state_survives)
+
+    def the_setting_is_remembered():
+        window.toggle_always_on_top(True)
+        from settings import Settings
+        assert Settings().always_on_top is True, "置顶状态没有存下来"
+        window.toggle_always_on_top(False)
+        assert Settings().always_on_top is False
+    check("重启后还记得", the_setting_is_remembered)
 
     print("持久化：")
     check("电台栈已写进设置", lambda: (_ for _ in ()).throw(AssertionError(
