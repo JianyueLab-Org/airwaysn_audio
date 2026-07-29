@@ -1,0 +1,225 @@
+# 推到 main 就打包、自动进一位补丁号、发 Release。
+#
+# 版本号规则：**只有 v2.0.xxx 的 xxx 会自动动。** 主版本和次版本（2.0）是人的
+# 决定，写在 version.py 的 VERSION 里；补丁号由这个工作流数已有的 v2.0.* 标签
+# 得出，取最大的那个加一。想发 2.1 就去改 VERSION 并把下面的 SERIES 一起改。
+#
+# 为什么不让 version.py 自己维护补丁号：那需要每次发版都回推一个提交改文件，
+# 而那个提交又会触发这个工作流，自己咬自己。数标签没有这个问题——标签就是
+# 已发布版本的唯一事实来源。
+#
+# 打包的四个：client/ 和 xplane_client/ 是早期的纯语音飞行员端，已经被 xpc/
+# 和 msfs/ 取代（那两个还会登录 FSD 让飞机出现在网络上），不再出包。但它们的
+# 测试照跑——共享 FREQ_* 频道约定和 Mumble 处理，回归了同样要知道。
+#
+# 只能在 Windows 上打：PyAudio、SimConnect、opus.dll 都是 Windows 的，
+# PyInstaller 也不支持交叉编译。
+
+name: 打包与发布
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 打标签、建 Release 都要写权限
+
+# 两次推送挨得很近时会同时算出同一个补丁号，然后第二个打标签失败。
+# 串行化，后面那个会重新数一遍。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SERIES: "2.0"          # 自动递增只在这个系列里进行
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.next.outputs.number }}   # 2.0.7
+      tag: ${{ steps.next.outputs.tag }}         # v2.0.7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 要看到全部标签
+      - id: next
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          # 只看本系列的标签，取补丁号最大的那个。一个都没有就从 0 开始。
+          latest=$(git tag -l "v${SERIES}.*" \
+                   | sed -n "s/^v${SERIES}\.\([0-9][0-9]*\)$/\1/p" \
+                   | sort -n | tail -1)
+          next=$(( ${latest:--1} + 1 ))
+          echo "number=${SERIES}.${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${SERIES}.${next}"   >> "$GITHUB_OUTPUT"
+          echo "上一个补丁号 ${latest:-（无）}，这次发 v${SERIES}.${next}"
+
+  test:
+    # 和 build 并行。测试没过就不发——release 同时依赖两者。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # PyAudio 没有 3.13+ 的 wheel
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: 单元测试
+        shell: pwsh
+        run: |
+          $dirs = @("atis", "client", "controller", "msfs", "server",
+                    "server/ATIS", "xpc", "xplane_client")
+          $failed = @()
+          foreach ($d in $dirs) {
+            Write-Output "::group::$d"
+            Push-Location $d
+            python -m unittest discover -p "test_*.py"
+            if ($LASTEXITCODE -ne 0) { $failed += $d }
+            Pop-Location
+            Write-Output "::endgroup::"
+          }
+          if ($failed.Count) { throw "这些目录的测试没过: $($failed -join ', ')" }
+
+      - name: 离屏 smoke
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen   # CI 上没有显示器
+        run: |
+          foreach ($d in @("atis", "controller", "client", "msfs", "xpc", "xplane_client")) {
+            Write-Output "::group::$d smoke"
+            Push-Location $d
+            python smoke_gui.py
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "$d 的 smoke 没过" }
+            Pop-Location
+            Write-Output "::endgroup::"
+          }
+
+  build:
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false   # 一个挂了其余三个照打，一次看全问题
+      matrix:
+        include:
+          - component: controller
+            output: audio-for-can
+          - component: atis
+            output: atis-for-can
+          - component: xpc
+            output: xpc-for-can
+          - component: msfs
+            output: msfs-for-can
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # version.freeze() 用 git rev-list --count HEAD 当 build 号，
+          # 浅克隆只有一个提交，会得出 build 1
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: 打包 ${{ matrix.output }}
+        working-directory: ${{ matrix.component }}
+        env:
+          # version.freeze() 读它，写进 buildinfo.json；界面和日志显示的就是它
+          AIRWAYSN_VERSION: ${{ needs.version.outputs.number }}
+        # 必须在组件目录里跑：spec 里 favicon.ico、opus.dll 都是相对路径
+        run: pyinstaller gui.spec --noconfirm --clean
+
+      - name: 验原生库和版本号
+        working-directory: ${{ matrix.component }}
+        shell: pwsh
+        # opus.dll 和 SimConnect.dll 是 ctypes 运行时加载的，PyInstaller 的静态
+        # 分析看不见。漏了不会让打包失败，只会让用户拿到一个装上就用不了的包，
+        # 所以在这里显式验一遍。
+        run: |
+          $root = "dist/${{ matrix.output }}/_internal"
+          $missing = @()
+          if (-not (Test-Path "$root/opus.dll")) { $missing += "opus.dll" }
+          if (-not (Test-Path "$root/buildinfo.json")) { $missing += "buildinfo.json" }
+          if ("${{ matrix.component }}" -eq "msfs" -and
+              -not (Test-Path "$root/SimConnect/SimConnect.dll")) {
+            $missing += "SimConnect/SimConnect.dll"
+          }
+          if ($missing.Count) { throw "包里缺这些运行时必需的文件: $($missing -join ', ')" }
+
+          $info = Get-Content "$root/buildinfo.json" | ConvertFrom-Json
+          if ($info.version -ne "${{ needs.version.outputs.number }}") {
+            throw "包里的版本号是 $($info.version)，应当是 ${{ needs.version.outputs.number }}"
+          }
+          Write-Output "原生库齐全，版本 $($info.version) build $($info.build)"
+
+      - name: 压包
+        working-directory: ${{ matrix.component }}/dist
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "${{ matrix.output }}" `
+            -DestinationPath "${{ matrix.output }}-${{ needs.version.outputs.tag }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.component }}/dist/*.zip
+          if-no-files-found: error
+
+  release:
+    # 只有推到 main 才发。手动触发只出产物挂在 Actions 里，方便试包而不占版本号。
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [version, test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+
+      - name: 打标签
+        # 标签是"已发布版本"的唯一事实来源，下一次就靠它算补丁号
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.version.outputs.tag }}" \
+                  -m "${{ needs.version.outputs.tag }}"
+          git push origin "${{ needs.version.outputs.tag }}"
+
+      - name: 建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          files: packages/**/*.zip
+          generate_release_notes: true
+          body: |
+            ## 下载哪个
+
+            | 包 | 给谁用 |
+            |---|---|
+            | `audio-for-can` | 管制员：一栈频率，每个带 RX/TX/XC |
+            | `atis-for-can` | 情报通播：自动取天气、中英双语播出 |
+            | `xpc-for-can` | X-Plane 飞行员：语音 + FSD |
+            | `msfs-for-can` | MSFS 飞行员：语音 + FSD |
+
+            解压后运行目录里的 exe。**不要**去 `build/` 里找同名的那个——
+            那只是引导程序，缺 `_internal/` 里的运行库，双击会报
+            "Failed to load Python DLL"。
+
+            早期的纯语音飞行员端（`client` / `xplane_client`）不再出包，
+            功能已并入 `xpc-for-can` 和 `msfs-for-can`。
