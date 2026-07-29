@@ -67,6 +67,8 @@ jobs:
         with:
           python-version: '3.12'   # PyAudio 没有 3.13+ 的 wheel
           cache: pip
+          # 默认只认 requirements.txt / pyproject.toml，不指明会直接报错
+          cache-dependency-path: requirements-build.txt
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
@@ -128,6 +130,8 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          # 默认只认 requirements.txt / pyproject.toml，不指明会直接报错
+          cache-dependency-path: requirements-build.txt
 
       - run: |
           python -m pip install --upgrade pip
