@@ -31,8 +31,9 @@ LANGUAGES = {"zh": "中文", "en": "English"}
 
 TEXT = {
     # ---------- 通用 ----------
-    "app.title":            {"zh": "管制语音 - Airwaysn", "en": "Controller Voice - Airwaysn"},
-    "app.name":             {"zh": "管制语音", "en": "Controller Voice"},
+    # 产品名和 XPC for CAN / MSFS for CAN 对齐，四个客户端一套命名
+    "app.title":            {"zh": "Audio for CAN", "en": "Audio for CAN"},
+    "app.name":             {"zh": "Audio for CAN", "en": "Audio for CAN"},
 
     # ---------- 登录 ----------
     "login.username":       {"zh": "用户名（ASN 号）", "en": "Username (ASN ID)"},
@@ -70,6 +71,10 @@ TEXT = {
                              "en": "Cross-couple with the other XC frequencies"},
     "radio.mute":           {"zh": "静音", "en": "Mute"},
     "radio.mute_tip":       {"zh": "静音这个频率", "en": "Mute this frequency"},
+    "main.compact":         {"zh": "精简", "en": "Compact"},
+    "main.compact_tip":     {"zh": "只显示电台卡片，窗口缩到最小",
+                             "en": "Show only the radio cards and shrink the window"},
+
     "radio.remove_tip":     {"zh": "从电台栈移除", "en": "Remove from the stack"},
     "radio.remove_locked":  {"zh": "这是你正在管的席位频率，不能移除",
                              "en": "This is the position you are staffing — cannot be removed"},

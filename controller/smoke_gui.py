@@ -202,6 +202,27 @@ def main():
         assert radio is not None and radio.callsign == "ZSPD_APP", radio
     check("上了席位自动加频率", adopts_my_position_frequency)
 
+    def my_own_frequency_defaults_to_rx_and_tx():
+        """上了席位本来就是要在这个频率上收发的，不该还要手动点两下。
+
+        漏点了不会报错，只是喊了半天没人应。
+        """
+        radio = window.stack.get(125900)
+        assert radio.rx, "自己的席位频率没有默认开 RX"
+        assert radio.tx, "自己的席位频率没有默认开 TX"
+        assert window.stack.selected_khz == 125900, "自己的席位频率不是主频率"
+    check("自己的频率默认 RX+TX", my_own_frequency_defaults_to_rx_and_tx)
+
+    def a_manual_tx_off_is_not_undone():
+        """管制员自己把 TX 关掉之后，下一轮刷新不该又给他打开。"""
+        window.stack.set_tx(125900, False)
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_APP",
+            "frequency": "125.900", "facility": 5}]))
+        assert not window.stack.get(125900).tx, "刷新之后 TX 又被打开了"
+        window.stack.set_tx(125900, True)      # 复原，后面的用例还要用
+    check("手动关掉的 TX 不会被刷回来", a_manual_tx_off_is_not_undone)
+
     def does_not_add_it_twice():
         before = len(window.stack)
         window.on_datafeed(feed(controllers=[{
@@ -462,17 +483,66 @@ def main():
         assert Settings().always_on_top is False
     check("重启后还记得", the_setting_is_remembered)
 
-    print("持久化：")
-    check("电台栈已写进设置", lambda: (_ for _ in ()).throw(AssertionError(
-        window.settings.radios)) if len(window.settings.radios) != 2 else None)
+    print("精简模式：")
 
-    def reload_stack():
-        from radiostack import RadioStack
-        restored = RadioStack()
-        restored.load(window.settings.radios)
-        assert len(restored) == 2
-        assert restored.get(118000).callsign == "ZSPD_TWR"
-    check("能从设置恢复", reload_stack)
+    def compact_hides_everything_but_the_cards():
+        window.toggle_compact(True)
+        for name in ("add_bar", "online_bar", "bottom_bar", "conn_label",
+                     "session_label", "settings_button", "disconnect_button"):
+            assert not getattr(window, name).isVisible(), f"{name} 没有收起来"
+        assert window.stack_area.isVisible(), "电台卡片被一起藏掉了"
+    check("精简只留卡片", compact_hides_everything_but_the_cards)
+
+    def compact_actually_tightens_the_layout():
+        """光藏控件不够——留着正常模式的边距和带文字的大按钮，一张卡的窗口
+        里有一半是空的，那就失去精简的意义了。"""
+        import gui as gui_module
+        margins = window.main_layout.contentsMargins()
+        assert margins.left() == gui_module.COMPACT_MARGINS[0], margins.left()
+        assert window.main_layout.spacing() == gui_module.COMPACT_SPACING
+        assert window.top_button.text() == "", "精简时按钮上还留着文字"
+        assert window.top_button.width() <= 40, window.top_button.width()
+    check("精简把留白也收紧", compact_actually_tightens_the_layout)
+
+    def there_is_always_a_way_back():
+        """顶栏不能整条藏——藏完就没有任何路径切回去了。"""
+        assert window.compact_button.isVisible(), "切回去的开关自己也被藏了"
+        assert window.top_button.isVisible(), "置顶开关被藏了"
+    check("精简后仍能切回", there_is_always_a_way_back)
+
+    def expanding_restores_everything():
+        window.toggle_compact(False)
+        for name in ("add_bar", "online_bar", "bottom_bar", "conn_label",
+                     "session_label", "settings_button", "disconnect_button"):
+            assert getattr(window, name).isVisible(), f"{name} 没有恢复"
+    check("展开全部恢复", expanding_restores_everything)
+
+    def the_state_is_remembered():
+        from settings import Settings
+        window.toggle_compact(True)
+        assert Settings().compact is True, "精简状态没有存下来"
+        window.toggle_compact(False)
+        assert Settings().compact is False
+    check("精简状态记得住", the_state_is_remembered)
+
+    print("持久化：")
+
+    def the_stack_is_not_persisted():
+        """频率不跨会话保留：上一场的临时频道多半早就没人了。"""
+        from settings import Settings
+        window.settings.save_settings()
+        assert not hasattr(Settings(), "radios") or not Settings().radios, \
+            "电台栈被写进设置了"
+    check("电台栈不写进设置", the_stack_is_not_persisted)
+
+    def a_fresh_window_starts_empty():
+        import json
+        import os
+        path = "radio_settings.json"
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                assert "radios" not in json.load(f), "设置文件里还有 radios"
+    check("设置文件里没有频率", a_fresh_window_starts_empty)
 
     print("移除与设置：")
     check("移除一个频率", lambda: window.remove_radio(118000))

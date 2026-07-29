@@ -77,6 +77,13 @@ MONO_FONT = "Consolas"
 CARD_WIDTH = 232
 CARD_HEIGHT = 116
 
+# 页面留白。精简模式下要紧一大截——那个模式的整个意义就是占地方少，留着
+# 正常模式的 16px 边距和 12px 间距，一张卡的窗口有一半是空的。
+NORMAL_MARGINS = (16, 14, 16, 12)
+NORMAL_SPACING = 12
+COMPACT_MARGINS = (6, 4, 6, 4)
+COMPACT_SPACING = 4
+
 
 class VoiceSignals(QObject):
     """pymumble 的回调在库线程里跑，必须经信号回到界面线程。"""
@@ -447,10 +454,14 @@ class ControllerWindow(QMainWindow):
 
         self.setup_ui()
         self.setup_ptt()
-        # 上次开着置顶的话，这次起来就是置顶的
+        # 上次开着置顶 / 精简的话，这次起来就还是那样
         self.apply_always_on_top()
+        if self.settings.compact:
+            self.toggle_compact(True)
 
-        self.stack.load(self.settings.radios)
+        # 电台栈**不做持久化**：每次启动都是空的。频率该从数据源来——上了席位
+        # 的自动加，别人的席位在"在线频率"里点。留着上一场的频率反而危险：
+        # 那些临时频道多半早就没人了，而屏幕上看起来一切正常。
 
     # ---------- 界面 ----------
     def setup_ui(self):
@@ -526,12 +537,17 @@ class ControllerWindow(QMainWindow):
     def build_main_page(self):
         page = QWidget()
         page.setObjectName("page")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 14, 16, 12)
-        layout.setSpacing(12)
+        self.main_layout = layout = QVBoxLayout(page)
+        layout.setContentsMargins(*NORMAL_MARGINS)
+        layout.setSpacing(NORMAL_SPACING)
 
         # ---- 顶栏：连接状态 + 席位 + 操作 ----
-        top = QHBoxLayout()
+        # 四个横条各包一层 QWidget：精简模式要整条整条地藏起来，而 QHBoxLayout
+        # 本身没有 setVisible，只能藏控件
+        self.top_bar = QWidget()
+        self.top_bar.setStyleSheet("background: transparent;")
+        top = QHBoxLayout(self.top_bar)
+        top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
         # 掉线要能一眼看出来，不然管制员会对着死掉的连接一直喊
         self.conn_indicator = Dot(ONLINE_COLOR)
@@ -554,6 +570,16 @@ class ControllerWindow(QMainWindow):
         self.top_button.clicked.connect(self.toggle_always_on_top)
         top.addWidget(self.top_button)
 
+        # 精简模式：只留电台卡片。管制员真正要盯的就是那几张卡，把输入框、
+        # 在线频率、状态栏都收起来之后窗口能小到压在雷达角落里。
+        self.compact_button = TogglePushButton()
+        self.compact_button.setText(t("main.compact"))
+        self.compact_button.setIcon(FluentIcon.MINIMIZE)
+        self.compact_button.setToolTip(t("main.compact_tip"))
+        self.compact_button.setChecked(self.settings.compact)
+        self.compact_button.clicked.connect(self.toggle_compact)
+        top.addWidget(self.compact_button)
+
         self.settings_button = settings_button = PushButton()
         settings_button.setText(t("main.settings"))
         settings_button.setIcon(FluentIcon.SETTING)
@@ -565,10 +591,13 @@ class ControllerWindow(QMainWindow):
         disconnect_button.setIcon(FluentIcon.POWER_BUTTON)
         disconnect_button.clicked.connect(self.disconnect_voice)
         top.addWidget(disconnect_button)
-        layout.addLayout(top)
+        layout.addWidget(self.top_bar)
 
         # ---- 添加频率 ----
-        add_row = QHBoxLayout()
+        self.add_bar = QWidget()
+        self.add_bar.setStyleSheet("background: transparent;")
+        add_row = QHBoxLayout(self.add_bar)
+        add_row.setContentsMargins(0, 0, 0, 0)
         add_row.setSpacing(8)
         # 输入框按比例伸缩，不写死宽度。写死的话（180 + 340 + 按钮 + 边距）正好
         # 顶到窗口最小宽度，"添加频率"就被挤到窗口边上，看着像被裁掉了。
@@ -596,7 +625,7 @@ class ControllerWindow(QMainWindow):
         add_row.addWidget(self.callsign_input, 2)
         add_row.addWidget(add_button, 0)
         add_row.addStretch(1)
-        layout.addLayout(add_row)
+        layout.addWidget(self.add_bar)
 
         # ---- 电台栈 ----
         self.stack_area = ScrollArea()
@@ -615,7 +644,10 @@ class ControllerWindow(QMainWindow):
         layout.addWidget(self.empty_hint)
 
         # ---- 在线频率：数据源上此刻有人的席位，点一下加进电台栈 ----
-        online_bar = QHBoxLayout()
+        self.online_bar = QWidget()
+        self.online_bar.setStyleSheet("background: transparent;")
+        online_bar = QHBoxLayout(self.online_bar)
+        online_bar.setContentsMargins(0, 0, 0, 0)
         online_bar.setSpacing(6)
         self.online_title = CaptionLabel(t("online.title"))
         self.online_title.setStyleSheet(f"color: {IDLE_COLOR};")
@@ -623,10 +655,13 @@ class ControllerWindow(QMainWindow):
         self.online_box = QHBoxLayout()
         self.online_box.setSpacing(4)
         online_bar.addLayout(self.online_box, 1)
-        layout.addLayout(online_bar)
+        layout.addWidget(self.online_bar)
 
         # ---- 底栏：PTT + 状态 ----
-        bottom = QHBoxLayout()
+        self.bottom_bar = QWidget()
+        self.bottom_bar.setStyleSheet("background: transparent;")
+        bottom = QHBoxLayout(self.bottom_bar)
+        bottom.setContentsMargins(0, 0, 0, 0)
         bottom.setSpacing(8)
         self.ptt_indicator = Dot(IDLE_COLOR, size=12)
         bottom.addWidget(self.ptt_indicator)
@@ -641,8 +676,58 @@ class ControllerWindow(QMainWindow):
         self.duty_label = CaptionLabel(t("duty.observer"))
         self.duty_label.setStyleSheet(f"color: {IDLE_COLOR};")
         bottom.addWidget(self.duty_label)
-        layout.addLayout(bottom)
+        layout.addWidget(self.bottom_bar)
         return page
+
+    # ---------- 精简模式 ----------
+    def toggle_compact(self, enabled=None):
+        """只留电台卡片，其余整条收起来。
+
+        管制员真正要盯的就是那几张卡；输入框、在线频率、状态栏都是配置和参考
+        用的，收起来之后窗口能小到压在雷达角落里——和置顶那个开关是一对。
+
+        顶栏不整条藏：留着连接指示灯、置顶和这个开关本身，否则精简之后就没有
+        任何路径能切回来了。
+        """
+        if enabled is None:
+            enabled = self.compact_button.isChecked()
+        enabled = bool(enabled)
+        self.compact_button.setChecked(enabled)
+
+        for widget in (self.add_bar, self.online_bar, self.bottom_bar):
+            widget.setVisible(not enabled)
+        # 没有频率时那句提示在精简模式下也没意义
+        self.empty_hint.setVisible(not enabled and len(self.stack) == 0)
+        for widget in (self.conn_label, self.session_label,
+                       self.settings_button, self.disconnect_button):
+            widget.setVisible(not enabled)
+
+        # 留白和按钮也要跟着缩。精简模式的意义就是占地方少，留着正常模式的
+        # 边距、间距和带文字的大按钮，一张卡的窗口里有一半是空的。
+        self.main_layout.setContentsMargins(
+            *(COMPACT_MARGINS if enabled else NORMAL_MARGINS))
+        self.main_layout.setSpacing(COMPACT_SPACING if enabled else NORMAL_SPACING)
+        for button, label in ((self.top_button, t("main.pin")),
+                              (self.compact_button, t("main.compact"))):
+            # 精简时只留图标：那两个字在这种窗口里占的是卡片的地方
+            button.setText("" if enabled else label)
+            if enabled:
+                button.setFixedSize(30, 26)
+            else:
+                button.setMinimumSize(0, 0)
+                button.setMaximumSize(16777215, 16777215)
+
+        # 最小尺寸要跟着放开，否则窗口缩不下去——一张卡加上留白就够了
+        if enabled:
+            self.setMinimumSize(CARD_WIDTH + 2 * COMPACT_MARGINS[0] + 4,
+                                CARD_HEIGHT + 70)
+            self.resize(self.minimumWidth(), self.minimumHeight())
+        else:
+            self.setMinimumSize(620, 480)
+            self.resize(max(self.width(), 620), max(self.height(), 480))
+
+        self.settings.compact = enabled
+        self.settings.save_settings()
 
     def _set_connection_style(self, connected):
         color = ONLINE_COLOR if connected else OFFLINE_COLOR
@@ -733,15 +818,14 @@ class ControllerWindow(QMainWindow):
 
     # ---------- 电台栈 ----------
     def on_stack_changed(self):
-        """栈变了：重画界面、推给服务器、存盘。"""
+        """栈变了：重画界面，推给服务器。**不存盘**——频率不跨会话保留。"""
         self.rebuild_rows()
+        self.refresh_online_list()      # 加/删之后"在线频率"里的置灰要跟着变
         if self.voice:
             # sync 要建频道、发协议消息，还要等服务器回话——放在界面线程里做的话，
             # 每加一个频率界面就会卡一下
             threading.Thread(target=self.voice.sync, args=(self.stack,),
                              daemon=True).start()
-        self.settings.radios = self.stack.to_list()
-        self.settings.save_settings()
 
     def rebuild_rows(self):
         current = {radio.frequency_khz for radio in self.stack}
@@ -916,7 +1000,16 @@ class ControllerWindow(QMainWindow):
         except ValueError as e:
             log.warning("自动加入席位频率失败: %s", e)
             return
-        log.info("按数据源上的席位 %s 自动加入 %s",
+        # 自己的席位频率默认就开 RX + TX：管制员上了席位，本来就是要在这个
+        # 频率上收发的，还要手动点两下才能说话是多余的一步——而且漏点了不会
+        # 报错，只是喊了半天没人应。set_tx 会连带打开 RX（不存在只发不收）。
+        #
+        # 只在**新加进来**的时候设（上面已经挡掉了栈里已有的），所以之后管制员
+        # 自己把 TX 关掉，下一轮刷新不会又给他打开。
+        self.stack.set_tx(khz, True)
+        self.stack.select(khz)          # 顺带设成主频率：真正进入的那个频道
+
+        log.info("按数据源上的席位 %s 自动加入 %s（默认 RX + TX）",
                  callsign, radiostack.format_frequency(khz))
         self.status_label.setStyleSheet(f"color: {ON_COLOR};")
         self.status_label.setText(t(
@@ -1109,7 +1202,7 @@ if __name__ == '__main__':
     debug = '--debug' in sys.argv or Settings().debug
     applog.setup(debug=debug)
     # 版本号必须进日志：用户发上来的日志是唯一能确认他跑的是哪个 build 的东西
-    log.info("管制语音客户端启动 %s", version.full())
+    log.info("Audio for CAN 启动 %s", version.full())
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))

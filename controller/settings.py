@@ -25,10 +25,13 @@ class Settings:
         self.input_device_index = None
         self.output_device_index = None
         self.last_username = ""
-        # 电台栈：上次用的那组频率，下次启动接着用
-        self.radios = []
+        # 电台栈**不存**。频率该从数据源来：上了席位的自动加，别人的席位在
+        # "在线频率"里点。留着上一场的频率反而危险——那些临时频道多半早就没
+        # 人了，屏幕上却看起来一切正常。老配置里的 radios 键读到也直接忽略。
         # 窗口置顶。管制员多半把语音压在雷达/模拟器上面用，这个开关要能记住
         self.always_on_top = False
+        # 精简模式：只留电台卡片。和置顶是一对，同样要记住
+        self.compact = False
         # 界面语言。空字符串表示"还没选过"，第一次启动跟系统走
         self.language = ""
         self.debug = False
@@ -45,8 +48,8 @@ class Settings:
                     self.input_device_index = data.get("input_device_index", None)
                     self.output_device_index = data.get("output_device_index", None)
                     self.last_username = data.get("last_username", "")
-                    self.radios = data.get("radios", [])
                     self.always_on_top = bool(data.get("always_on_top", False))
+                    self.compact = bool(data.get("compact", False))
                     self.language = data.get("language", "") or ""
                     self.debug = bool(data.get("debug", False))
         except Exception as e:
@@ -61,8 +64,8 @@ class Settings:
                 "input_device_index": self.input_device_index,
                 "output_device_index": self.output_device_index,
                 "last_username": self.last_username,
-                "radios": self.radios,
                 "always_on_top": self.always_on_top,
+                "compact": self.compact,
                 "language": self.language,
                 "debug": self.debug,
             }

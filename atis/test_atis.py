@@ -1148,6 +1148,182 @@ class VoiceFixTest(unittest.TestCase):
         self.assertEqual(voicefix.polish("a ,b .c"), "a, b. c")
 
 
+class BroadcastRulesTest(unittest.TestCase):
+    """开播前的拦截规则。
+
+    这几条原来在 gui.py 里各写了两遍（点按钮时一遍、数据源核对回来再一遍），
+    四段文案各自独立，只能靠点按钮触发，测不到。
+
+    两遍检查本身是必要的：核对要走网络，中间隔着几秒，这期间完全可能又开了
+    一个同频率的席位。所以规则要能共用，但不能因此省掉第二次检查。
+    """
+
+    def setUp(self):
+        global rules
+        import rules
+        self.profile = Profile(path=os.path.join(
+            tempfile.mkdtemp(), "atis_profile.json"))
+        self.pudong = Station("ZSPD", "浦东", "127.850")
+        self.profile.add(self.pudong)
+        self.rendered = ("ZSPD ATIS A", "Shanghai ATIS Alpha")
+
+    def refuse(self, station=None, broadcasting=(), cid="1000",
+               password="pw", rendered=True):
+        return rules.blocking_reason(
+            station or self.pudong, self.profile, broadcasting, cid, password,
+            self.rendered if rendered else None)
+
+    def test_nothing_blocks_a_normal_start(self):
+        self.assertIsNone(self.refuse())
+
+    def test_credentials_are_required(self):
+        self.assertEqual(self.refuse(cid="")[0], "错误")
+        self.assertEqual(self.refuse(password="")[0], "错误")
+        self.assertIn("用户名", self.refuse(cid="")[1])
+
+    def test_no_script_is_blocked(self):
+        title, message = self.refuse(rendered=False)
+        self.assertEqual(title, "错误")
+        self.assertIn("刷新天气", message)
+
+    def test_a_blank_voice_script_counts_as_no_script(self):
+        """渲染出来但语音是空白的，播出去就是一段静音。"""
+        self.rendered = ("有文字", "   ")
+        self.assertIsNotNone(self.refuse())
+
+    # ---------- 频率冲突 ----------
+    def test_same_frequency_is_refused(self):
+        """语音账号是 {cid}_atis{频率}，同频率再开一个会把先连上的踢掉。"""
+        twin = Station("ZSSS", "虹桥", "127.850")     # 同频率，不同机场
+        self.profile.add(twin)
+        title, message = self.refuse(broadcasting={twin.callsign})
+        self.assertEqual(title, "频率冲突")
+        self.assertIn(twin.callsign, message)
+        self.assertIn("踢掉", message)
+
+    def test_a_different_frequency_is_fine(self):
+        other = Station("ZSSS", "虹桥", "132.250")
+        self.profile.add(other)
+        self.assertIsNone(self.refuse(broadcasting={other.callsign}))
+
+    def test_itself_is_not_a_conflict(self):
+        """自己已经在播的话，调用方走的是停播那条路，不该报冲突。"""
+        self.assertIsNone(rules.frequency_conflict(
+            self.pudong, self.profile, {self.pudong.callsign}))
+
+    def test_conflict_names_the_other_station(self):
+        twin = Station("ZSSS", "虹桥", "127.850")
+        self.profile.add(twin)
+        found = rules.frequency_conflict(self.pudong, self.profile,
+                                         {twin.callsign})
+        self.assertIs(found, twin)
+
+    def test_credentials_are_checked_before_the_conflict(self):
+        """先报最好改的那一条：没填账号时不该先弹频率冲突。"""
+        twin = Station("ZSSS", "虹桥", "127.850")
+        self.profile.add(twin)
+        self.assertEqual(self.refuse(cid="", broadcasting={twin.callsign})[0],
+                         "错误")
+
+
+class ScriptTest(unittest.TestCase):
+    """渲染层。以前这段逻辑埋在 gui.py 里、还抄了两遍（预览一遍、推送一遍），
+    只能靠 smoke 间接覆盖；拆成 script.py 之后可以直接测。
+
+    两遍抄写的真正代价不是重复，是**改岔之后界面上看不出来**——预览显示的和
+    播出去的成了两份稿子，只有听的人知道。
+    """
+
+    def setUp(self):
+        global script
+        import script
+        self.metar = Metar(ZSPD)
+        self.preset = Preset(
+            airport_conditions="ARR RWY 16L, DEP RWY 16R.",
+            chinese_runway="跑道 幺六左 进港，跑道 幺六右 出港。",
+            chinese_extra="放行频率 幺两幺点六。")
+
+    def station(self, language=profile_module.LANGUAGE_ENGLISH, **kw):
+        return Station("ZSPD", "Shanghai Pudong International Airport",
+                       "127.850", voice_language=language,
+                       chinese_name="上海浦东国际机场", **kw)
+
+    # ---------- render ----------
+    def test_missing_pieces_give_none(self):
+        """缺天气就不该推一份缺了半截的稿子出去。"""
+        station = self.station()
+        self.assertIsNone(script.render(station, self.preset, None))
+        self.assertIsNone(script.render(station, None, self.metar))
+        self.assertIsNone(script.render(None, self.preset, self.metar))
+
+    def test_text_keeps_the_raw_groups(self):
+        text, _ = script.render(self.station(), self.preset, self.metar)
+        self.assertIn("09004MPS", text, "文字通播要照抄电码")
+        self.assertIn("Q1013", text)
+
+    def test_english_station_speaks_english_only(self):
+        _, voice = script.render(self.station(), self.preset, self.metar)
+        self.assertIn("wind zero niner zero", voice)
+        self.assertNotIn("风", voice, "选了英文就不该混进中文")
+
+    def test_chinese_station_speaks_chinese_only(self):
+        station = self.station(profile_module.LANGUAGE_CHINESE)
+        _, voice = script.render(station, self.preset, self.metar)
+        self.assertIn("上海浦东国际机场", voice)
+        self.assertIn("风向", voice)
+        self.assertNotIn("wind", voice, "选了中文就不该混进英文")
+
+    def test_bilingual_puts_chinese_after_english(self):
+        """中文飞行员听得懂英文的居多，反过来不一定。"""
+        station = self.station(profile_module.LANGUAGE_BOTH)
+        _, voice = script.render(station, self.preset, self.metar)
+        self.assertLess(voice.index("wind zero niner zero"),
+                        voice.index("风向"), "中文应当在英文之后")
+
+    def test_preset_runway_wins_over_the_station_one(self):
+        """切到别的构型时英文的 ARR RWY 会变，中文不跟着就自相矛盾了。"""
+        station = self.station(profile_module.LANGUAGE_CHINESE,
+                               chinese_runway="三四右")
+        _, voice = script.render(station, self.preset, self.metar)
+        self.assertIn("幺六左", voice)
+        self.assertNotIn("三四右", voice, "预设里的跑道没有盖过席位上那个")
+
+    def test_station_runway_is_the_fallback(self):
+        station = self.station(profile_module.LANGUAGE_CHINESE,
+                               chinese_runway="三四右")
+        bare = Preset()
+        _, voice = script.render(station, bare, self.metar)
+        self.assertIn("三四右", voice)
+
+    # ---------- summary ----------
+    def test_summary_has_the_four_things(self):
+        station = self.station()
+        line = script.summary(station, self.metar)
+        for piece in ("ZSPD", station.letter, "09004MPS", "Q1013"):
+            self.assertIn(piece, line, line)
+
+    def test_summary_without_weather(self):
+        line = script.summary(self.station(), None)
+        self.assertIn("ZSPD", line)
+        self.assertNotIn("Q", line.replace("ZSPD", ""), line)
+
+    def test_summary_marks_the_broadcasting_one(self):
+        self.assertTrue(script.summary(self.station(), self.metar,
+                                       broadcasting=True).startswith("●"))
+        self.assertFalse(script.summary(self.station(), self.metar,
+                                        broadcasting=False).startswith("●"))
+
+    def test_summary_distinguishes_departure_and_arrival(self):
+        """同一个机场的综合/离场/进场不能长得一模一样。"""
+        lines = {
+            script.summary(self.station(atis_type=kind), self.metar)
+            for kind in (profile_module.TYPE_COMBINED,
+                         profile_module.TYPE_DEPARTURE,
+                         profile_module.TYPE_ARRIVAL)
+        }
+        self.assertEqual(len(lines), 3, lines)
+
+
 class ChineseVoiceTest(unittest.TestCase):
     """中文通播稿。不是英文的逐词翻译，语序和读法都是民航自己的一套。"""
 

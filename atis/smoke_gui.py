@@ -93,11 +93,125 @@ def main():
 
     check("选中第一个", lambda: window.station_list.setCurrentRow(0))
 
+    # 用 isHidden() 而不是 isVisible()：离屏跑的时候顶层窗口没有 show()，
+    # isVisible() 对所有子控件一律返回 False，测不出任何东西
+    def the_metar_line_follows_the_selection():
+        """切席位时 METAR 那一行要跟着走。
+
+        原来它只在 on_metar 里、且到货的正好是当前席位时才写一次——于是屏幕上
+        会出现"选中 ZBAA、右边渲染的是 ZBAA、METAR 那行却是 ZSHC"，看的人会
+        以为渲染用错了天气。
+        """
+        import metar as metar_module
+        first, second = window.profile.stations[0], window.profile.stations[1]
+        window.on_metar(first.callsign, metar_module.Metar(ZSPD), "")
+        window.station_list.setCurrentRow(1)
+        text = window.metar_label.text()
+        assert "09004MPS" not in text, f"切到别的席位还显示上一个的报文：{text!r}"
+        window.station_list.setCurrentRow(0)
+        assert "09004MPS" in window.metar_label.text(), \
+            f"切回来没有恢复：{window.metar_label.text()!r}"
+    check("METAR 行跟着席位走", the_metar_line_follows_the_selection)
+
+    def the_top_bar_does_not_grow_with_the_window():
+        """顶栏纵向要钉成 Fixed。
+
+        它是个包了一层的 QWidget（精简模式要整条藏起来），而裸 QWidget 默认是
+        Preferred，会跟着窗口一起长——多出来的高度全被这一条吃掉，账号输入框
+        浮在窗口正中间，底下的分割器反被挤扁。用 addLayout 时没这问题，所以是
+        包那一层引进来的。
+        """
+        window.show()
+        window.resize(1000, 560)
+        app.processEvents()
+        short = window.top_bar.height()
+        window.resize(1000, 960)
+        app.processEvents()
+        tall = window.top_bar.height()
+        assert tall == short, f"窗口拉高之后顶栏从 {short} 变成 {tall}"
+        assert tall < 120, f"顶栏 {tall}px，太高了"
+    check("顶栏不跟着窗口长高", the_top_bar_does_not_grow_with_the_window)
+
+    def pinning_is_remembered():
+        from settings import Settings
+        window.toggle_always_on_top(True)
+        assert Settings().always_on_top is True, "置顶状态没有存下来"
+        window.toggle_always_on_top(False)
+        assert Settings().always_on_top is False
+    check("置顶状态记得住", pinning_is_remembered)
+
+    def compact_leaves_only_the_list():
+        window.toggle_compact(True)
+        for name in ("top_bar", "station_buttons", "right_panel"):
+            assert getattr(window, name).isHidden(), f"{name} 没有收起来"
+        assert not window.station_list.isHidden(), "席位列表被一起藏掉了"
+        assert not window.compact_button.isHidden(), "切回去的开关自己也被藏了"
+    check("精简只留席位列表", compact_leaves_only_the_list)
+
+    def expanding_restores_everything():
+        window.toggle_compact(False)
+        for name in ("top_bar", "station_buttons", "right_panel"):
+            assert not getattr(window, name).isHidden(), f"{name} 没有恢复"
+    check("展开全部恢复", expanding_restores_everything)
+
+    def compact_state_is_remembered():
+        from settings import Settings
+        window.toggle_compact(True)
+        assert Settings().compact is True, "精简状态没有存下来"
+        window.toggle_compact(False)
+        assert Settings().compact is False
+    check("精简状态记得住", compact_state_is_remembered)
+
+    def departure_and_arrival_are_distinguishable():
+        """同一个机场的综合/离场/进场不能长得一模一样。"""
+        texts = [window.station_list.item(i).text()
+                 for i in range(window.station_list.count())]
+        assert len(set(texts)) == len(texts), f"有两行完全相同：{texts}"
+    check("同场不同类型能区分", departure_and_arrival_are_distinguishable)
+
+    def advancing_the_letter_updates_the_list():
+        station = window.current_station()
+        before = station.letter
+        window.advance_letter()
+        after = window.current_station().letter
+        assert after != before, "字母没有推进"
+        assert after in window.station_list.currentItem().text(), \
+            f"列表还停在上一份：{window.station_list.currentItem().text()!r}"
+    check("推进字母列表跟着变", advancing_the_letter_updates_the_list)
+
+    def updating_labels_keeps_the_preset_selection():
+        """字母每 5 分钟就可能推进一次，不能顺手把用户选的构型重置掉。
+
+        refresh_stations() 会清空列表再填，顺带触发 on_station_selected()，
+        预设下拉框就回到第一项了——所以字母更新只能走 update_station_labels()。
+        """
+        if window.preset_combo.count() < 2:
+            return                      # 只有一个预设时这条测不出来
+        window.preset_combo.setCurrentIndex(1)
+        chosen = window.preset_combo.currentIndex()
+        window.update_station_labels()
+        assert window.preset_combo.currentIndex() == chosen, "预设选择被重置了"
+    check("更新字母不动预设选择", updating_labels_keeps_the_preset_selection)
+
     def feed_metar():
         import metar as metar_module
         station = window.current_station()
         window.on_metar(station.callsign, metar_module.Metar(ZSPD), "")
     check("喂一份天气进去", feed_metar)
+
+    def the_list_shows_the_four_things_that_matter():
+        """值班时要扫的就这四样：机场、当前代码、风、修压。
+
+        注意第一份报文的 changed 是 False（没有旧值可比），所以列表刷新不能只
+        挂在 changed 上——那正是从空白变成有数据的那一次。
+        """
+        station = window.current_station()
+        text = window.station_list.currentItem().text()
+        assert station.identifier in text, f"没有机场码：{text!r}"
+        assert station.letter in text, f"没有情报字母：{text!r}"
+        assert "09004MPS" in text, f"没有风：{text!r}"
+        assert "Q1013" in text, f"没有修压：{text!r}"
+    check("列表显示机场/代码/风/修压", the_list_shows_the_four_things_that_matter)
 
     def preview_generated():
         text = window.text_preview.toPlainText()

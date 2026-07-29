@@ -18,9 +18,14 @@ import threading
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QLineEdit,
-                             QListWidget, QListWidgetItem, QComboBox, QTextEdit,
-                             QMessageBox, QDialog, QSplitter, QFileDialog)
+                             QHBoxLayout, QListWidgetItem,
+                             QMessageBox, QDialog, QSplitter, QFileDialog,
+                             QSizePolicy)
+from qfluentwidgets import (BodyLabel, CaptionLabel, ComboBox, FluentIcon,
+                            LineEdit, ListWidget, PasswordLineEdit,
+                            PrimaryPushButton, PushButton, StrongBodyLabel,
+                            SubtitleLabel, TextEdit, Theme, TogglePushButton,
+                            setTheme, setThemeColor)
 
 import airports
 import applog
@@ -28,6 +33,8 @@ import version
 import chinese
 import datafeed
 import metar as metar_module
+import rules
+import script
 import template as template_module
 import fsdclient
 import vatis_import
@@ -43,6 +50,22 @@ log = logging.getLogger("界面")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.airwaysn.org:6809）。
 SERVER = "hjdczy.top"
+
+# 外观和管制端一致（controller/gui.py 是同一套值）：偏蓝紫的深底，不是中性灰。
+# 两个客户端多半并排开着，长得不一样会很跳。
+THEME_COLOR = "#5eb1bf"     # 强调色（主按钮、选中项）
+WINDOW_BG = "#2c2f45"       # 窗口底
+IDLE_COLOR = "#8b90a4"      # 次要文字
+ON_COLOR = "#28a745"        # 正在播出
+OFF_COLOR = "#dc3545"       # 出错
+# METAR 和电码用等宽：一屏几份报文时列能对齐，扫视快得多。中文不用等宽，很难看。
+MONO_FONT = "Consolas"
+
+
+def apply_theme():
+    """深色 Fluent。必须在建窗口之前调用。"""
+    setTheme(Theme.DARK)
+    setThemeColor(THEME_COLOR)
 
 
 def resource_path(name):
@@ -95,24 +118,24 @@ class StationDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
-        self.identifier = QLineEdit()
+        self.identifier = LineEdit()
         self.identifier.setPlaceholderText('机场 ICAO，例如 ZSPD')
-        self.name = QLineEdit()
+        self.name = LineEdit()
         self.name.setPlaceholderText('机场名称（可留空）')
-        self.frequency = QLineEdit()
+        self.frequency = LineEdit()
         self.frequency.setPlaceholderText('频率，例如 127.850')
 
-        self.atis_type = QComboBox()
+        self.atis_type = ComboBox()
         for key in TYPE_SUFFIX:
             self.atis_type.addItem(f"{TYPE_LABELS[key]}  {TYPE_SUFFIX[key]}", key)
 
-        self.language = QComboBox()
+        self.language = ComboBox()
         for key, label in LANGUAGES.items():
             self.language.addItem(label, key)
 
-        self.chinese_name = QLineEdit()
+        self.chinese_name = LineEdit()
         self.chinese_name.setPlaceholderText('中文稿里念的机场名，例如 上海浦东')
-        self.chinese_runway = QLineEdit()
+        self.chinese_runway = LineEdit()
         self.chinese_runway.setPlaceholderText('中文稿里念的跑道，例如 三六左')
 
         for label, widget in (('机场:', self.identifier), ('名称:', self.name),
@@ -121,16 +144,16 @@ class StationDialog(QDialog):
                               ('中文名:', self.chinese_name),
                               ('中文跑道:', self.chinese_runway)):
             row = QHBoxLayout()
-            row.addWidget(QLabel(label))
+            row.addWidget(BodyLabel(label))
             row.addWidget(widget)
             layout.addLayout(row)
 
         position_row = QHBoxLayout()
-        self.latitude = QLineEdit()
+        self.latitude = LineEdit()
         self.latitude.setPlaceholderText('纬度，例如 31.14340')
-        self.longitude = QLineEdit()
+        self.longitude = LineEdit()
         self.longitude.setPlaceholderText('经度，例如 121.80500')
-        position_row.addWidget(QLabel('席位位置:'))
+        position_row.addWidget(BodyLabel('席位位置:'))
         position_row.addWidget(self.latitude)
         position_row.addWidget(self.longitude)
         layout.addLayout(position_row)
@@ -138,32 +161,34 @@ class StationDialog(QDialog):
         # 输入机场代码时自动带出坐标，省得手查
         self.identifier.textChanged.connect(self.fill_position_from_airport)
 
-        position_hint = QLabel('留空会按机场代码自动填。位置决定席位在雷达图上的位置。')
-        position_hint.setStyleSheet("color: #777777;")
+        position_hint = BodyLabel('留空会按机场代码自动填。位置决定席位在雷达图上的位置。')
+        position_hint.setStyleSheet(f"color: {IDLE_COLOR};")
         position_hint.setWordWrap(True)
         layout.addWidget(position_hint)
 
         range_row = QHBoxLayout()
-        self.range_start = QLineEdit('A')
+        self.range_start = LineEdit()
+        self.range_start.setText('A')
         self.range_start.setFixedWidth(40)
-        self.range_end = QLineEdit('Z')
+        self.range_end = LineEdit()
+        self.range_end.setText('Z')
         self.range_end.setFixedWidth(40)
-        range_row.addWidget(QLabel('情报字母范围:'))
+        range_row.addWidget(BodyLabel('情报字母范围:'))
         range_row.addWidget(self.range_start)
-        range_row.addWidget(QLabel('到'))
+        range_row.addWidget(BodyLabel('到'))
         range_row.addWidget(self.range_end)
         range_row.addStretch()
         layout.addLayout(range_row)
 
-        hint = QLabel('离场和进场分别用不同字母段，飞行员就不会把两份通播搞混。')
-        hint.setStyleSheet("color: #777777;")
+        hint = BodyLabel('离场和进场分别用不同字母段，飞行员就不会把两份通播搞混。')
+        hint.setStyleSheet(f"color: {IDLE_COLOR};")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         buttons = QHBoxLayout()
-        ok = QPushButton('确定')
+        ok = PushButton('确定')
         ok.clicked.connect(self.validate_and_accept)
-        cancel = QPushButton('取消')
+        cancel = PushButton('取消')
         cancel.clicked.connect(self.reject)
         buttons.addWidget(ok)
         buttons.addWidget(cancel)
@@ -221,7 +246,8 @@ class AtisWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(icon_path))
-        self.setWindowTitle(f'情报通播 - Airwaysn {version.full()}')
+        # 产品名和 XPC for CAN / MSFS for CAN 对齐，四个客户端一套命名
+        self.setWindowTitle(f'ATIS for CAN {version.full()}')
         self.setMinimumSize(900, 600)
 
         self.settings = Settings()
@@ -244,115 +270,244 @@ class AtisWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_all_metars)
         self.apply_refresh_interval()
 
+        # 上次开着置顶 / 精简的话，这次起来就还是那样
+        if self.settings.always_on_top:
+            self.toggle_always_on_top(True)
+        if self.settings.compact:
+            self.toggle_compact(True)
+
     # ---------- 界面 ----------
     def setup_ui(self):
+        # 主题只管 qfluentwidgets 的控件，普通 QWidget 的底色还得自己给，
+        # 否则深色控件会浮在一片白底上。和管制端同一套写法。
+        self.setStyleSheet(
+            f"QMainWindow {{ background-color: {WINDOW_BG}; }}"
+            f"QWidget#page {{ background-color: {WINDOW_BG}; }}"
+            f"QSplitter {{ background-color: {WINDOW_BG}; }}")
+
         central = QWidget()
+        central.setObjectName("page")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        top = QHBoxLayout()
-        self.cid_input = QLineEdit(self.settings.cid)
+        # 顶栏包一层：精简模式要整条藏起来，而 QHBoxLayout 没有 setVisible。
+        # **纵向必须钉成 Fixed。** 裸 QWidget 默认是 Preferred，会跟着窗口一起
+        # 长——多出来的高度全被这一条吃掉，账号输入框浮在窗口正中间，底下的
+        # 分割器反被挤扁。原来用 addLayout 时没这问题，布局本身不占额外空间。
+        self.top_bar = QWidget()
+        self.top_bar.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                   QSizePolicy.Policy.Fixed)
+        top = QHBoxLayout(self.top_bar)
+        top.setContentsMargins(0, 0, 0, 0)
+        self.cid_input = LineEdit()
+        self.cid_input.setText(self.settings.cid)
         self.cid_input.setPlaceholderText('用户名')
         self.cid_input.setFixedWidth(110)
-        self.password_input = QLineEdit()
+        # 专门的密码框：自带那个"看一眼"的小眼睛，比手设 EchoMode 好用
+        self.password_input = PasswordLineEdit()
         self.password_input.setPlaceholderText('密码')
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setFixedWidth(140)
-        top.addWidget(QLabel('账号:'))
+        self.password_input.setFixedWidth(160)
+        top.addWidget(BodyLabel('账号:'))
         top.addWidget(self.cid_input)
         top.addWidget(self.password_input)
         top.addStretch()
-        settings_button = QPushButton('设置')
+        settings_button = PushButton('设置')
+        settings_button.setIcon(FluentIcon.SETTING)
         settings_button.clicked.connect(self.open_settings)
         top.addWidget(settings_button)
-        layout.addLayout(top)
+        layout.addWidget(self.top_bar)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # 左：席位列表
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel('通播席位'))
-        self.station_list = QListWidget()
+
+        # 标题那一行带着精简开关。开关必须留在精简模式下也看得见的地方，
+        # 否则收起来之后没有任何路径能切回去。
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(StrongBodyLabel('通播席位'))
+        header.addStretch()
+
+        # 置顶。和精简是一对：值班时窗口压在 vATIS / 雷达上面用，被盖住就等于
+        # 看不见情报字母推进了没有。和精简一样放在这一行——顶栏在精简模式下整条
+        # 藏起来，放那儿就没了。
+        self.pin_button = TogglePushButton('置顶')
+        self.pin_button.setIcon(FluentIcon.PIN)
+        self.pin_button.setToolTip('窗口保持在其它程序上面')
+        self.pin_button.setChecked(self.settings.always_on_top)
+        self.pin_button.clicked.connect(self.toggle_always_on_top)
+        header.addWidget(self.pin_button)
+
+        self.compact_button = TogglePushButton('精简')
+        self.compact_button.setIcon(FluentIcon.MINIMIZE)
+        self.compact_button.setToolTip('只留席位列表，窗口缩到最小')
+        self.compact_button.setChecked(self.settings.compact)
+        self.compact_button.clicked.connect(self.toggle_compact)
+        header.addWidget(self.compact_button)
+        left_layout.addLayout(header)
+
+        self.station_list = ListWidget()
         self.station_list.currentItemChanged.connect(lambda *_: self.on_station_selected())
         left_layout.addWidget(self.station_list)
 
+        # 新建/编辑/删除/导入包一层，精简模式下整块收起来。同样要钉成 Fixed，
+        # 否则它会跟席位列表抢纵向空间
+        self.station_buttons = QWidget()
+        self.station_buttons.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                           QSizePolicy.Policy.Fixed)
+        buttons_layout = QVBoxLayout(self.station_buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons = QHBoxLayout()
         for text, handler in (('新建', self.add_station), ('编辑', self.edit_station),
                               ('删除', self.remove_station)):
-            button = QPushButton(text)
+            button = PushButton(text)
             button.clicked.connect(handler)
             buttons.addWidget(button)
-        left_layout.addLayout(buttons)
+        buttons_layout.addLayout(buttons)
 
-        import_button = QPushButton('导入 vATIS 配置…')
+        import_button = PushButton('导入 vATIS 配置…')
         import_button.setToolTip('读取 vATIS 的 profile JSON，把里面的席位和预设导进来')
         import_button.clicked.connect(self.import_vatis)
-        left_layout.addWidget(import_button)
+        buttons_layout.addWidget(import_button)
+        left_layout.addWidget(self.station_buttons)
         splitter.addWidget(left)
 
         # 右：预设与通播内容
-        right = QWidget()
+        self.right_panel = right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
         preset_row = QHBoxLayout()
-        self.preset_combo = QComboBox()
+        self.preset_combo = ComboBox()
         self.preset_combo.currentIndexChanged.connect(lambda *_: self.regenerate())
-        preset_row.addWidget(QLabel('预设:'))
+        preset_row.addWidget(BodyLabel('预设:'))
         preset_row.addWidget(self.preset_combo, 1)
-        edit_preset = QPushButton('编辑预设')
+        edit_preset = PushButton('编辑预设')
         edit_preset.clicked.connect(self.edit_preset)
         preset_row.addWidget(edit_preset)
         right_layout.addLayout(preset_row)
 
         letter_row = QHBoxLayout()
-        self.letter_label = QLabel('情报字母: -')
-        self.letter_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.letter_label = SubtitleLabel('情报字母: -')
         letter_row.addWidget(self.letter_label)
         letter_row.addStretch()
-        advance = QPushButton('推进字母')
+        advance = PushButton('推进字母')
+        advance.setIcon(FluentIcon.CHEVRON_RIGHT)
         advance.clicked.connect(self.advance_letter)
         letter_row.addWidget(advance)
-        fetch = QPushButton('刷新天气')
+        fetch = PushButton('刷新天气')
+        fetch.setIcon(FluentIcon.SYNC)
         fetch.clicked.connect(lambda: self.refresh_metar(self.current_station()))
         letter_row.addWidget(fetch)
         right_layout.addLayout(letter_row)
 
-        self.metar_label = QLabel('METAR: --')
+        self.metar_label = CaptionLabel('METAR: --')
         self.metar_label.setWordWrap(True)
-        self.metar_label.setStyleSheet("color: #555555; font-family: Consolas, monospace;")
+        self.metar_label.setStyleSheet(f"color: {IDLE_COLOR}; font-family: {MONO_FONT}, monospace;")
         right_layout.addWidget(self.metar_label)
 
-        right_layout.addWidget(QLabel('文字通播'))
-        self.text_preview = QTextEdit()
+        right_layout.addWidget(StrongBodyLabel('文字通播'))
+        self.text_preview = TextEdit()
         self.text_preview.setReadOnly(True)
         self.text_preview.setFixedHeight(90)
         right_layout.addWidget(self.text_preview)
 
-        right_layout.addWidget(QLabel('语音稿'))
-        self.voice_preview = QTextEdit()
+        right_layout.addWidget(StrongBodyLabel('语音稿'))
+        self.voice_preview = TextEdit()
         self.voice_preview.setReadOnly(True)
         right_layout.addWidget(self.voice_preview)
 
         broadcast_row = QHBoxLayout()
-        self.broadcast_button = QPushButton('开始播出')
+        self.broadcast_button = PrimaryPushButton('开始播出')
         self.broadcast_button.clicked.connect(self.toggle_broadcast)
         broadcast_row.addWidget(self.broadcast_button)
-        self.status_label = QLabel('未播出')
-        self.status_label.setStyleSheet("color: #555555;")
+        self.status_label = CaptionLabel('未播出')
+        self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
         broadcast_row.addWidget(self.status_label, 1)
         right_layout.addLayout(broadcast_row)
 
         splitter.addWidget(right)
         splitter.setSizes([260, 640])
-        layout.addWidget(splitter)
+        # 伸缩权重给分割器：窗口拉高时长的应该是席位列表和稿子预览，
+        # 不是顶栏那一条
+        layout.addWidget(splitter, 1)
+
+    # ---------- 置顶 ----------
+    def toggle_always_on_top(self, checked=None):
+        """窗口保持在其它程序上面。
+
+        Qt 改窗口标志会把窗口重建一次，show() 之后最大化状态会丢，所以要自己
+        记住再还原——管制端那边踩过这个坑。
+        """
+        if checked is None:
+            checked = self.pin_button.isChecked()
+        checked = bool(checked)
+        self.pin_button.setChecked(checked)
+        self.settings.always_on_top = checked
+        self.settings.save_settings()
+
+        maximised = self.isMaximized()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, checked)
+        if maximised:
+            self.showMaximized()
+        else:
+            self.show()
+
+    # ---------- 精简模式 ----------
+    def toggle_compact(self, enabled=None):
+        """只留席位列表，其余整块收起来。
+
+        和管制端那个精简是一回事：值班时真正要扫的就是「哪个场、第几份、风、
+        修压」那几行，模板、预览、播出控件都是配置用的。收起来之后窗口能小到
+        压在雷达或 vATIS 旁边。
+
+        精简开关本身放在列表标题那一行，跟着列表一起留下——顶栏整条藏掉之后，
+        它是唯一能切回去的路径。
+        """
+        if enabled is None:
+            enabled = self.compact_button.isChecked()
+        enabled = bool(enabled)
+        self.compact_button.setChecked(enabled)
+
+        self.top_bar.setVisible(not enabled)
+        self.station_buttons.setVisible(not enabled)
+        self.right_panel.setVisible(not enabled)
+
+        if enabled:
+            self.setMinimumSize(300, 220)
+            self.resize(300, 320)
+        else:
+            self.setMinimumSize(0, 0)
+            self.resize(max(self.width(), 900), max(self.height(), 560))
+            self.splitter.setSizes([260, 640])
+
+        self.settings.compact = enabled
+        self.settings.save_settings()
 
     # ---------- 席位 ----------
     def current_station(self):
         item = self.station_list.currentItem()
         return self.profile.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+    def station_item_text(self, station):
+        return script.summary(station, self.metars.get(station.callsign),
+                              station.callsign in self.broadcasters)
+
+    def update_station_labels(self):
+        """只改列表文字，不重建、不动选中项。
+
+        情报字母每次天气变化都会推进，而 refresh_stations() 会清空列表再填，
+        顺带触发 on_station_selected()——那会把预设下拉框重置回第一项，用户
+        选的构型就没了。天气每 5 分钟刷一次，选择被抢一次是不能接受的。
+        """
+        for row in range(self.station_list.count()):
+            item = self.station_list.item(row)
+            station = self.profile.get(item.data(Qt.ItemDataRole.UserRole))
+            if station:
+                item.setText(self.station_item_text(station))
 
     def refresh_stations(self):
         selected = self.station_list.currentItem()
@@ -360,10 +515,8 @@ class AtisWindow(QMainWindow):
 
         self.station_list.clear()
         for station in self.profile:
-            item = QListWidgetItem(station.label)
+            item = QListWidgetItem(self.station_item_text(station))
             item.setData(Qt.ItemDataRole.UserRole, station.callsign)
-            if station.callsign in self.broadcasters:
-                item.setText(f"● {station.label}")
             self.station_list.addItem(item)
             if station.callsign == wanted:
                 self.station_list.setCurrentItem(item)
@@ -371,6 +524,22 @@ class AtisWindow(QMainWindow):
         if self.station_list.currentRow() < 0 and self.station_list.count():
             self.station_list.setCurrentRow(0)
         self.on_station_selected()
+
+    def update_metar_label(self):
+        """METAR 那一行永远显示**当前选中席位**的报文。
+
+        原来它只在 on_metar 里、且到货的正好是当前席位时才写一次——切席位不刷，
+        于是屏幕上会出现"选中 ZBAA、右边渲染的是 ZBAA、METAR 那行却是 ZSHC"。
+        看的人会以为渲染用错了天气，实际只是这一行没跟着走。
+        """
+        station = self.current_station()
+        parsed = self.metars.get(station.callsign) if station else None
+        if parsed is not None:
+            self.metar_label.setText(f'METAR: {parsed.raw}')
+        elif station is not None:
+            self.metar_label.setText('METAR: （还没取到）')
+        else:
+            self.metar_label.setText('METAR: -')
 
     def on_station_selected(self):
         station = self.current_station()
@@ -384,6 +553,7 @@ class AtisWindow(QMainWindow):
         broadcasting = bool(station and station.callsign in self.broadcasters)
         self.broadcast_button.setText('停止播出' if broadcasting else '开始播出')
         self.broadcast_button.setEnabled(station is not None)
+        self.update_metar_label()
         self.regenerate()
 
         if station and station.callsign not in self.metars:
@@ -485,7 +655,11 @@ class AtisWindow(QMainWindow):
             self.regenerate()
 
     def regenerate(self):
-        """把当前席位 + 预设 + METAR 渲染成文字通播和语音稿。"""
+        """把当前席位 + 预设 + METAR 渲染出来，填进右边的预览。
+
+        渲染本身在 script.py 里——预览和真正推出去的稿子必须是同一份代码算的，
+        两边各写一遍的话，改岔了界面上根本看不出来。
+        """
         station = self.current_station()
         preset = self.current_preset()
         if not station or not preset:
@@ -495,27 +669,17 @@ class AtisWindow(QMainWindow):
             return
 
         self.letter_label.setText(f'情报字母: {station.letter}')
-        parsed = self.metars.get(station.callsign)
-        if parsed is None:
+        rendered = script.render(station, preset, self.metars.get(station.callsign))
+        if rendered is None:
             self.text_preview.setPlainText('（还没有天气数据）')
             self.voice_preview.setPlainText('')
             return
 
-        context = template_module.build_context(
-            parsed, station.identifier, station.letter,
-            preset.airport_conditions, preset.notams, preset.transition_level,
-            # 语音念机场全名：念 "Z S P D" 听着像在拼写，真实通播念的是
-            # "Shanghai Pudong International Airport"。席位上没填名称才退回代码。
-            facility_voice=station.name or station.identifier,
-            # 收尾语跟着预设：不同构型要交代的事不一样。留空用内置那句。
-            closing=preset.closing or None)
-        text, voice = template_module.render(preset.template, context,
-                                             station.contractions)
-        voice = self.voice_for(station, parsed, voice, preset)
+        text, voice = rendered
         self.text_preview.setPlainText(text)
         self.voice_preview.setPlainText(voice)
 
-        unknown = template_module.unknown_variables(preset.template)
+        unknown = script.unknown_variables(preset)
         if unknown:
             self.status_label.setText('模板里有认不出的变量: ' + ', '.join(unknown))
         return text, voice
@@ -592,6 +756,11 @@ class AtisWindow(QMainWindow):
         elif recovered:
             note = f'{callsign} 天气已恢复'
 
+        # 列表上那一行带着风和修压，每收到一份天气都要刷——不能只在 changed 时
+        # 刷：**第一份**报文的 changed 是 False（之前没有旧值可比），那正是列表
+        # 从空白变成有数据的那一次
+        self.update_station_labels()
+
         # 还没恢复的错误优先于流水账。反过来的话，一个席位取不到天气这件事会
         # 被另一个席位的"天气更新"盖掉，再也没人看得见。
         outstanding = next(iter(self._weather_errors.values()), None)
@@ -599,7 +768,7 @@ class AtisWindow(QMainWindow):
             self.status_label.setText(outstanding or note)
 
         if station is self.current_station():
-            self.metar_label.setText(f'METAR: {parsed.raw}')
+            self.update_metar_label()
             self.regenerate()
 
         # 已经在播的席位，换稿
@@ -620,51 +789,11 @@ class AtisWindow(QMainWindow):
             fsd.set_atis_lines(fsdclient.wrap_atis_text(text))
 
     def render_for(self, station):
+        """给某个席位渲染稿子。当前选中的那个用界面上选的预设，其余用第一个。"""
         preset = station.presets[0] if station.presets else None
         if station is self.current_station():
             preset = self.current_preset() or preset
-        parsed = self.metars.get(station.callsign)
-        if not preset or parsed is None:
-            return None
-        context = template_module.build_context(
-            parsed, station.identifier, station.letter,
-            preset.airport_conditions, preset.notams, preset.transition_level,
-            # 语音念机场全名：念 "Z S P D" 听着像在拼写，真实通播念的是
-            # "Shanghai Pudong International Airport"。席位上没填名称才退回代码。
-            facility_voice=station.name or station.identifier,
-            # 收尾语跟着预设：不同构型要交代的事不一样。留空用内置那句。
-            closing=preset.closing or None)
-        text, voice = template_module.render(preset.template, context,
-                                             station.contractions)
-        return text, self.voice_for(station, parsed, voice, preset)
-
-    @staticmethod
-    def voice_for(station, parsed, english, preset=None):
-        """按席位设置决定语音稿用哪种语言。
-
-        中文稿不是英文的翻译，是 chinese.py 从 METAR 重新渲染的——语序和数字
-        读法都不一样。双语时中文在后，因为中文飞行员听得懂英文的居多，反过来
-        不一定。
-        """
-        language = getattr(station, "voice_language", profile_module.LANGUAGE_ENGLISH)
-        if language == profile_module.LANGUAGE_ENGLISH:
-            return english
-
-        # 跑道优先取当前预设的：切到"北向"时英文稿的 ARR RWY 会变，中文稿
-        # 要是还念着南向的跑道，同一份通播里两种语言互相矛盾。预设没填才回退
-        # 到席位上那个。
-        runway = getattr(preset, "chinese_runway", "") or station.chinese_runway
-        script = chinese.render(
-            parsed,
-            facility=station.chinese_name or station.identifier,
-            letter=station.letter,
-            runway=runway,
-            # 中文稿是从 METAR 独立渲染的，跑道构型、放行频率、应答机这些在
-            # 中文侧没有对应字段，整段由预设提供，接在气象之后念
-            extra=getattr(preset, "chinese_extra", "") or "")
-        if language == profile_module.LANGUAGE_CHINESE:
-            return script
-        return f"{english} {script}"
+        return script.render(station, preset, self.metars.get(station.callsign))
 
     def advance_letter(self):
         station = self.current_station()
@@ -673,6 +802,7 @@ class AtisWindow(QMainWindow):
         station.advance_letter()
         self.profile.save()
         self.regenerate()
+        self.update_station_labels()
         self.push_update(station)
 
     # ---------- 播出 ----------
@@ -686,25 +816,11 @@ class AtisWindow(QMainWindow):
 
         cid = self.cid_input.text().strip()
         password = self.password_input.text()
-        if not cid or not password:
-            QMessageBox.warning(self, '错误', '请先填写用户名和密码')
-            return
-
-        # 语音账号是 {cid}_atis{频率} —— 同一频率上再开一个，用户名就撞了，
-        # 服务端会把先连上的那个踢掉（server/login.py 的同名踢人逻辑）
-        for other_callsign in self.broadcasters:
-            other = self.profile.get(other_callsign)
-            if other and other.frequency_khz == station.frequency_khz:
-                QMessageBox.warning(
-                    self, '频率冲突',
-                    f'{other_callsign} 已经在 {other.frequency} 上播出了。\n'
-                    f'两个通播用同一个频率会共用同一个语音账号，'
-                    f'后连上的会把先连上的踢掉。')
-                return
-
-        rendered = self.render_for(station)
-        if not rendered or not rendered[1].strip():
-            QMessageBox.warning(self, '错误', '还没有可播的内容，先刷新天气')
+        refused = rules.blocking_reason(
+            station, self.profile, self.broadcasters,
+            cid, password, self.render_for(station))
+        if refused:
+            QMessageBox.warning(self, *refused)
             return
 
         # 开播前先查一次数据源：确认本人确实在管制，顺便拿到等级。
@@ -758,35 +874,18 @@ class AtisWindow(QMainWindow):
         self.start_broadcast(station, cid, password, rating)
 
     def frequency_conflict(self, station):
-        """同频率上已经有别的通播在播吗？
-
-        语音账号是 {cid}_atis{频率}，同频率再开一个用户名就撞了，服务端会把
-        先连上的踢掉（server/login.py 的同名踢人逻辑）。
-        """
-        for other_callsign in self.broadcasters:
-            if other_callsign == station.callsign:
-                continue
-            other = self.profile.get(other_callsign)
-            if other and other.frequency_khz == station.frequency_khz:
-                return other
-        return None
+        return rules.frequency_conflict(station, self.profile, self.broadcasters)
 
     def start_broadcast(self, station, cid, password, rating=0):
         """核对通过之后真正建立两条连接。"""
-        # 核对期间隔了几秒，这段时间里可能又开了一个同频率的席位，所以这里
-        # 要再查一次，不能只依赖点按钮那一刻的检查
-        conflict = self.frequency_conflict(station)
-        if conflict:
-            QMessageBox.warning(
-                self, '频率冲突',
-                f'{conflict.callsign} 已经在 {conflict.frequency} 上播出了。\n'
-                f'两个通播用同一个频率会共用同一个语音账号，'
-                f'后连上的会把先连上的踢掉。')
-            return
-
+        # **必须再查一遍。** 数据源核对要走网络，隔着几秒，这期间完全可能又开
+        # 了一个同频率的席位——只信点按钮那一刻的检查会漏。规则本身在 rules.py
+        # 里，两条路径共用一份，文案不会各说各的。
         rendered = self.render_for(station)
-        if not rendered or not rendered[1].strip():
-            QMessageBox.warning(self, '错误', '还没有可播的内容，先刷新天气')
+        refused = rules.blocking_reason(
+            station, self.profile, self.broadcasters, cid, password, rendered)
+        if refused:
+            QMessageBox.warning(self, *refused)
             return
 
         callsign = station.callsign
@@ -856,7 +955,9 @@ class AtisWindow(QMainWindow):
         if station and station.callsign == callsign:
             self.status_label.setText(message)
             self.status_label.setStyleSheet(
-                "color: #cc0000;" if state == 'error' else "color: #555555;")
+                f"color: {OFF_COLOR};" if state == 'error'
+                else f"color: {ON_COLOR};" if state == 'online'
+                else f"color: {IDLE_COLOR};")
         if state == 'fsd-error':
             # 只收掉 FSD 这一条，语音继续播——席位不在网络上总比频率上没声音好
             fsd = self.fsd_clients.pop(callsign, None)
@@ -904,47 +1005,52 @@ class PresetDialog(QDialog):
         layout = QVBoxLayout(self)
 
         name_row = QHBoxLayout()
-        self.name = QLineEdit(self.preset.name)
-        name_row.addWidget(QLabel('名称:'))
+        self.name = LineEdit()
+        self.name.setText(self.preset.name)
+        name_row.addWidget(BodyLabel('名称:'))
         name_row.addWidget(self.name)
         layout.addLayout(name_row)
 
-        layout.addWidget(QLabel('模板'))
-        self.template = QTextEdit(self.preset.template)
+        layout.addWidget(BodyLabel('模板'))
+        self.template = TextEdit()
+        self.template.setPlainText(self.preset.template)
         layout.addWidget(self.template)
 
-        variables = QLabel('可用变量: ' + '  '.join(
+        variables = BodyLabel('可用变量: ' + '  '.join(
             f'[{name}]' for name in sorted(set(template_module.ALIASES))))
         variables.setWordWrap(True)
-        variables.setStyleSheet("color: #777777; font-size: 11px;")
+        variables.setStyleSheet(f"color: {IDLE_COLOR}; font-size: 11px;")
         layout.addWidget(variables)
 
-        vox = QLabel('变量后面加 :VOX 表示在文字通播里也用语音说法，例如 [WX:VOX]。')
-        vox.setStyleSheet("color: #777777;")
+        vox = BodyLabel('变量后面加 :VOX 表示在文字通播里也用语音说法，例如 [WX:VOX]。')
+        vox.setStyleSheet(f"color: {IDLE_COLOR};")
         vox.setWordWrap(True)
         layout.addWidget(vox)
 
-        layout.addWidget(QLabel('机场条件  [ARPT_COND]'))
-        self.conditions = QTextEdit(self.preset.airport_conditions)
+        layout.addWidget(BodyLabel('机场条件  [ARPT_COND]'))
+        self.conditions = TextEdit()
+        self.conditions.setPlainText(self.preset.airport_conditions)
         self.conditions.setFixedHeight(60)
         layout.addWidget(self.conditions)
 
-        layout.addWidget(QLabel('NOTAM  [NOTAMS]'))
-        self.notams = QTextEdit(self.preset.notams)
+        layout.addWidget(BodyLabel('NOTAM  [NOTAMS]'))
+        self.notams = TextEdit()
+        self.notams.setPlainText(self.preset.notams)
         self.notams.setFixedHeight(60)
         layout.addWidget(self.notams)
 
         tl_row = QHBoxLayout()
-        self.transition_level = QLineEdit(self.preset.transition_level)
+        self.transition_level = LineEdit()
+        self.transition_level.setText(self.preset.transition_level)
         self.transition_level.setPlaceholderText('例如 3600 米')
-        tl_row.addWidget(QLabel('过渡高度层  [TL]:'))
+        tl_row.addWidget(BodyLabel('过渡高度层  [TL]:'))
         tl_row.addWidget(self.transition_level)
         layout.addLayout(tl_row)
 
         buttons = QHBoxLayout()
-        ok = QPushButton('保存')
+        ok = PushButton('保存')
         ok.clicked.connect(self.accept)
-        cancel = QPushButton('取消')
+        cancel = PushButton('取消')
         cancel.clicked.connect(self.reject)
         buttons.addWidget(ok)
         buttons.addWidget(cancel)
@@ -965,7 +1071,7 @@ def selftest():
     很容易因为找不到驱动或者写不了缓存目录而失灵，界面上却只表现为"通播没声
     音"。加个自检开关，装机之后先跑一次就能确认：
 
-        airwaysn-atis.exe --selftest    退出码 0 表示语音可用
+        atis-for-can.exe --selftest    退出码 0 表示语音可用
     """
     from broadcast import Synthesizer
     synth = Synthesizer()
@@ -988,13 +1094,14 @@ if __name__ == '__main__':
     # --debug 会把协议细节也记进日志（FSD 收发的每个包、频道操作）。
     # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
     applog.setup(debug='--debug' in sys.argv or Settings().debug)
-    log.info("情报通播客户端启动 %s", version.full())
+    log.info("ATIS for CAN 启动 %s", version.full())
 
     if '--selftest' in sys.argv:
         sys.exit(selftest())
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))
+    apply_theme()               # 必须在建窗口之前
     window = AtisWindow()
     window.show()
     sys.exit(app.exec())

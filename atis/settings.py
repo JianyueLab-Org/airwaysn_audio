@@ -55,6 +55,10 @@ class Settings:
         # 自动刷新天气的间隔（秒）。METAR 半小时一发，5 分钟查一次足够及时，
         # 又不至于把气象源打太狠。夹在 1 分钟到 1 小时之间。
         self.metar_refresh = DEFAULT_METAR_REFRESH
+        # 精简模式：只留席位列表。值班时窗口压在别的东西旁边用，要记住
+        self.compact = False
+        # 窗口置顶。和精简是一对，同样要记住
+        self.always_on_top = False
         self.debug = False
         self.load_settings()
 
@@ -78,6 +82,8 @@ class Settings:
                                      or datafeed.DEFAULT_DATAFEED_URL)
                 self.metar_refresh = clamp_refresh(
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
+                self.compact = bool(data.get("compact", False))
+                self.always_on_top = bool(data.get("always_on_top", False))
                 self.debug = bool(data.get("debug", False))
         except Exception as e:
             log.warning(f"加载设置失败: {e}")
@@ -95,6 +101,8 @@ class Settings:
                     "rating": self.rating,
                     "datafeed_url": self.datafeed_url,
                     "metar_refresh": self.metar_refresh,
+                    "compact": self.compact,
+                    "always_on_top": self.always_on_top,
                     "debug": self.debug,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:

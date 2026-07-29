@@ -230,6 +230,15 @@ class RuntimeStateTest(unittest.TestCase):
 
 
 class PersistenceTest(unittest.TestCase):
+    """序列化本身还是对的，但**管制端已经不再用它存频率了**。
+
+    电台栈不跨会话保留：频率该从数据源来——上了席位的自动加，别人的席位在
+    "在线频率"里点。留着上一场的频率反而危险，那些临时频道多半早就没人了，
+    而屏幕上看起来一切正常。
+
+    `to_list` / `load` 留着是因为它们是干净的纯函数，将来导出/导入构型还用得上；
+    但眼下没有任何调用方，别看到这个类就以为设置里还存着 radios。
+    """
 
     def test_round_trip(self):
         stack = RadioStack()

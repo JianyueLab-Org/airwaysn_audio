@@ -3,7 +3,7 @@
 打包出来的程序是 console=False 的，print 出去的东西没有任何地方能看到——用户
 报"连不上"的时候手里一点线索都没有。所以统一写到文件里：
 
-    airwaysn-atis.log      当前目录，滚动保留 4 份
+    atis-for-can.log      当前目录，滚动保留 4 份
 
 从源码跑的时候同时打到控制台。加 --debug 会把级别降到 DEBUG，那一档会记录
 协议层面的细节（进出的频道、发出去的语音目标、收到的每个包），排查现场问题
@@ -18,7 +18,7 @@ import logging.handlers
 import os
 import sys
 
-LOG_NAME = "airwaysn-atis.log"
+LOG_NAME = "atis-for-can.log"
 MAX_BYTES = 2 * 1024 * 1024
 BACKUPS = 3
 

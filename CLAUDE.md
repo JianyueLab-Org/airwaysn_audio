@@ -22,7 +22,9 @@ There is no dependency manifest, test suite, or build script in the repo. Everyt
 
 `client/` and `xplane_client/` are **near-duplicate forks** of each other — same `radio.py`/`settings.py`/`gui.py` layout, identical apart from where COM1 comes from, so a fix to audio or PTT logic has to be applied to both, every time. `controller/`, `atis/` and `xpc/` no longer share that shape: they were rebuilt around their own models (`radiostack.py` + `voice.py`, `profile.py` + `broadcast.py`, and `xplane.py` + `fsdpilot.py` + `voice.py`) and have no `radio.py`.
 
-`xpc/` **supersedes `xplane_client/`** in scope: same simulator, but it also logs in to FSD so the aircraft appears on the network, where `xplane_client/` is voice-only. `xplane_client/` is still the smaller, voice-only option and is not deprecated.
+**`client/` and `xplane_client/` are legacy and are no longer shipped.** `xpc/` supersedes `xplane_client/` and `msfs/` supersedes `client/` — same simulators, but those two also log in to FSD so the aircraft appears on the network, where the old pair is voice-only. The release workflow (`.github/workflows/release.yml`) builds only `controller`, `atis`, `xpc` and `msfs`; the legacy pair is deliberately absent from the build matrix, and the release notes say so.
+
+Legacy does not mean dead: both still run, still have `test_radio.py` and `smoke_gui.py`, and the CI **does** run their tests and smoke checks — a regression in them still has to be known about, because they share the `FREQ_*` channel contract and the Mumble handling that everything else depends on. What it means is that no packaged build is produced, so a fix landing there reaches nobody until someone builds it by hand. Prefer fixing `xpc/`/`msfs/` when the same bug exists in both.
 
 There is no shared package — each component is imported flat from its own directory, which is why `mumblecompat.py` and `applog.py` exist as per-component copies rather than one import. Keep that pattern when adding cross-cutting helpers; a shared parent module would need path juggling in every PyInstaller spec.
 
@@ -49,7 +51,7 @@ Build a Windows bundle (from the component directory):
 pyinstaller gui.spec
 ```
 
-**Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/airwaysn-controller/`, `dist/airwaysn-atis/` and `dist/xpc-for-can/`.
+**Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/audio-for-can/`, `dist/atis-for-can/` and `dist/xpc-for-can/`.
 
 Tests — every component except `server/login.py` has some; each runs from its own directory and needs no server, no audio device and no network:
 
@@ -88,7 +90,7 @@ python -m unittest test_mumble -v        # 通播的建频道 / 进频道，含�
 
 `test_xpc.py` loads `plugin/PI_XpcTraffic.py` directly (the plugin guards its `import xp` so it imports outside X-Plane) to check the bridge reassembler and the animation-value ordering. The rest of the plugin needs a running simulator and is not covered.
 
-**Logging.** Both clients ship `applog.py` (a per-component copy, matching how the rest of the repo duplicates rather than shares). `applog.setup(debug)` installs a rotating file handler writing `airwaysn-controller.log` / `airwaysn-atis.log` to the CWD, plus a console handler when one exists. This is not optional polish: the packaged builds are `console=False`, so a bare `print` goes nowhere and a user reporting "it won't connect" has nothing to send you. Use `log = logging.getLogger("模块名")` per module rather than `print`.
+**Logging.** Both clients ship `applog.py` (a per-component copy, matching how the rest of the repo duplicates rather than shares). `applog.setup(debug)` installs a rotating file handler writing `audio-for-can.log` / `atis-for-can.log` to the CWD, plus a console handler when one exists. This is not optional polish: the packaged builds are `console=False`, so a bare `print` goes nowhere and a user reporting "it won't connect" has nothing to send you. Use `log = logging.getLogger("模块名")` per module rather than `print`.
 
 `setup()` also replaces `sys.excepthook` **and** `threading.excepthook` — an uncaught exception in a Qt slot or a worker thread otherwise vanishes silently, leaving a frozen window and an empty log. `--debug` (or the settings checkbox, persisted as `debug`) drops the level to DEBUG, which is where the protocol traffic lives: every FSD packet in and out (with the `#AA` password redacted), channel-listener changes, voice-target changes, and the radio-stack sync.
 
@@ -317,6 +319,8 @@ Three things only a real install revealed — the synthetic `aircraft.cfg` tests
 
 - **Livery matching needs livery packs.** Only 40 of 375 liveries carried an `icao_airline` at all, and those were developer house liveries (`AIB`, `FENIX`, `IBE`). Default MSFS aircraft ship without airline codes, so `EQUIPMENT+AIRLINE` almost never hits until the user installs real liveries. This is a user-side fact, not a bug — it just means the realistic ceiling is "right aircraft type, wrong paint".
 - **`CATEGORIES` exists because family fallback isn't enough.** With no 777 installed, a `B77W` used to fall through every tier and land on the arbitrary first model — an A319 standing in for a 777. The tier between "same family" and "first model" substitutes within 宽体/窄体/支线/通航, which turned that A319 into a 787 and cut the unrelated-aircraft cases from 8/24 to 2/24. `cslmatch.py` carries the same table and tier; the two are meant to stay in sync.
+
+  **The category tier must sit *before* the generic-by-prefix tier, and for a long time it did not.** `GENERIC_BY_PREFIX` guesses from a two-character prefix, and `A3` / `B7` span both narrow and wide bodies — `B77W` guesses `B738`, `A359` guesses `A320`. With the generic tier first, installing either of the two most common models (a 737-800 or an A320) meant **every widebody degraded to a narrowbody and the category tier never ran at all**: a 777 rendered as a 737 on everyone else's screen, which is precisely what the category tier exists to prevent. Both `cslmatch.py` and `aimatch.py` had the tiers in the wrong order. The existing tests missed it because they installed only an `A319` and a `B78X` — with no `B738` present the generic guess found nothing, so the category tier ran anyway and the assertion passed. `test_category_beats_the_generic_guess` (in both suites) installs a `B738` specifically to close that hole. Generic-by-prefix is now the *last* resort before the fallback, for type codes that are not in `CATEGORIES` at all.
 
 ## Related repositories
 
