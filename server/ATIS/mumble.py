@@ -105,6 +105,26 @@ class ATISBroadcaster(threading.Thread):
             print(f"进入频道失败: {e}")
             return False
 
+    def _in_expected_channel(self):
+        """服务器上此刻是不是真的还在本席位的频道里。
+
+        连接是 reconnect=True 建的，而 _join_channel 只在 connect_to_server 里
+        跑过一次。pymumble 掉线自己连回来之后，服务器会把用户放回**根频道**，
+        本地这边毫无变化——通播于是一直往根频道里播：该听到的人听不到，反而
+        是那些自己切频道失败、卡在根频道的人全都听得到。这个机器人是常年挂着
+        的，重连几乎必然发生。
+        """
+        try:
+            if not self.mumble:
+                return False
+            channel = self._find_channel(self.channel_name)
+            myself = self.mumble.users.myself
+        except Exception:
+            return False
+        if channel is None or myself is None:
+            return False
+        return myself["channel_id"] == channel["channel_id"]
+
     def _find_channel(self, name):
         try:
             return self.mumble.channels.find_by_name(name)
@@ -261,6 +281,14 @@ class ATISBroadcaster(threading.Thread):
         print("开始ATIS广播循环")
         while self.running:
             try:
+                # 每一轮开播前对着服务器确认一次，别信自己记的状态
+                if not self._in_expected_channel():
+                    print(f"已经不在 {self.channel_name} 里了（多半是断线重连过），"
+                          f"重新进频道")
+                    if not self._join_channel():
+                        time.sleep(5)
+                        continue
+
                 if self.check_channel_silence():
                     # 如果有中文ATIS，先播放中文
                     if self.chinese_text:

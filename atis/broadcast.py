@@ -8,6 +8,7 @@ server/login.py 认这个格式，并把频率的 6 位数字当成 Murmur 用�
 管制端抢输入输出设备。
 """
 
+import collections
 import logging
 import os
 import re
@@ -141,13 +142,20 @@ def _pick_voice(engine, chinese):
     return None
 
 
+# 缓存留几条。播报循环每 REPEAT_GAP 秒就要同一段 PCM，所以缓存是必要的；但
+# 键是整篇稿子，METAR 一变、模板一改就是新的一条，而一条 45 秒的通播在 48kHz
+# 单声道 16bit 下是 4MB 出头。不封顶的话，值一天班就能攒出几百兆——而真正会被
+# 复用的从来只有"当前这一稿"。
+CACHE_ENTRIES = 4
+
+
 class Synthesizer:
-    """文本 → 48kHz 单声道 PCM，按文本缓存。"""
+    """文本 → 48kHz 单声道 PCM，按文本缓存（只留最近几条）。"""
 
     def __init__(self):
         self._engine = None
         self._temp_dir = tempfile.mkdtemp(prefix="atis_")
-        self._cache = {}
+        self._cache = collections.OrderedDict()
 
     def _ready(self):
         if self._engine is None:
@@ -166,11 +174,14 @@ class Synthesizer:
         if not text or not text.strip():
             return None
         if text in self._cache:
+            self._cache.move_to_end(text)
             return self._cache[text]
         with _TTS_LOCK:
             pcm = self._render(text)
         if pcm:
             self._cache[text] = pcm
+            while len(self._cache) > CACHE_ENTRIES:
+                self._cache.popitem(last=False)
         return pcm
 
     def _render(self, text):
@@ -180,6 +191,10 @@ class Synthesizer:
             if voice_id:
                 engine.setProperty('voice', voice_id)
 
+            # cleanup() 会把这个目录整个删掉，而 Broadcaster 停了之后再 start()
+            # 是允许的——目录没了的话 save_to_file 会静默失败，只留一句
+            # "语音合成失败"，看不出是这个原因
+            os.makedirs(self._temp_dir, exist_ok=True)
             path = os.path.join(self._temp_dir, "atis.wav")
             if os.path.exists(path):
                 try:
@@ -446,6 +461,26 @@ class Broadcaster:
             self._state('error', f"进入频道失败: {e}")
             return False
 
+    def _in_expected_channel(self):
+        """服务器上我们此刻是不是真的还在这个频率的频道里。
+
+        不能拿自己记的状态当准。连接是 reconnect=True 建的，pymumble 掉线后会
+        自己连回来，而服务器把重连上来的用户放回**根频道**——本地这边什么都没
+        变，`_join_channel` 又只在 `_connect` 里跑过一次。于是通播会一直往根频道
+        里播：该听到的人听不到，反而是那些自己切频道失败、卡在根频道的人全都
+        听得到。和 CLAUDE.md 里 PTT 发进根频道是同一类问题。
+        """
+        try:
+            if not self.mumble:
+                return False
+            channel = self._find_channel(self.station.channel)
+            myself = self.mumble.users.myself
+        except Exception:
+            return False
+        if channel is None or myself is None:
+            return False
+        return myself["channel_id"] == channel["channel_id"]
+
     def _wait_for_channel(self, name):
         """等服务器把新建的频道回报回来。
 
@@ -476,13 +511,16 @@ class Broadcaster:
             kind = self.mumble.denial_type(event.type)
         except Exception:
             kind = str(getattr(event, "type", "?"))
-        messages = {
+        # 不要叫 messages：模块顶上 `from pymumble_py3 import messages` 是发
+        # CreateChannel / MoveCmd 用的，在这里被局部变量盖住，以后谁在这个函数
+        # 里加一句发命令就会莫名其妙地炸
+        reasons = {
             "Permission": "没有权限（建立频率频道需要根频道的 MakeTempChannel 权限）",
             "ChannelName": "频道名不合服务器的规矩",
             "NestingLimit": "频道层级超过了服务器上限",
             "ChannelCountLimit": "服务器上的频道数已达上限",
         }
-        self._denial = messages.get(kind, f"服务器拒绝了操作: {kind}")
+        self._denial = reasons.get(kind, f"服务器拒绝了操作: {kind}")
         if getattr(event, "reason", ""):
             self._denial += f"（{event.reason}）"
         log.warning("%s: %s", self.station.callsign, self._denial)
@@ -564,6 +602,15 @@ class Broadcaster:
             if pcm is None:
                 self._state('error', "语音合成失败，请检查系统 TTS 语音")
                 return
+
+            # 每一轮开播前都对着服务器确认一次，别信自己记的
+            if not self._in_expected_channel():
+                log.info("已经不在 %s 里了（多半是断线重连过），重新进频道",
+                         self.station.channel)
+                if not self._join_channel():
+                    if self.stop_event.wait(REPEAT_GAP):
+                        break
+                    continue
 
             if not self._wait_for_quiet():
                 break

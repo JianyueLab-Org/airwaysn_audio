@@ -65,6 +65,9 @@ class TrafficInjector:
         self._pending = {}          # requestID -> 呼号（等 objectID 回来）
         self._requested_titles = {}  # requestID -> 模型名，出错时才知道是谁
         self._assigned = {}         # requestID -> objectID
+        # 已经不要了、但 objectID 还在路上的那些请求。飞机在模拟器里是**已经建
+        # 出来**的，等号码回来必须补一刀删掉，否则它会以最后的位置永久停在天上。
+        self._orphaned = set()
         self.bad_titles = set()     # 模拟器拒绝生成过的模型；匹配时要排除掉
         self._next_request = REQUEST_BASE
         self._enums = None
@@ -160,6 +163,10 @@ class TrafficInjector:
                 record = self.aircraft.get(callsign)
                 if record is not None and record.get("object_id") is None:
                     self.aircraft.pop(callsign, None)
+            # 这里把所有在等的请求都丢掉了，可其中有些是会建成功的——它们的
+            # objectID 随后就到，没人认领就成了天上的幽灵。全部记成待补删，
+            # 真没建出来的那几个 AIRemoveObject 会自己失败，无害。
+            self._orphaned.update(self._pending)
             self._pending.clear()
 
     def _define_position(self):
@@ -203,18 +210,39 @@ class TrafficInjector:
             self.remove(callsign)
 
     def _collect_assigned(self):
-        """把已经回来的 objectID 认领到对应的飞机上。"""
+        """把已经回来的 objectID 认领到对应的飞机上。
+
+        还要收拾"号码回来晚了"的那些：飞机一创建就飞出范围（或者中途来了个
+        SimConnect 异常）时，remove() 那会儿 object_id 还是 None，删不了——可是
+        模拟器那边是真的建出来了。不在这里补删的话，它会以最后的位置永远停在
+        天上，而我们连它的号码都不再记得。
+        """
         with self._lock:
             ready = [(rid, oid) for rid, oid in self._assigned.items()
                      if rid in self._pending]
             for rid, oid in ready:
                 callsign = self._pending.pop(rid)
                 self._assigned.pop(rid, None)
+                self._requested_titles.pop(rid, None)
                 record = self.aircraft.get(callsign)
                 if record is not None:
                     record["object_id"] = oid
                     log.info("%s 已放入模拟器（对象 %d，模型 %s）",
                              callsign, oid, record.get("title", "?"))
+            strays = [(rid, self._assigned.pop(rid))
+                      for rid in list(self._assigned) if rid in self._orphaned]
+            for rid, _ in strays:
+                self._orphaned.discard(rid)
+                self._requested_titles.pop(rid, None)
+
+        # DLL 调用放到锁外面：_request_id() 自己也要拿这把锁
+        for _, object_id in strays:
+            try:
+                self.sim.dll.AIRemoveObject(self.sim.hSimConnect, object_id,
+                                            self._request_id())
+                log.info("补删了一架已经不需要的他机（对象 %d）", object_id)
+            except Exception as e:
+                log.debug("补删他机出错: %s", e)
 
     def _sync_one(self, callsign, entry):
         record = self.aircraft.get(callsign)
@@ -283,9 +311,14 @@ class TrafficInjector:
         record = self.aircraft.pop(callsign, None)
         if not record:
             return
-        with self._lock:
-            self._pending.pop(record.get("request_id"), None)
         object_id = record.get("object_id")
+        with self._lock:
+            request_id = record.get("request_id")
+            was_pending = self._pending.pop(request_id, None) is not None
+            if object_id is None and was_pending:
+                # 号码还没回来。飞机在模拟器里已经建出来了，这里删不掉，
+                # 记一笔等 _collect_assigned 补删。
+                self._orphaned.add(request_id)
         if object_id is None:
             return
         try:

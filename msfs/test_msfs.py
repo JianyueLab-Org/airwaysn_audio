@@ -588,6 +588,57 @@ class InjectorTest(unittest.TestCase):
         injector = self.inject.TrafficInjector(sim=None)
         self.assertIsInstance(injector._requested_titles, dict)
 
+    def _fake_injector(self, removed):
+        """一个不碰 SimConnect 的注入器，只记下 AIRemoveObject 调了哪些对象。"""
+        injector = self.inject.TrafficInjector(sim=None)
+        injector.available = True
+
+        class Dll:
+            @staticmethod
+            def AIRemoveObject(handle, object_id, request_id):
+                removed.append(object_id)
+                return 0
+
+        injector.sim = type("S", (), {"dll": Dll, "hSimConnect": None})()
+        return injector
+
+    def test_an_aircraft_removed_before_its_id_arrives_is_still_deleted(self):
+        """号码回来晚了的飞机也必须删掉，否则会永远停在天上。
+
+        AICreateNonATCAircraft 只是把请求发出去，objectID 是异步回来的。飞机
+        刚建好就飞出范围时，remove() 那一刻 object_id 还是 None——可模拟器里
+        它是真的存在的。不补这一刀的话，它会以最后的位置一直停在那儿，而且
+        我们连它的号码都不再记得，只能重启模拟器。
+        """
+        removed = []
+        injector = self._fake_injector(removed)
+        injector.aircraft["CES2345"] = {"object_id": None, "title": "738",
+                                        "request_id": 10001}
+        injector._pending[10001] = "CES2345"
+
+        injector.remove("CES2345")
+        self.assertEqual(removed, [], "号码还没回来，这时候删不了")
+
+        # 号码现在到了
+        injector._assigned[10001] = 4242
+        injector._collect_assigned()
+        self.assertEqual(removed, [4242], "已经不要的飞机没有被补删，会变成幽灵")
+        self.assertNotIn(10001, injector._assigned, "补删之后不该再留着")
+        self.assertNotIn(10001, injector._orphaned)
+
+    def test_a_late_id_for_a_live_aircraft_is_claimed_not_deleted(self):
+        """正常情况不能误删：还要着的飞机，号码回来就该认领。"""
+        removed = []
+        injector = self._fake_injector(removed)
+        injector.aircraft["CCA101"] = {"object_id": None, "title": "320",
+                                       "request_id": 10002}
+        injector._pending[10002] = "CCA101"
+        injector._assigned[10002] = 77
+
+        injector._collect_assigned()
+        self.assertEqual(removed, [], "这架还要着，不该删")
+        self.assertEqual(injector.aircraft["CCA101"]["object_id"], 77)
+
     def test_cap_leaves_headroom(self):
         # 每架都是完整的飞机模型，放太多会掉帧
         self.assertLessEqual(self.inject.MAX_AIRCRAFT, 64)

@@ -160,7 +160,7 @@ class SimLink:
                 try:
                     self._open()
                 except Exception as e:
-                    self._state(False, f"连不上 MSFS（模拟器是否已启动？）")
+                    self._state(False, "连不上 MSFS（模拟器是否已启动？）")
                     log.debug("SimConnect 打开失败: %s", e)
                     self._sleep(RETRY_INTERVAL)
                     continue
