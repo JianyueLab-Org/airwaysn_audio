@@ -7,9 +7,17 @@
 
 import os
 import sys
+import tempfile
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# 挪到临时目录再跑。Profile / Settings 的路径都是相对当前目录的裸文件名，直接在
+# atis 目录下跑的话，这个测试会**读到并写坏使用者真实的 atis_profile.json**——
+# "添加两个席位" 在你已经配过席位时必然失败（呼号重复），跑完还会把它覆盖掉。
+# airports.py 和图标走的都是 __file__ / sys._MEIPASS，所以换目录是安全的。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.chdir(tempfile.mkdtemp(prefix="airwaysn-atis-smoke-"))
 
 # pymumble 需要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
 try:
@@ -155,7 +163,8 @@ def main():
         assert rendered, "没有渲染出通播"
         text, voice = rendered
         assert "09004MPS" in text, "文字通播仍应照抄电码"
-        for fragment in ("上海浦东", "风", "能见度", "温度", "修正海压"):
+        for fragment in ("上海浦东", "风向", "风速", "能见度", "气温", "露点",
+                         "修正海压"):
             assert fragment in voice, f"中文稿缺少 {fragment}：{voice}"
         assert "wind" not in voice, "选了中文就不该混进英文稿"
     check("中文语音稿", chinese_script_is_generated)

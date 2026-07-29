@@ -2,6 +2,14 @@
 
 import ctypes.util
 import os
+import sys
+
+# build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
+# 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version
+
+version.freeze(os.path.dirname(os.path.abspath(SPEC)))
 
 excludes = ['torch', 'transformers', 'scipy', 'pyttsx3', 'matplotlib']
 
@@ -49,6 +57,7 @@ a = Analysis(
         # X-Plane 插件。它不在这个进程里跑——是给用户复制到
         # <X-Plane>/Resources/plugins/PythonPlugins/ 的，所以只是随包带上。
         ('plugin/PI_XpcTraffic.py', 'plugin'),
+        ('buildinfo.json', '.'),
     ],
     hiddenimports=[
         'pymumble_py3',

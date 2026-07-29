@@ -288,6 +288,10 @@ class MumbleRadioClient:
             pymumble.constants.PYMUMBLE_CLBK_SOUNDRECEIVED,
             self.handle_incoming_audio,
         )
+        self.mumble.callbacks.set_callback(
+            pymumble.constants.PYMUMBLE_CLBK_PERMISSIONDENIED,
+            self.handle_permission_denied,
+        )
         self.current_channel = None
 
         # ---- 独立连接状态标记 ----
@@ -786,6 +790,36 @@ class MumbleRadioClient:
             except Exception as e:
                 log.debug("语音处理错误: %s", e)
                 time.sleep(0.1)
+
+    def handle_permission_denied(self, event):
+        """服务器拒绝了某个动作，把原因说出来。
+
+        不接这条回报的代价，实测日志长这样：
+
+            频道 FREQ_127100 不存在，建一个临时的
+            建立频道 FREQ_127100 后 5 秒内没有出现，1 秒后重试
+            （无限重复，没有任何错误）
+
+        建频率频道要根频道的 MakeTempChannel（0x400）、进频道要 Enter（0x4）。
+        服务器缺哪一条都只是**默默不照做**：命令发出去了、没有报错、频道就是不
+        出现。看上去像网络慢，实际上再等一万年也不会成功，而真正的原因服务器早
+        就用 PermissionDenied 说了。管制端和 ATIS 一直接着这条，飞行员端漏了。
+        """
+        try:
+            kind = self.mumble.denial_type(event.type)
+        except Exception:
+            kind = str(getattr(event, "type", "?"))
+        reasons = {
+            "Permission": "没有权限（建频率频道要根频道的 MakeTempChannel，"
+                          "进频道要 Enter）",
+            "ChannelName": "频道名不合服务器的规矩",
+            "NestingLimit": "频道层级超过了服务器上限",
+            "ChannelCountLimit": "服务器上的频道数已达上限",
+        }
+        reason = reasons.get(kind, "服务器拒绝了操作: %s" % kind)
+        if getattr(event, "reason", ""):
+            reason += "（%s）" % event.reason
+        log.warning("服务器拒绝: %s", reason)
 
     def handle_incoming_audio(self, user, soundchunk):
         if not self.mumble.users.myself:

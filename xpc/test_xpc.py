@@ -480,6 +480,9 @@ class VoiceChannelTest(unittest.TestCase):
         caster = self.voice.Voice.__new__(self.voice.Voice)
         # 测试环境里 pymumble 的常量可能是替身，所以拿模块自己导入的那个比对
         connected_state = self.voice.PYMUMBLE_CONN_STATE_CONNECTED
+        # 连接标记由 CONNECTED / DISCONNECTED 回调翻转，这里假定已经连上
+        caster._connection_established = threading.Event()
+        caster._connection_established.set()
 
         caster.mumble = type("M", (), {"connected": connected_state})()
         self.assertTrue(caster.connected, "真的连上了应当是 True")
@@ -492,8 +495,29 @@ class VoiceChannelTest(unittest.TestCase):
 
     def test_no_mumble_means_not_connected(self):
         caster = self.voice.Voice.__new__(self.voice.Voice)
+        caster._connection_established = threading.Event()
+        caster._connection_established.set()
         caster.mumble = None
         self.assertFalse(caster.connected)
+
+    def test_a_dead_main_loop_is_not_reported_as_connected(self):
+        """主循环结束时 pymumble **不会**把 connected 改回去，它就停在 2。
+
+        只看状态码的话，连接早就死透了（命令队列再没人抽）界面还是绿的——那
+        正是"进不了频道又不报错"的表象。所以还要看那个由回调翻转的独立标记，
+        老飞行员端的 _connection_established 就是干这个的。
+        """
+        caster = self.voice.Voice.__new__(self.voice.Voice)
+        connected_state = self.voice.PYMUMBLE_CONN_STATE_CONNECTED
+        caster.mumble = type("M", (), {"connected": connected_state})()
+
+        caster._connection_established = threading.Event()
+        caster._connection_established.set()
+        self.assertTrue(caster.connected, "前提：标记在时算已连接")
+
+        caster._connection_established.clear()   # 主循环退出时清掉
+        self.assertFalse(caster.connected,
+                         "状态码还停在已连接，但循环已经没了，不能算连着")
 
     def test_stuck_channel_is_explained(self):
         # 切不过去的两个分支原来是静默 continue，日志里什么都看不到
@@ -668,6 +692,9 @@ class VoiceRuntimeTest(unittest.TestCase):
             settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100))
         self.voice.mumble = self.server
         self.voice.running = True
+        # 这些用例绕过 start() 直接塞连接，所以连接标记要自己置上——正常路径
+        # 里它由 pymumble 的 CONNECTED 回调翻转
+        self.voice._connection_established.set()
         self.voice._input = FakeStream()
         self.voice._output = FakeStream()
         self.voice._chunk = 960
@@ -784,6 +811,11 @@ class VoiceStartupFailureTest(unittest.TestCase):
             def terminate(self):
                 self.terminated = True
 
+        # pymumble 是替身，errors.ConnectionRejectedError 不是真的异常类——
+        # _mumble_loop 的 except 接不住 MagicMock，会当场 TypeError
+        rejected = type("ConnectionRejectedError", (Exception,), {})
+        voice.pymumble.errors.ConnectionRejectedError = rejected
+
         class FakeMumble:
             connected = 3               # PYMUMBLE_CONN_STATE_FAILED
             callbacks = types.SimpleNamespace(set_callback=lambda *a: None)
@@ -794,8 +826,9 @@ class VoiceStartupFailureTest(unittest.TestCase):
             def set_receive_sound(self, value):
                 pass
 
-            def start(self):
-                pass
+            def run(self):
+                # 密码不对时真的 pymumble 就是从 run() 里把它抛出来的
+                raise rejected("Wrong certificate or password")
 
             def is_ready(self):
                 pass
@@ -854,6 +887,126 @@ class VoiceStartupFailureTest(unittest.TestCase):
         self.assertTrue(all(a.terminated for a in self.audios),
                         "每一次失败都要收干净，不能越攒越多")
         self.assertEqual(len(self.stopped), 3)
+
+
+class VoiceParentThreadTest(unittest.TestCase):
+    """pymumble 的主循环不能挂在那个"调完 start() 就退"的线程上。
+
+    pymumble 在 __init__ 里记下 `parent_thread = threading.current_thread()`，
+    主循环的条件是 `... and self.parent_thread.is_alive() and not self.exit`，
+    而**抽命令队列就在那个循环里**：
+
+        while self.commands.is_cmd():
+            self.treat_command(self.commands.pop_cmd())
+
+    gui.py 是 `threading.Thread(target=voice.start).start()` 调起来的，start()
+    把工作线程拉起来就返回，那个一次性线程当场结束。于是循环退出——连接还在、
+    频道表还在、myself 也还在，但从此没有一条命令发得出去：MoveCmd 永远躺在
+    队列里，服务器压根没收到，既不把人挪进频道，也不会回 PermissionDenied。
+
+    实测日志就是这个形状，能刷一整晚：
+
+        → 发出进频道命令 FREQ_124550：会话号=111 从频道0 到频道1
+        ← 进频道命令已入队 FREQ_124550
+        发出了进入 FREQ_124550 的请求，但 5 秒内没有生效，稍后重试
+        现场诊断 ... 我在频道=0 频道表共4个 表里有没有目标=True
+
+    替身照抄 pymumble 那一行（构造时记下当前线程），所以这里测的是真的行为，
+    不是字符串匹配。
+    """
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice_module = voice
+
+        # pymumble 是替身，模块里的状态常量也是 MagicMock，不能写死 2
+        connected_state = voice.PYMUMBLE_CONN_STATE_CONNECTED
+        voice.pymumble.errors.ConnectionRejectedError = type(
+            "ConnectionRejectedError", (Exception,), {})
+        connected_clbk = voice.PYMUMBLE_CLBK_CONNECTED
+
+        class FakeMumble:
+            def __init__(self, *args, **kwargs):
+                # pymumble 的 mumble.py:59 就是这么写的
+                self.parent_thread = threading.current_thread()
+                # 留一份原样的，用来证明这个陷阱是真的存在
+                self.constructed_in = threading.current_thread()
+                self.connected = 0
+                self._callbacks = {}
+                self._done = threading.Event()
+                self.callbacks = types.SimpleNamespace(
+                    set_callback=lambda name, fn: self._callbacks.__setitem__(
+                        name, fn))
+
+            def set_receive_sound(self, value):
+                pass
+
+            def run(self):
+                """和真的一样：连上之后**一直不返回**，直到 stop()。"""
+                self.mumble_thread = threading.current_thread()
+                self.connected = connected_state
+                callback = self._callbacks.get(connected_clbk)
+                if callback:
+                    callback()
+                self._done.wait()
+
+            def is_ready(self):
+                pass
+
+            def stop(self):
+                self._done.set()
+
+        self._real_mumble = voice.pymumble.Mumble
+        voice.pymumble.Mumble = FakeMumble
+
+    def tearDown(self):
+        self.voice_module.pymumble.Mumble = self._real_mumble
+
+    def make_voice(self):
+        v = self.voice_module.Voice(
+            "host", "1000", "pw",
+            settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100))
+        v._open_audio = lambda: (
+            setattr(v, "_audio", types.SimpleNamespace(terminate=lambda: None)),
+            setattr(v, "_input", FakeStream()),
+            setattr(v, "_output", FakeStream()))
+        # 这两条循环不是这里要测的，让它们立刻结束，免得后台线程干扰
+        v._run = lambda: None
+        v._channel_loop = lambda: None
+        return v
+
+    def start_from_a_throwaway_thread(self, v):
+        """完全照着 gui.py 的调法来。"""
+        thread = threading.Thread(target=v.start, daemon=True)
+        thread.start()
+        thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), "start() 没有返回")
+        return thread
+
+    def test_the_mumble_loop_outlives_the_thread_that_called_start(self):
+        v = self.make_voice()
+        starter = self.start_from_a_throwaway_thread(v)
+        self.assertIsNotNone(v.mumble, "前提：连上了")
+        self.assertFalse(starter.is_alive(), "前提：起头的那个线程已经退了")
+        self.assertTrue(
+            v.mumble.parent_thread.is_alive(),
+            "pymumble 的 parent_thread 已经死了——它的主循环就此结束，命令队列"
+            "再没人抽，MoveCmd 永远发不出去，而且一声不吭")
+        v.stop()
+
+    def test_the_trap_is_real_the_object_is_built_on_the_throwaway_thread(self):
+        """证明上一条测的不是个假想：对象确实是在一次性线程里构造的。"""
+        v = self.make_voice()
+        starter = self.start_from_a_throwaway_thread(v)
+        self.assertIs(v.mumble.constructed_in, starter,
+                      "Mumble 对象就是在那个一次性线程里建的，所以 pymumble 默认"
+                      "记下的 parent_thread 正是它")
+        self.assertIsNot(v.mumble.parent_thread, starter,
+                         "必须改指到一个和会话同寿的线程上")
+        v.stop()
 
 
 class ChannelNameTest(unittest.TestCase):
@@ -1542,6 +1695,37 @@ class ModelMatchingTest(unittest.TestCase):
         model, why = models.match(equipment="B77W")
         self.assertEqual(model.icao, "B78X", why)
         self.assertIn("宽体", why)
+
+    def test_category_beats_the_generic_guess(self):
+        """同类机身必须排在「按前缀猜通用机型」前面。
+
+        GENERIC_BY_PREFIX 是两位前缀，A3 / B7 同时盖住窄体和宽体：B77W 猜出
+        B738、A359 猜出 A320。通用那级要是排在前面，只要装了 B738 或 A320
+        （最普及的两个），所有宽体都会退成窄体——一架 777 在别人屏幕上变成
+        737，正是同类机身那一级本来要挡的情况。
+
+        关键在于**装了 B738**。上面那条用例只装了 A319 和 B78X，通用猜出的
+        B738 找不到，自然就轮到了同类机身，于是顺序错了也照样通过。
+        """
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738", "b738.obj", icao="B738"),
+            cslmatch.Model("A320", "a320.obj", icao="A320"),
+            cslmatch.Model("B789", "b789.obj", icao="B789"),
+        ])
+        for want in ("B77W", "B77L", "A359", "A388", "B744"):
+            model, why = models.match(equipment=want)
+            self.assertEqual(model.icao, "B789",
+                             f"{want} 应当顶一架宽体，却拿到 {model.icao}（{why}）")
+            self.assertIn("宽体", why)
+
+    def test_generic_still_used_when_the_category_has_nothing(self):
+        """同类机身里一个都没装时，仍然要退到通用机型，别直接掉兜底。"""
+        models = cslmatch.ModelSet([
+            cslmatch.Model("B738", "b738.obj", icao="B738"),
+        ])
+        model, why = models.match(equipment="B77W")
+        self.assertEqual(model.icao, "B738", why)
+        self.assertIn("通用机型", why)
 
     def test_category_lookup(self):
         self.assertEqual(cslmatch.category_of("B77W"), "宽体")

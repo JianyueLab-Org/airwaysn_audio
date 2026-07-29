@@ -10,6 +10,7 @@ from pynput import keyboard
 
 import applog
 import i18n
+import version
 from i18n import t
 
 log = logging.getLogger("设置")
@@ -154,6 +155,11 @@ class SettingsDialog(QDialog):
         log_layout.addWidget(self.debug_checkbox)
         log_layout.addWidget(open_log)
         layout.addLayout(log_layout)
+
+        # 连上之后登录页就看不见了，版本号在这里再露一次
+        version_label = QLabel(version.full())
+        version_label.setStyleSheet("color: #808080;")
+        layout.addWidget(version_label)
 
         button_layout = QHBoxLayout()
         save_button = QPushButton(t("settings.save"))

@@ -71,20 +71,35 @@ TEXT = {
     "radio.mute":           {"zh": "静音", "en": "Mute"},
     "radio.mute_tip":       {"zh": "静音这个频率", "en": "Mute this frequency"},
     "radio.remove_tip":     {"zh": "从电台栈移除", "en": "Remove from the stack"},
+    "radio.remove_locked":  {"zh": "这是你正在管的席位频率，不能移除",
+                             "en": "This is the position you are staffing — cannot be removed"},
+    "radio.tx_needs_duty":  {"zh": "数据源上没有你的管制席位，只能收听",
+                             "en": "You are not staffing a position — receive only"},
     "radio.no_callsign":    {"zh": "—", "en": "—"},
     "radio.last_rx_none":   {"zh": "最后通话: --", "en": "Last: --"},
     "radio.last_rx":        {"zh": "最后通话: {who}  {stamp}", "en": "Last: {who}  {stamp}"},
 
     # ---------- 底栏 / 状态 ----------
     "status.ready":         {"zh": "就绪", "en": "Ready"},
-    "status.listeners":     {"zh": "多频率接收需要服务器支持频道监听（Mumble 1.4+）；"
-                                   "若只听得到主频率（▸），说明服务器不支持",
-                             "en": "Receiving several frequencies needs server-side channel "
-                                   "listening (Mumble 1.4+). If you only hear the primary "
-                                   "frequency (▸), the server does not support it."},
     "status.adopted":       {"zh": "已按你在网上的席位 {callsign} 自动加入 {frequency}",
                              "en": "Added {frequency} from your online position {callsign}"},
     "status.audio_device":  {"zh": "音频设备", "en": "Audio device"},
+
+    # ---------- 值守状态（在不在管制席位上） ----------
+    "duty.on":              {"zh": "值守 {callsign}", "en": "Staffing {callsign}"},
+    "duty.observer":        {"zh": "未上席位 · 只收不发",
+                             "en": "Not staffing · receive only"},
+    "duty.tx_dropped":      {"zh": "已离开管制席位，所有 TX / XC 已关闭",
+                             "en": "Left your position — all TX / XC turned off"},
+
+    # ---------- 在线席位一览 ----------
+    "online.title":         {"zh": "在线频率", "en": "Online frequencies"},
+    "online.empty":         {"zh": "数据源上暂时没有在线席位",
+                             "en": "No positions online"},
+    "online.add_tip":       {"zh": "点一下把 {callsign} 的 {frequency} 加进电台栈",
+                             "en": "Click to add {frequency} ({callsign}) to the stack"},
+    "online.already":       {"zh": "{frequency} 已经在电台栈里了",
+                             "en": "{frequency} is already in the stack"},
     "status.audio_failed":  {"zh": "切换设备失败: {error}",
                              "en": "Could not switch device: {error}"},
 

@@ -282,22 +282,28 @@ class ModelSet:
             if found:
                 return found[0], f"用同族 {relative} 顶替"
 
-        # 4. 同类别通用。猜出来的通用机型本身也可能没装（比如猜出 A320 但包里
-        #    只有 A20N），所以这一级同样要走一遍同族，否则会白白掉到兜底。
-        generic = generic_for(equipment)
-        for candidate in (generic,) + tuple(family_of(generic)):
-            found = self._by_icao.get(candidate)
-            if found:
-                return found[0], f"退到通用机型 {candidate}"
-
-        # 5. 同类机身。宽体顶宽体、支线顶支线，至少大小对得上——拿一架 A319 去
-        #    顶 B777 视觉上差得离谱。
+        # 4. 同类机身。宽体顶宽体、支线顶支线，至少大小对得上。
+        #
+        #    **这一级必须排在「通用机型」前面。** GENERIC_BY_PREFIX 是按两位前缀
+        #    猜的，而 A3 / B7 这样的前缀同时盖住窄体和宽体：B77W 会被猜成 B738、
+        #    A359 会被猜成 A320。把通用那级放前面的话，只要装了 B738 或 A320
+        #    （最普及的两个模型），**所有宽体都会退成窄体**，这一级永远轮不到
+        #    ——一架 777 在别人屏幕上变成 737，正是它本来要挡的那种情况。
         category = category_of(equipment)
         if category:
             for candidate in CATEGORIES[category]:
                 found = self._by_icao.get(candidate)
                 if found:
                     return found[0], f"同为{category}，用 {candidate} 顶替"
+
+        # 5. 同类别通用。走到这里说明机型码不在 CATEGORIES 里（新机型、打错的
+        #    代码），只能按前缀猜。猜出来的通用机型本身也可能没装（比如猜出
+        #    A320 但包里只有 A20N），所以这一级同样要走一遍同族。
+        generic = generic_for(equipment)
+        for candidate in (generic,) + tuple(family_of(generic)):
+            found = self._by_icao.get(candidate)
+            if found:
+                return found[0], f"退到通用机型 {candidate}"
 
         # 6. 兜底。看不见的飞机比涂装错的飞机危险得多。
         return self.models[0], "没有近似机型，用了包里的第一个"

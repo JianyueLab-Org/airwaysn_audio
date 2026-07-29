@@ -67,10 +67,24 @@ PERM_NAMES = [
     (PERM_MAKE_TEMP_CHANNEL, "MakeTempChannel"), (PERM_LISTEN, "Listen"),
 ]
 
-# 这套系统跑起来必须有的，以及缺了会怎样
+# 这套系统跑起来必须有的，以及缺了会怎样。
+#
+# 这几条的共同点是：缺了之后服务器**只是默默不照做**，不会给客户端任何看得懂的
+# 反馈。表现出来就是"命令发出去了、没有报错、就是不生效"，看着像网络慢或者服务
+# 器卡，实际上再等一万年也不会成功。真实日志里是这样的：
+#
+#     频道 FREQ_127100 不存在，建一个临时的
+#     建立频道 FREQ_127100 后 5 秒内没有出现，1 秒后重试   （无限重复）
 REQUIRED = [
     (PERM_LISTEN, "Listen", "管制端收不到主频率以外的频率"),
     (PERM_MAKE_TEMP_CHANNEL, "MakeTempChannel", "建不了 FREQ_* 频道，报频道不存在"),
+    (PERM_ENTER, "Enter",
+     "进不了 FREQ_* 频道：频道明明存在，进频道的命令也发了，人却一直留在根频道，"
+     "于是 PTT 发不出去、也收不到任何人的话音"),
+    (PERM_WHISPER, "Whisper",
+     "管制端发不出话音：管制端不是普通说话，而是用 VoiceTarget 对着一组频道"
+     "whisper，缺这一条它说什么都没人听得到"),
+    (PERM_SPEAK, "Speak", "谁都发不出话音"),
 ]
 
 

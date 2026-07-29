@@ -2,6 +2,14 @@
 
 import ctypes.util
 import os
+import sys
+
+# build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
+# 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version
+
+version.freeze(os.path.dirname(os.path.abspath(SPEC)))
 
 # qfluentwidgets 的 QSS、SVG 图标和内置字体是编进 Qt resource 模块（*_rc.py）的，
 # 跟着普通 import 就一起打进去了，不用 collect_data_files——实测收出来是 0 个文件。
@@ -51,7 +59,7 @@ a = Analysis(
     pathex=[],
     binaries=opus_binaries,
     # 窗口图标要随程序分发，否则打包后运行时取不到
-    datas=[('favicon.ico', '.')],
+    datas=[('favicon.ico', '.'), ('buildinfo.json', '.')],
     # 管制端不做语音合成，不需要 scipy / pyttsx3 的隐式导入
     hiddenimports=[
         'pymumble_py3',

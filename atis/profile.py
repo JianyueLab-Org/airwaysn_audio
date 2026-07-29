@@ -50,13 +50,25 @@ LANGUAGES = {
 
 class Preset:
     def __init__(self, name="默认", template=None, airport_conditions="",
-                 notams="", transition_level=""):
+                 notams="", transition_level="", chinese_runway="",
+                 closing="", chinese_extra=""):
         from template import DEFAULT_TEMPLATE
         self.name = name
         self.template = DEFAULT_TEMPLATE if template is None else template
         self.airport_conditions = airport_conditions
         self.notams = notams
         self.transition_level = transition_level
+        # 中文稿念的跑道。跟着预设走而不是跟着席位——切到"北向"时英文稿的
+        # ARR RWY 会变，中文稿要是还念着南向的跑道，两份稿子就自相矛盾了。
+        # 留空则回退到席位上的 chinese_runway。
+        self.chinese_runway = chinese_runway
+        # 收尾语跟着预设走。不同构型要交代的事不一样，比如「并确认能否执行
+        # RNAV 程序」只该出现在 RNAV 离场可用的那份稿子里。留空用内置那句。
+        self.closing = closing
+        # 中文稿的附加文本。中文通播不是英文的逐词翻译（chinese.py 是从 METAR
+        # 独立渲染的），跑道构型、放行频率、应答机模式这些注意事项在中文侧没有
+        # 对应字段，整段写在这里，接在气象之后念。
+        self.chinese_extra = chinese_extra
 
     def to_dict(self):
         return {
@@ -65,6 +77,9 @@ class Preset:
             "airport_conditions": self.airport_conditions,
             "notams": self.notams,
             "transition_level": self.transition_level,
+            "chinese_runway": self.chinese_runway,
+            "closing": self.closing,
+            "chinese_extra": self.chinese_extra,
         }
 
     @classmethod
@@ -75,6 +90,11 @@ class Preset:
             data.get("airport_conditions", ""),
             data.get("notams", ""),
             data.get("transition_level", ""),
+            # 老配置没有这一项，缺省空字符串会回退到席位上的那个
+            data.get("chinese_runway", ""),
+            # 老配置没有这两项：空串 = 用内置收尾语、中文稿不加附言
+            data.get("closing", ""),
+            data.get("chinese_extra", ""),
         )
 
 

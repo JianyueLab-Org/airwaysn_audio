@@ -38,6 +38,7 @@ import bridge
 import cslmatch
 import fsdpilot
 import traffic as traffic_module
+import version
 import voice as voice_module
 import xplane
 from settings import Settings
@@ -45,7 +46,9 @@ from settings import Settings
 log = logging.getLogger("界面")
 
 APP_NAME = "XPC for CAN"
-VERSION = "1.0.0"
+# 版本号和 build 号统一在 version.py 里。build 号是打包时由 gui.spec 固化的
+# ——打包之后程序里没有 .git，运行时问不出来。
+VERSION = version.VERSION
 
 GREEN = "#2ecc71"
 RED = "#e74c3c"
@@ -624,7 +627,7 @@ class XpcWindow(QMainWindow):
     def show_about(self):
         QMessageBox.information(
             self, "关于",
-            f"{APP_NAME} v{VERSION}\n\n"
+            f"{APP_NAME} {version.full()}\n\n"
             "Cerulean Aviation Network 的 X-Plane 飞行员客户端。\n"
             "语音走 Mumble，网络走 FSD，飞行数据从 X-Plane 的 UDP 取。\n\n"
             f"日志：{applog.log_path() or '（未写入文件）'}")
@@ -910,7 +913,7 @@ class FlightPlanDialog(QDialog):
 
 def main():
     applog.setup(debug="--debug" in sys.argv)
-    logging.getLogger("启动").info("%s v%s", APP_NAME, VERSION)
+    logging.getLogger("启动").info("%s %s", APP_NAME, version.full())
     app = QApplication(sys.argv)
     window = XpcWindow()
     window.show()

@@ -52,6 +52,23 @@ _WEATHER = re.compile(r'^(-|\+|VC)?([A-Z]{2,8})$')
 _TREND = ("NOSIG", "TEMPO", "BECMG", "RMK")
 
 
+# 情报字母的通话表。和 server/ATIS/process.py 里那份一致——通播念的是
+# "INFORMATION ALPHA"，直接给 TTS 一个孤零零的 "A"，SAPI 会念成"诶"。
+NATO = {
+    "A": "Alpha", "B": "Bravo", "C": "Charlie", "D": "Delta", "E": "Echo",
+    "F": "Foxtrot", "G": "Golf", "H": "Hotel", "I": "India", "J": "Juliett",
+    "K": "Kilo", "L": "Lima", "M": "Mike", "N": "November", "O": "Oscar",
+    "P": "Papa", "Q": "Quebec", "R": "Romeo", "S": "Sierra", "T": "Tango",
+    "U": "Uniform", "V": "Victor", "W": "Whiskey", "X": "X-ray",
+    "Y": "Yankee", "Z": "Zulu",
+}
+
+
+def spell_letter(letter):
+    """情报字母 → 通话字母表的词。不认识的原样返回。"""
+    return NATO.get(str(letter).strip().upper(), str(letter))
+
+
 def spell(text):
     """把数字逐位念出来：090 → zero niner zero。非数字原样保留。"""
     return " ".join(DIGITS.get(ch, ch) for ch in str(text))
@@ -112,9 +129,12 @@ def _wind(token, variation):
     if direction != "VRB" and speed_value == 0:
         voice = "wind calm"
     elif direction == "VRB":
-        voice = f"wind variable at {spell(speed_value)} {unit_voice}"
+        voice = f"wind variable {spell(speed_value)} {unit_voice}"
     else:
-        voice = f"wind {spell(direction)} at {spell(speed_value)} {unit_voice}"
+        # 念法照本网通播的稿子：WIND 140 DEGREES 5 METRES PER SECOND。
+        # 度数和风速仍然逐位念（"one four zero"），不能交给 TTS 去读 140
+        # ——那会念成 "one hundred forty"，不是航空用语。
+        voice = f"wind {spell(direction)} degrees {spell(speed_value)} {unit_voice}"
 
     if gust:
         voice += f" gusting {spell(int(gust))} {unit_voice}"
@@ -287,7 +307,7 @@ class Metar:
                 self.temperature = Element(
                     temp, f"temperature {spell_number(self._signed(temp))}")
                 self.dew_point = Element(
-                    dew, f"dew point {spell_number(self._signed(dew))}")
+                    dew, f"dewpoint {spell_number(self._signed(dew))}")
                 continue
 
             if re.match(r'^Q\d{4}$', token):

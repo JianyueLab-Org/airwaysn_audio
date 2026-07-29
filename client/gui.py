@@ -19,6 +19,7 @@ import pymumble_py3 as pymumble
 import queue
 import pygame
 import applog
+import version
 
 ico_path = r".\favicon.ico"
 
@@ -186,6 +187,7 @@ class RadioGUI(QMainWindow):
 
         # 设置日志
         applog.setup()
+        logging.getLogger("启动").info("MSFS 飞行员客户端启动 %s", version.full())
 
         # 设置应用程序图标和窗口图标
         from PyQt6.QtGui import QIcon
@@ -214,7 +216,7 @@ class RadioGUI(QMainWindow):
             log.debug("pygame状态: get_init=%s display=%s joystick=%s",
                        pygame.get_init(), pygame.display.get_init(), pygame.joystick.get_init())
             
-        self.setWindowTitle("无线电-Airwaysn")
+        self.setWindowTitle(f"无线电-Airwaysn {version.full()}")
         self.setMinimumSize(300, 200)
         
         self.stacked_widget = QStackedWidget()

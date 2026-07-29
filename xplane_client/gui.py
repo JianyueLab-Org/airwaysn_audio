@@ -31,6 +31,7 @@ import keyboard
 import pymumble_py3 as pymumble
 import pygame
 import applog
+import version
 
 ico_path = r".\favicon.ico"
 
@@ -203,6 +204,7 @@ class RadioGUI(QMainWindow):
 
         # 设置日志
         applog.setup()
+        logging.getLogger("启动").info("X-Plane 飞行员客户端启动 %s", version.full())
 
         from PyQt6.QtGui import QIcon
         icon = QIcon(ico_path)
@@ -220,7 +222,7 @@ class RadioGUI(QMainWindow):
         except Exception as e:
             log.error("Pygame初始化失败: %s", e)
 
-        self.setWindowTitle("无线电-Airwaysn (X-Plane)")
+        self.setWindowTitle(f"无线电-Airwaysn (X-Plane) {version.full()}")
         self.setMinimumSize(300, 200)
 
         self.stacked_widget = QStackedWidget()

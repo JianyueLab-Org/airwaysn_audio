@@ -94,6 +94,37 @@ def frequency_khz(entry):
     return khz
 
 
+def online_positions(data):
+    """此刻在线的所有管制席位，[(呼号, 千赫, facility)]，按频率排序。
+
+    判定和 controller_for 一致：席位类型要高于观察员，频率要能解析、且不是
+    can-fsd 那个"没设频率"的占位。挂着观察员的、没设频率的，列出来只会让人
+    去点一个谁也不在的频道。
+
+    同一个频率上可能有多个席位（比如同一频率的主备），全都留着——列表是给人
+    看的，合并掉反而看不出谁在上面。
+    """
+    found = []
+    if not data:
+        return found
+    for entry in data.get("controllers") or []:
+        try:
+            facility = int(entry.get("facility", 0))
+        except (TypeError, ValueError):
+            facility = 0
+        if facility <= FACILITY_OBSERVER:
+            continue
+        khz = frequency_khz(entry)
+        if khz is None:
+            continue
+        callsign = str(entry.get("callsign", "")).strip()
+        if not callsign:
+            continue
+        found.append((callsign, khz, facility))
+    found.sort(key=lambda item: (item[1], item[0]))
+    return found
+
+
 def roster(data):
     """CID → 呼号。飞行员和管制席位都收进来。
 

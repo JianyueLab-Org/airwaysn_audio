@@ -29,7 +29,6 @@ SERVER_ID = 1
 
 # 口令不写在这里，见 serverconf.py。环境变量 / server_secrets.json /
 # mumble-server.ini 三选一，都没有就在启动时大声失败。
-ATIS_ACCOUNT = serverconf.atis_account()
 
 # requests 没有默认超时。authenticate 跑在 Ice 的服务端分发线程上，上游接口
 # 一旦变成黑洞（不是拒连，是不回包），这个线程就永远回不来——线程池被占满之后
@@ -225,16 +224,20 @@ def login(cid, password):
 
 
 def login_ATIS(name, password):
-    """ATIS 登录，用户名形如 DDDD_atisDDDDDD。"""
+    """ATIS 登录，用户名形如 DDDD_atisDDDDDD。
+
+    **这条路径不能去掉**，哪怕服务端一台通播机都不跑：管制员手里的桌面通播
+    客户端（atis/，打包成 airwaysn-atis）登录用的就是 `{自己的cid}_atis{频率}`，
+    走的正是这里。cid 部分照常拿去上游接口验，和普通用户一样。
+
+    以前这里还有一条保留账号的旁路，给 server/ATIS/ 那队服务端通播机免验证用。
+    默认部署只起 login.py、那队机器人不跑，所以那条旁路是死代码，已经去掉。
+    **要重新启用服务端通播机的话，光把 server/ATIS/mumble.py 拉起来是不够的**
+    ——它那个保留账号（默认 900）上游接口并不认识，要么把旁路加回来，要么在
+    can-web 那边给它建一个真账号。
+    """
     cid = name.split("_atis")[0]
     print(f"ATIS登录: cid={cid}")           # 密码不进日志
-
-    # 服务端自己那队通播机用的保留账号，不走上游接口。
-    # 口令没配就没有这条捷径——不能拿空口令去比，那等于谁都能冒充它。
-    reserved = serverconf.atis_password()
-    if reserved and cid == ATIS_ACCOUNT and password == reserved:
-        return VERIFY_OK
-
     return verify(cid, password)
 
 
@@ -308,10 +311,6 @@ def main():
     except serverconf.MissingSecret as e:
         print(f"启动失败: {e}")
         return 1
-    if not serverconf.atis_password():
-        print("提示: 没有配通播保留账号的口令，服务端那队通播机将无法登录"
-              "（普通用户不受影响）")
-
     with Ice.initialize(init_data) as communicator:
         _communicator = communicator
 

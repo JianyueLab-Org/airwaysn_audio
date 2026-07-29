@@ -6,6 +6,13 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
+# build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
+# 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version
+
+version.freeze(os.path.dirname(os.path.abspath(SPEC)))
+
 # 收集PyQt6依赖
 qt_binaries, qt_datas, qt_hiddenimports = collect_all('PyQt6')
 
@@ -51,6 +58,7 @@ a = Analysis(
     datas=[
         ('radio.py', '.'),
         ('settings.py', '.'),
+        ('buildinfo.json', '.'),
     ] + qt_datas,
     hiddenimports=[
         'pkg_resources',

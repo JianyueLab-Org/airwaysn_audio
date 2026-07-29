@@ -25,7 +25,10 @@ import numpy as np
 import pyaudio
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
-from pymumble_py3.constants import (PYMUMBLE_CLBK_SOUNDRECEIVED,
+from pymumble_py3.constants import (PYMUMBLE_CLBK_CONNECTED,
+                                    PYMUMBLE_CLBK_DISCONNECTED,
+                                    PYMUMBLE_CLBK_PERMISSIONDENIED,
+                                    PYMUMBLE_CLBK_SOUNDRECEIVED,
                                     PYMUMBLE_CONN_STATE_CONNECTED)
 
 log = logging.getLogger("语音")
@@ -93,6 +96,13 @@ class Voice:
         self._pending = None               # 还没切过去的频率
         self._thread = None
 
+        # ---- 连接状态，照搬老飞行员端 client/radio.py 的做法 ----
+        # 由 pymumble 的 CONNECTED / DISCONNECTED 回调翻转，不去猜 mumble 内部
+        # 的线程状态。老客户端叫 _connection_established。
+        self._connection_established = threading.Event()
+        self._mumble_thread = None         # 我们自己拿着的 pymumble 主循环线程
+        self._reject_reason = ""           # 服务器拒绝时的原因，来自 run() 的异常
+
     # ---------- 状态 ----------
     def _status(self, state, message):
         log.info("%s: %s", state, message)
@@ -110,8 +120,21 @@ class Voice:
         3 失败。原来写 bool(...)，**失败的 3 也是真值**，于是连接被服务器拒绝
         之后我们照样当成连上了——实测日志里就是这样：Mumble 回了
         "Wrong certificate or password"，界面还报"语音已连接"。
+
+        光看状态码也不够：pymumble 的主循环退出时**不会把 connected 改回去**，
+        它就停在 2。循环已经没了、命令队列再没人抽，这里却照样报"已连接"，
+        界面一路绿灯——那正是"进不了频道又不报错"的表象。
+
+        所以和老飞行员端一样，先看那个由回调翻转的独立标记
+        （client/radio.py 的 `_connection_established`）：CONNECTED 时置上、
+        DISCONNECTED 时清掉，主循环线程退出时也清掉。**不要用
+        `mumble.is_alive()`**——pymumble 的循环现在跑在我们自己的线程里
+        （`mumble.run()`，不是 `start()`），它那个 Thread 从没启动过，
+        `is_alive()` 恒为 False。
         """
         if not self.mumble:
+            return False
+        if not self._connection_established.is_set():
             return False
         return self.mumble.connected == PYMUMBLE_CONN_STATE_CONNECTED
 
@@ -209,7 +232,81 @@ class Voice:
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED,
                                                self._on_sound)
-            self.mumble.start()
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_PERMISSIONDENIED,
+                                               self._on_permission_denied)
+            # 连接标记由这两条回调翻转，和老飞行员端一样
+            # （client/gui.py:398-414）。这一份原来两条都没接：DISCONNECTED 正是
+            # pymumble 主循环结束时走的那条，没人听的话连接已经彻底死了而界面
+            # 还是绿的，日志里一个字都没有。
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED,
+                                               self._on_connected)
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_DISCONNECTED,
+                                               self._on_disconnected)
+
+            # ---- pymumble 的主循环挂在"创建它的那个线程"上 ----
+            #
+            # pymumble 在 __init__ 里记下
+            #
+            #     self.parent_thread = threading.current_thread()
+            #
+            # （mumble.py:59，它自己的注释写的是 "main thread of the calling
+            # application"），而主循环的条件里带着它：
+            #
+            #     while ... and self.parent_thread.is_alive() and not self.exit:
+            #         ...
+            #         while self.commands.is_cmd():
+            #             self.treat_command(self.commands.pop_cmd())
+            #
+            # **抽命令队列就在这个循环里。** 而 gui.py 是用
+            # `threading.Thread(target=voice.start).start()` 调起来的：start()
+            # 把 _run / _channel_loop 拉起来就返回，那个临时线程当场结束，
+            # parent_thread.is_alive() 变 False，循环退出——连接还在、频道表还
+            # 在、myself 也还在，但从此没有任何一条命令发得出去。
+            #
+            # 表现出来是这样一段能刷一整晚的日志：
+            #
+            #     → 发出进频道命令 FREQ_124550：会话号=111 从频道0 到频道1
+            #     ← 进频道命令已入队 FREQ_124550
+            #     发出了进入 FREQ_124550 的请求，但 5 秒内没有生效，稍后重试
+            #     现场诊断 ... 我在频道=0 频道表共4个 表里有没有目标=True
+            #
+            # 命令进了队列却没上线，服务器压根没收到，自然既不照做也不回
+            # PermissionDenied——"收得到、发不动、不报错"就是这么来的。老飞行员
+            # 端（client/radio.py）不犯这个错纯属走运：它的 Mumble 对象建在 GUI
+            # 线程里，跑 mumble.run() 的那个线程又自己阻塞着不退。
+            #
+            # 老飞行员端的做法是让 Mumble 对象活在一个不会退的线程上；这里把
+            # 它挑明：主线程活得和进程一样久，正好就是 pymumble 那句注释的本意。
+            # 关闭不受影响——_release() 走 mumble.stop()，它自己会把 reconnect
+            # 置空、exit 置真、socket 关掉，不靠 parent_thread 死。
+            self.mumble.parent_thread = threading.main_thread()
+
+            # ---- 以下几处照搬 client/radio.py（老飞行员客户端）----
+            # 那一份在同一台服务器、同一个账号上是实测好用的。
+
+            # pymumble 的 init_connection 要到 start() 之后才设 connected，
+            # 中间这段空窗里读它会 AttributeError
+            self.mumble.connected = 0
+            # ping 从默认 10 秒改成 1 秒。老客户端这么设的；服务器对久不 ping
+            # 的连接可能有自己的处置，而我们建完频道要等的正是服务器的回话。
+            pymumble.mumble.PYMUMBLE_PING_DELAY = 1
+            pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
+
+            # **不用 mumble.start()，用我们自己的线程跑 mumble.run()。**
+            # 老飞行员端就是这么做的（client/gui.py 的 run_client）：Mumble 是
+            # threading.Thread 的子类，start() 会另起一条我们看不见也拿不到的
+            # 线程，run() 则让主循环跑在我们自己拿着的线程里——它活多久、什么
+            # 时候退、退出时抛了什么，都在自己手上。
+            #
+            # 还有一个实际好处：服务器拒绝登录时 run() 会把
+            # ConnectionRejectedError 抛出来。走 start() 的话这个异常死在
+            # pymumble 自己的线程里，我们只能靠状态码倒推"大概是密码不对"。
+            self._mumble_thread = threading.Thread(
+                target=self._mumble_loop, name="pymumble-loop", daemon=True)
+            self._mumble_thread.start()
+            # 老客户端在这里先睡 1 秒再 is_ready()。is_ready() 本身是等锁的，
+            # 按说不需要，但那一份就是这么写的、也确实能用，先对齐再说。
+            time.sleep(1)
             self.mumble.is_ready()
         except Exception as e:
             self.running = False
@@ -223,10 +320,14 @@ class Voice:
         # "语音已连接"，然后一切都莫名其妙地不工作。
         if not self.connected:
             self.running = False
+            reason = self._reject_reason or "用户名或密码不对？"
             self._release()
-            self._status('error',
-                         f"语音服务器拒绝了 {self.username}（用户名或密码不对？）")
+            self._status('error', f"语音服务器拒绝了 {self.username}（{reason}）")
             return
+
+        # 连上那一刻的现场快照。切频道紧接着就发生（日志里两条常在同一秒），
+        # 所以这一刻哪些东西还没就绪，直接决定了后面切不切得过去。
+        self._snapshot("刚连上")
 
         self._status('online', f"语音已连接（{self.username}）")
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -353,7 +454,16 @@ class Voice:
                 thread.join(timeout=2)
         self._thread = self._channel_thread = None
 
+        # _release() 里的 mumble.stop() 会把 reconnect 置空、exit 置真、socket
+        # 关掉，主循环这才会返回——所以收这条线程必须排在 _release() 之后。
         self._release()
+        loop_thread = self._mumble_thread
+        if (loop_thread and loop_thread.is_alive()
+                and loop_thread is not threading.current_thread()):
+            loop_thread.join(timeout=2)
+        self._mumble_thread = None
+        self._connection_established.clear()
+
         self._status('stopped', "语音已断开")
 
     # ---------- 频率 ----------
@@ -378,7 +488,9 @@ class Voice:
         那本来就是更可靠的判据——服务器拒绝建频道时也不会干等。
         """
         command = messages.CreateChannel(0, name, True)
+        log.info("→ 发出建频道命令 %s（父=0 临时=True）", name)
         self.mumble.execute_command(command, blocking=False)
+        log.info("← 建频道命令已入队 %s（execute_command 已返回，没有卡住）", name)
 
     def _wait_until_in(self, channel_id):
         """等服务器确认我们真的进了这个频道。"""
@@ -390,6 +502,54 @@ class Voice:
             time.sleep(0.1)
         return False
 
+    def _snapshot(self, when):
+        """把 Mumble 侧的关键状态打一行出来。
+
+        这几个值是判断"命令为什么不生效"的全部依据：会话号是 None 的话，
+        MoveCmd 带的就是个无效会话，服务器会默默忽略；频道表是空的话，说明
+        服务器的频道列表还没收到，这时候去 find_by_name 当然找不到。
+        """
+        try:
+            mumble = self.mumble
+            users = getattr(mumble, "users", None)
+            session = getattr(users, "myself_session", None) if users else None
+            myself = getattr(users, "myself", None) if users else None
+            channels = getattr(mumble, "channels", None)
+            count = len(channels) if channels is not None else -1
+            log.info("[%s] 连接状态=%r 会话号=%r myself=%s 我在频道=%r 频道表=%d个",
+                     when, getattr(mumble, "connected", None), session,
+                     "有" if myself else "None",
+                     myself["channel_id"] if myself else None, count)
+        except Exception as e:
+            log.warning("[%s] 取状态出错: %s", when, e)
+
+    def _diagnose(self, name, target_id=None):
+        """进不去/建不出来时，把现场状态原样打出来。
+
+        走到这里说明命令发了、服务器没照做、也没回 PermissionDenied。剩下的可能
+        性靠读代码分不出来，只能看运行时的真实状态：
+
+        - `myself_session` 是不是 None —— 是的话 MoveCmd 带的是个无效会话号，
+          服务器会**默默忽略**，既不生效也不报错
+        - 频道表里到底有没有这个名字 —— 有名字却进不去，和压根没建出来是两回事
+        - 我们此刻在哪个频道 —— 0 是根频道
+        """
+        try:
+            users = self.mumble.users
+            session = getattr(users, "myself_session", None)
+            myself = users.myself
+            here = myself["channel_id"] if myself else "（myself 是 None）"
+            table = self.mumble.channels
+            names = [c.get("name") for c in table.values()] if hasattr(table, "values") else []
+            log.warning(
+                "现场诊断 目标=%s(id=%s) 我的会话号=%r 我在频道=%r "
+                "频道表共%d个 表里有没有目标=%s",
+                name, target_id, session, here, len(names), name in names)
+            if len(names) <= 40:
+                log.warning("现场诊断 频道表: %s", sorted(n for n in names if n))
+        except Exception as e:
+            log.warning("现场诊断 取状态时出错: %s", e)
+
     def _wait_for_channel(self, name):
         """等服务器把新建的频道回报回来。
 
@@ -399,10 +559,23 @@ class Voice:
         看着像频道建不了，其实只是没等到。
         """
         deadline = time.time() + CHANNEL_TIMEOUT
+        started = time.time()
+        reported = 0
         while time.time() < deadline and self.running:
             channel = self._find_channel(name)
             if channel is not None:
+                log.info("频道 %s 在 %.1f 秒后出现了（id=%s）", name,
+                         time.time() - started, channel["channel_id"])
                 return channel
+            # 每秒报一次进度：频道表在不在长，能区分"服务器没回"和"回了但没这个"
+            waited = int(time.time() - started)
+            if waited > reported:
+                reported = waited
+                try:
+                    log.debug("等 %s 中…已等 %d 秒，频道表现有 %d 个",
+                              name, waited, len(self.mumble.channels))
+                except Exception:
+                    pass
             time.sleep(0.1)
         return self._find_channel(name)
 
@@ -445,21 +618,35 @@ class Voice:
                 if channel is None:
                     log.warning("建立频道 %s 后 %.0f 秒内没有出现，%.0f 秒后重试",
                                 name, CHANNEL_TIMEOUT, CHANNEL_RETRY_INTERVAL)
+                    self._diagnose(name)
                     return
 
                 myself = self.mumble.users.myself
-                if myself and myself["channel_id"] != channel["channel_id"]:
+                if myself is None:
+                    # 这一支以前是静默走过去的，然后**当成切换成功**记账——人还在
+                    # 根频道，界面却显示已经在频率上了
+                    log.warning("myself 还是 None，这一轮先不切 %s", name)
+                    return
+                if myself["channel_id"] != channel["channel_id"]:
+                    session = self.mumble.users.myself_session
+                    log.info("→ 发出进频道命令 %s：会话号=%r 从频道%r 到频道%r",
+                             name, session, myself["channel_id"],
+                             channel["channel_id"])
+                    if session is None:
+                        log.warning("会话号是 None，这条 MoveCmd 服务器会直接忽略"
+                                    "——既不会生效，也不会回任何错误")
                     # move_in() 也走 execute_command(blocking=True)，和建频道
                     # 一样会无限期卡住，同样自己发命令
                     self.mumble.execute_command(
-                        messages.MoveCmd(self.mumble.users.myself_session,
-                                         channel["channel_id"]),
+                        messages.MoveCmd(session, channel["channel_id"]),
                         blocking=False)
+                    log.info("← 进频道命令已入队 %s", name)
                     # 命令是异步的，确认真的进去了再记账——否则收敛循环会以为
                     # 成功而不再重试，人却还留在原地
                     if not self._wait_until_in(channel["channel_id"]):
                         log.warning("发出了进入 %s 的请求，但 %.0f 秒内没有生效，"
                                     "稍后重试", name, CHANNEL_TIMEOUT)
+                        self._diagnose(name, channel["channel_id"])
                         return
 
                 self.frequency = frequency
@@ -499,6 +686,80 @@ class Voice:
         if reason != self._skip_reason:
             self._skip_reason = reason
             log.debug("暂时不发送: %s", reason)
+
+    def _on_permission_denied(self, event):
+        """服务器拒绝了某个动作，把原因说出来。
+
+        不接这条回报的代价，实测日志长这样：
+
+            频道 FREQ_127100 不存在，建一个临时的
+            建立频道 FREQ_127100 后 5 秒内没有出现，1 秒后重试
+            （无限重复，没有任何错误）
+
+        建频道要根频道的 MakeTempChannel（0x400）、进频道要 Enter（0x4），
+        服务器缺哪一条都只是**默默不照做**——命令发出去了、没有报错、频道就是
+        不出现。看上去像网络慢或者服务器卡，实际上再等一万年也不会成功，而
+        真正的原因服务器早就用 PermissionDenied 告诉我们了。管制端和 ATIS
+        一直接着这条，四个飞行员端漏了。
+        """
+        try:
+            kind = self.mumble.denial_type(event.type)
+        except Exception:
+            kind = str(getattr(event, "type", "?"))
+        reasons = {
+            "Permission": "没有权限（建频率频道要根频道的 MakeTempChannel，"
+                          "进频道要 Enter）",
+            "ChannelName": "频道名不合服务器的规矩",
+            "NestingLimit": "频道层级超过了服务器上限",
+            "ChannelCountLimit": "服务器上的频道数已达上限",
+            "UserListenerLimit": "服务器限制了每个用户能监听的频道数",
+        }
+        reason = reasons.get(kind, f"服务器拒绝了操作: {kind}")
+        if getattr(event, "reason", ""):
+            reason += f"（{event.reason}）"
+        # 走已有的"卡住原因"这条路，界面和日志都已经在看它了
+        self._note_stuck(reason)
+        self._status("denied", reason)
+
+    def _mumble_loop(self):
+        """pymumble 的主循环，跑在我们自己的线程里。
+
+        照搬老飞行员端 client/gui.py 的 run_client()。这条线程活多久，连接就
+        活多久：`Mumble.run()` 里是 `while True` 带自动重连，只有 `stop()`
+        （它会把 reconnect 置空）才会让它返回。所以这条线程退出 == 会话结束，
+        没有第二种解释，也就不会再出现"连接其实早死了、界面还绿着"。
+        """
+        try:
+            self.mumble.run()
+        except pymumble.errors.ConnectionRejectedError as e:
+            # 走 start() 的话这个异常死在 pymumble 自己的线程里，外面只能靠状态
+            # 码倒推。自己跑就能把服务器的原话带给用户。
+            self._reject_reason = str(e) or "服务器拒绝了连接"
+            log.warning("服务器拒绝了连接: %s", e)
+        except Exception as e:
+            log.warning("Mumble 主循环异常退出: %s", e)
+        finally:
+            self._connection_established.clear()
+            log.info("Mumble 主循环已结束")
+
+    def _on_connected(self):
+        """pymumble 收到 ServerSync，连接真的建立了。"""
+        self._connection_established.set()
+
+    def _on_disconnected(self):
+        """pymumble 彻底放弃了这条连接。
+
+        注意它**不是**每次掉线都发：客户端是 reconnect=True 建的，普通掉线
+        pymumble 自己会连回来，只有它决定不再重连时才走到这里——也就是
+        `stop()` 之后，或者 `parent_thread` 死了。后一种是纯粹的自伤，而且从
+        外面完全看不出来：连接状态码还停在"已连接"，频道表还在，就是再也发不
+        出一条命令。所以这条一定要落到日志里。
+        """
+        self._connection_established.clear()
+        if not self.running:
+            return                      # 我们自己 stop() 的，正常收尾
+        log.warning("pymumble 不再重连了")
+        self._status('error', "语音连接已断开（不再自动重连），请重新连接")
 
     def _on_sound(self, user, chunk):
         """pymumble 的库线程调用。"""

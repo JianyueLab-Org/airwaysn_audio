@@ -26,14 +26,15 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
                             InfoBar, InfoBarPosition, LineEdit, PasswordLineEdit,
                             PrimaryPushButton, PushButton, ScrollArea, Slider,
                             StrongBodyLabel, SubtitleLabel, Theme,
-                            TogglePushButton, TransparentToolButton,
-                            setTheme, setThemeColor)
+                            PillPushButton, TogglePushButton,
+                            TransparentToolButton, setTheme, setThemeColor)
 
 import applog
 import datafeed
 import i18n
 from i18n import t
 import radiostack
+import version
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
 from voice import VoiceClient
@@ -378,6 +379,21 @@ class RadioRow(CardWidget):
         self.xc_button.set_state(radio.xc)
         self.mute_button.set_state(radio.muted, muted=radio.muted)
 
+        # 没在数据源上的管制席位时只许收：TX / XC 直接禁用，别让人按了没反应
+        # 又不知道为什么
+        stack = self.window.stack
+        may_transmit = stack.transmit_allowed
+        for button in (self.tx_button, self.xc_button):
+            button.setEnabled(may_transmit)
+            button.setToolTip(t("radio.tx_tip") if may_transmit
+                              else t("radio.tx_needs_duty"))
+
+        # 本人正在管的席位频率不许删——手滑删掉等于把自己从工作频率上摘下去
+        locked = stack.is_locked(radio.frequency_khz)
+        self.remove_button.setEnabled(not locked)
+        self.remove_button.setToolTip(t("radio.remove_locked") if locked
+                                      else t("radio.remove_tip"))
+
         self.volume.blockSignals(True)
         self.volume.setValue(radio.volume)
         self.volume.blockSignals(False)
@@ -416,6 +432,8 @@ class ControllerWindow(QMainWindow):
         # "最后通话: 1005" 显示成 "最后通话: CES2345"
         self.roster = {}
         self._user_removed = set()    # 用户自己删掉的，别再自动加回去跟他较劲
+        self.online = []              # 数据源上在线的席位 [(呼号, 千赫, facility)]
+        self._online_buttons = []
 
         self.signals = VoiceSignals()
         self.signals.state.connect(self.on_voice_state)
@@ -493,6 +511,15 @@ class ControllerWindow(QMainWindow):
         row.addWidget(card)
         row.addStretch()
         outer.addLayout(row)
+
+        # 版本号放登录页：用户报问题时第一句就该是"你用的哪个版本"，而这时候
+        # 他多半还没连上。不进 i18n——"v1.1.0 (build 71.667d9b4)"两种语言下
+        # 是同一串，翻了反而对不上日志里的那一行。
+        self.version_label = CaptionLabel(version.full())
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.version_label.setStyleSheet(f"color: {IDLE_COLOR};")
+        outer.addSpacing(8)
+        outer.addWidget(self.version_label)
         outer.addStretch()
         return page
 
@@ -543,22 +570,32 @@ class ControllerWindow(QMainWindow):
         # ---- 添加频率 ----
         add_row = QHBoxLayout()
         add_row.setSpacing(8)
+        # 输入框按比例伸缩，不写死宽度。写死的话（180 + 340 + 按钮 + 边距）正好
+        # 顶到窗口最小宽度，"添加频率"就被挤到窗口边上，看着像被裁掉了。
+        # 上限还是 INPUT_WIDTH——屏幕再宽也没必要把输入框拉到一米长。
         self.freq_input = LineEdit()
         self.freq_input.setPlaceholderText(t("main.freq_hint"))
-        self.freq_input.setFixedWidth(180)
+        self.freq_input.setMinimumWidth(120)
+        self.freq_input.setMaximumWidth(200)
         self.freq_input.returnPressed.connect(self.add_radio)
         self.callsign_input = LineEdit()
         self.callsign_input.setPlaceholderText(t("main.callsign_hint"))
-        self.callsign_input.setFixedWidth(INPUT_WIDTH)
+        self.callsign_input.setMinimumWidth(160)
+        self.callsign_input.setMaximumWidth(INPUT_WIDTH)
         self.callsign_input.returnPressed.connect(self.add_radio)
         self.add_button = add_button = PrimaryPushButton()
         add_button.setText(t("main.add"))
         add_button.setIcon(FluentIcon.ADD)
+        # 图标加中文标签，给够宽度，别让 Qt 把文字压成省略号
+        add_button.setMinimumWidth(112)
         add_button.clicked.connect(self.add_radio)
-        add_row.addWidget(self.freq_input)
-        add_row.addWidget(self.callsign_input)
-        add_row.addWidget(add_button)
-        add_row.addStretch()
+        # 两个输入框分掉多余的宽度（呼号那个占大头），按钮紧跟其后、保持自然
+        # 宽度，多出来的空间留在最右边。窗口窄下去时先压缩输入框，按钮不会被
+        # 挤出可视区。
+        add_row.addWidget(self.freq_input, 1)
+        add_row.addWidget(self.callsign_input, 2)
+        add_row.addWidget(add_button, 0)
+        add_row.addStretch(1)
         layout.addLayout(add_row)
 
         # ---- 电台栈 ----
@@ -577,6 +614,17 @@ class ControllerWindow(QMainWindow):
         self.empty_hint.setStyleSheet(f"color: {IDLE_COLOR};")
         layout.addWidget(self.empty_hint)
 
+        # ---- 在线频率：数据源上此刻有人的席位，点一下加进电台栈 ----
+        online_bar = QHBoxLayout()
+        online_bar.setSpacing(6)
+        self.online_title = CaptionLabel(t("online.title"))
+        self.online_title.setStyleSheet(f"color: {IDLE_COLOR};")
+        online_bar.addWidget(self.online_title)
+        self.online_box = QHBoxLayout()
+        self.online_box.setSpacing(4)
+        online_bar.addLayout(self.online_box, 1)
+        layout.addLayout(online_bar)
+
         # ---- 底栏：PTT + 状态 ----
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
@@ -589,6 +637,10 @@ class ControllerWindow(QMainWindow):
         self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
         self.status_label.setWordWrap(True)
         bottom.addWidget(self.status_label, 1)
+        # 值守状态：在不在管制席位上，决定了能不能发信，必须一眼看得见
+        self.duty_label = CaptionLabel(t("duty.observer"))
+        self.duty_label.setStyleSheet(f"color: {IDLE_COLOR};")
+        bottom.addWidget(self.duty_label)
         layout.addLayout(bottom)
         return page
 
@@ -753,9 +805,100 @@ class ControllerWindow(QMainWindow):
         if not data:
             return
         self.roster = datafeed.roster(data)
+        self.online = datafeed.online_positions(data)
+        self.apply_duty_state(data)
         # 之前记下的是 CID，重画一次就变成呼号了——晚到的对照表也能补上
         self.rebuild_rows()
+        self.refresh_online_list()
         self.adopt_controlled_frequency(data)
+
+    def refresh_online_list(self):
+        """把数据源上的在线席位画成一排按钮，点一下就加进电台栈。
+
+        已经在栈里的置灰而不是藏起来——藏起来的话，一个频率是"没人上"还是
+        "我已经加过了"就分不出来了。
+        """
+        # 整个清空：除了按钮，末尾还有一个 addStretch 加进来的空白项，只删控件
+        # 的话它每刷新一次就多一个，席位一多整排就被挤到左边去了
+        while self.online_box.count():
+            item = self.online_box.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._online_buttons = []
+
+        if not self.online:
+            label = CaptionLabel(t("online.empty"))
+            label.setStyleSheet(f"color: {IDLE_COLOR};")
+            self.online_box.addWidget(label)
+            self._online_buttons.append(label)
+            return
+
+        for callsign, khz, _facility in self.online:
+            frequency = radiostack.format_frequency(khz)
+            # 只显示呼号：频率在按钮上写不下（实测被压成 "ZBAA ...8.500"），
+            # 而且管制员认的本来就是呼号。频率放进悬停提示，要看还是看得到。
+            button = PillPushButton(callsign, self)
+            button.setCheckable(False)
+            button.setFixedHeight(24)
+            # 按文字量给宽度，别让 Qt 去压缩它
+            width = button.fontMetrics().horizontalAdvance(callsign) + 24
+            button.setFixedWidth(width)
+            already = self.stack.get(khz) is not None
+            button.setEnabled(not already)
+            button.setToolTip(
+                t("online.already", frequency=frequency) if already
+                else t("online.add_tip", callsign=callsign, frequency=frequency))
+            if not already:
+                button.clicked.connect(
+                    lambda _checked=False, k=khz, c=callsign:
+                    self.add_online_frequency(k, c))
+            self.online_box.addWidget(button)
+            self._online_buttons.append(button)
+
+        # 席位少的时候不要平摊到整行，靠左排
+        self.online_box.addStretch(1)
+
+    def add_online_frequency(self, khz, callsign):
+        """从在线一览里加一个频率。"""
+        if self.stack.get(khz):
+            return
+        try:
+            self.stack.add(khz, callsign)
+        except ValueError as e:
+            self.warn(t("main.add_failed"), str(e))
+            return
+        # 手动加回来的，就不算"用户删掉的"了
+        self._user_removed.discard(khz)
+        self.refresh_online_list()
+
+    def apply_duty_state(self, data):
+        """按数据源判定本人在不在管制席位，据此开闸或落闸。
+
+        语音服务器没有花名册检查——任何账号都能进任何 FREQ_* 频道，也都能对着
+        它说话。这一层是客户端自觉守的，和 can-fsd 上「不在花名册里就不能上
+        席位」对应。判定用的是 datafeed.controller_for，和自动加频率同一条：
+        要在 controllers[] 里，且席位类型高于观察员。
+        """
+        entry = datafeed.controller_for(self.cid, data)
+        khz = datafeed.frequency_khz(entry) if entry else None
+
+        dropped = self.stack.set_transmit_allowed(entry is not None)
+        self.stack.set_locked(khz)
+
+        if entry is None:
+            self.duty_label.setStyleSheet(f"color: {IDLE_COLOR};")
+            self.duty_label.setText(t("duty.observer"))
+            if dropped:
+                # 值守掉了会把已经开着的 TX 落下来，这事必须说出来，否则管制员
+                # 会对着一个自以为开着的频率讲话
+                log.info("数据源上已经不在管制席位，TX / XC 全部落下")
+                self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
+                self.status_label.setText(t("duty.tx_dropped"))
+        else:
+            self.duty_label.setStyleSheet(f"color: {ON_COLOR};")
+            self.duty_label.setText(t("duty.on", callsign=str(
+                entry.get("callsign", "")).strip()))
 
     def adopt_controlled_frequency(self, data):
         """本人在网上上了席位的话，把那个频率自动加进电台栈。"""
@@ -847,19 +990,10 @@ class ControllerWindow(QMainWindow):
         self.update_hint()
 
     def update_hint(self):
-        """多频率接收要服务器支持频道监听（Mumble 1.4+）。
-
-        不能靠"一段时间没收到声音"来判定不支持——频率上安静是常态，那样只会误报。
-        这里只把前提讲清楚；真收到过非主频率的话音之后就不再提。
-        """
         if not self.voice:
             return
-        if len(self.stack.rx_frequencies()) > 1 and not self.voice.listeners_confirmed:
-            self.status_label.setStyleSheet(f"color: {ACTIVE_COLOR};")
-            self.status_label.setText(t("status.listeners"))
-        else:
-            self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
-            self.status_label.setText(t("status.ready"))
+        self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
+        self.status_label.setText(t("status.ready"))
 
     def disconnect_voice(self):
         self.datafeed_timer.stop()
@@ -974,7 +1108,8 @@ if __name__ == '__main__':
     # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
     debug = '--debug' in sys.argv or Settings().debug
     applog.setup(debug=debug)
-    log.info("管制语音客户端启动")
+    # 版本号必须进日志：用户发上来的日志是唯一能确认他跑的是哪个 build 的东西
+    log.info("管制语音客户端启动 %s", version.full())
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))

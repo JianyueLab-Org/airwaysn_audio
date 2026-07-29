@@ -81,6 +81,24 @@ class RejectAwareMumble(pymumble.Mumble):
                 log.warning("解析 Reject 消息失败: %s", e)
         return super().dispatch_control_message(type, message)
 
+    def run(self):
+        """接住"服务器拒绝"，别让它变成一条 CRITICAL。
+
+        pymumble 的 run() 只接 socket.error，ConnectionRejectedError 会一路穿出
+        连接线程，被 applog 的 threading.excepthook 记成"未捕获异常"加一段
+        traceback——一次普通的密码错误看上去就像程序崩了，排查时很容易被带偏。
+
+        在这里接是安全的：pymumble 抛之前已经把 connected 置成 FAILED、也放掉了
+        ready_lock（mumble.py 的 dispatch_control_message），状态该收拾的都收拾
+        完了，异常剩下的唯一作用就是终止线程——而 run() 返回同样终止线程。
+        拒绝的原因我们在 dispatch_control_message 里已经记下来了，rejection()
+        照常能拿到。
+        """
+        try:
+            super().run()
+        except pymumble.errors.ConnectionRejectedError as e:
+            log.info("服务器拒绝了连接，连接线程正常退出: %s", e)
+
     def rejection(self):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
         if not self.reject_type and not self.reject_reason:
@@ -468,13 +486,27 @@ class VoiceClient:
         return self._find_channel(name)
 
     def _resolve_channel(self, khz):
-        """拿到频率对应的频道 id，没有就建一个临时频道。"""
-        if khz in self._channel_ids:
-            return self._channel_ids[khz]
+        """拿到频率对应的频道 id，没有就建一个临时频道。
 
+        **每次都拿服务器的频道表核对一遍，绝不能直接吃缓存。** 频率频道都是
+        temporary 的，最后一个人离开服务器当场就把它销毁——管制员把主频率从 A
+        换到 B、A 上又没别人就足够了，根本用不着断线重连（重连时清缓存挡不住
+        这条路径）。旧号留在表里的后果是两头都不报错：
+
+        - `_join(旧号)` 的 MoveCmd 指向一个不存在的频道，服务器既不照做也不
+          抱怨，日志里只剩一行接一行的"5 秒内没有生效"；
+        - VoiceTarget 里编的还是那个旧号，话音被服务器直接丢掉。
+
+        监听却落在别的活着的频道上，于是耳朵是好的——合起来正好是用户报的
+        "收得到、发不动、不报错"。
+
+        查一次频道表只是本地字典查找，不走网络，没有省下来的必要。
+        """
         name = radiostack.channel_name(khz)
         channel = self._find_channel(name)
+
         if channel is None:
+            self._forget_channel(khz, name)
             try:
                 log.info("频道 %s 不存在，建一个临时的", name)
                 self._create_channel(name)
@@ -488,11 +520,27 @@ class VoiceClient:
             return None
 
         channel_id = channel["channel_id"]
+        previous = self._channel_ids.get(khz)
+        if previous is not None and previous != channel_id:
+            # 同一个频率换了新号：反查表里的旧号要拆掉，否则收到的音频会被
+            # 认成另一个频率
+            self._channel_to_khz.pop(previous, None)
+            log.info("频道 %s 换了号：%s → %s", name, previous, channel_id)
         log.debug("频率 %s 对应频道 %s (id %s)",
                   radiostack.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
         return channel_id
+
+    def _forget_channel(self, khz, name):
+        """频道已经不在服务器上了，把它的号从两张表里拆掉。"""
+        stale = self._channel_ids.pop(khz, None)
+        if stale is None:
+            return
+        self._channel_to_khz.pop(stale, None)
+        self._listening.discard(stale)
+        log.info("频道 %s 已经不在了（临时频道一空就被销毁），旧号 %s 作废",
+                 name, stale)
 
     def sync(self, stack):
         """把电台栈的状态推到服务器：进主频道、监听其余 RX、设好 TX 目标。

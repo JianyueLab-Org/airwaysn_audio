@@ -9,6 +9,7 @@
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -17,6 +18,7 @@ import unittest
 import metar as metar_module
 import profile as profile_module
 import template as template_module
+import voicefix
 import weather
 from metar import Metar
 from profile import Preset, Profile, Station
@@ -38,7 +40,7 @@ class MetarTest(unittest.TestCase):
         # 文字通播照抄电码，语音要念得出来——这就是 :VOX 的意义
         self.assertEqual(self.metar.wind.text, "09004MPS")
         self.assertEqual(self.metar.wind.voice,
-                         "wind zero niner zero at four meters per second")
+                         "wind zero niner zero degrees four meters per second")
 
     def test_visibility_and_clouds(self):
         self.assertEqual(self.metar.visibility.voice,
@@ -48,14 +50,14 @@ class MetarTest(unittest.TestCase):
 
     def test_temperature_and_pressure(self):
         self.assertEqual(self.metar.temperature.voice, "temperature two five")
-        self.assertEqual(self.metar.dew_point.voice, "dew point one eight")
+        self.assertEqual(self.metar.dew_point.voice, "dewpoint one eight")
         self.assertEqual(self.metar.pressure.voice, "QNH one zero one three hectopascals")
 
     def test_calm_and_variable_wind(self):
         self.assertEqual(Metar("ZBAA 251300Z 00000MPS 9999 25/18 Q1013").wind.voice,
                          "wind calm")
         self.assertEqual(Metar("ZBAA 251300Z VRB02MPS 9999 25/18 Q1013").wind.voice,
-                         "wind variable at two meters per second")
+                         "wind variable two meters per second")
 
     def test_gust_and_variation(self):
         wind = Metar("KLAX 251300Z 26015G25KT 220V300 10SM 25/18 A2992").wind
@@ -99,6 +101,166 @@ class MetarTest(unittest.TestCase):
         self.assertFalse(Metar("").is_valid())
 
 
+class PresetClosingAndChineseExtraTest(unittest.TestCase):
+    """收尾语和中文附加文本都跟着预设走。
+
+    同一个机场不同构型要交代的事不一样：「并确认能否执行 RNAV 程序」只该出现在
+    RNAV 离场可用的那份稿子里。中文那段更是没法从英文模板生成——chinese.py 是
+    从 METAR 独立渲染的，语序和英文完全不同。
+    """
+
+    def test_preset_closing_replaces_the_default(self):
+        pr = Preset(closing="advise you have information [ATIS_LETTER] and RNAV")
+        ctx = template_module.build_context(
+            Metar("ZBAA 291000Z 30007MPS CAVOK 24/M08 Q1003"),
+            "ZBAA", "J", closing=pr.closing or None)
+        _, voice = template_module.render("[CLOSING]", ctx)
+        # RNAV 在语音稿里会被展开成 R NAV，否则 TTS 当成单词念
+        self.assertIn("information Juliett and R NAV", voice)
+
+    def test_empty_closing_falls_back_to_the_builtin(self):
+        ctx = template_module.build_context(
+            Metar("ZBAA 291000Z 30007MPS CAVOK 24/M08 Q1003"),
+            "ZBAA", "J", closing=Preset().closing or None)
+        _, voice = template_module.render("[CLOSING]", ctx)
+        self.assertIn("advise on initial contact", voice)
+
+    def test_both_new_fields_survive_a_round_trip(self):
+        pr = Preset(closing="收尾", chinese_extra="中文附言")
+        back = Preset.from_dict(pr.to_dict())
+        self.assertEqual(back.closing, "收尾")
+        self.assertEqual(back.chinese_extra, "中文附言")
+
+    def test_old_presets_without_them_still_load(self):
+        pr = Preset.from_dict({"name": "默认"})
+        self.assertEqual(pr.closing, "")
+        self.assertEqual(pr.chinese_extra, "")
+
+
+class SpokenFacilityAndClosingTest(unittest.TestCase):
+
+    METAR = "ZSPD 291200Z 14005MPS CAVOK 30/26 Q1010"
+
+    def context(self, **kw):
+        return template_module.build_context(Metar(self.METAR), "ZSPD", "F", **kw)
+
+    def test_closing_letter_is_spoken_too(self):
+        """收尾语里的字母也要念通话字母。
+
+        原来收尾语只渲染了文字那一遍，于是同一句通播开头念
+        "INFORMATION Foxtrot"、结尾念 "information F"——听上去像两份稿子。
+        """
+        _, voice = template_module.render("[CLOSING]", self.context())
+        self.assertIn("information Foxtrot", voice)
+        self.assertNotIn("information F ", voice + " ")
+
+    def test_facility_is_spoken_as_the_airport_name(self):
+        """语音念机场全名，文字稿留 ICAO。
+
+        念 "Z S P D" 听着像在拼写，真实通播念的是机场名。
+        """
+        ctx = self.context(facility_voice="Shanghai Pudong International Airport")
+        text, voice = template_module.render("[FACILITY]", ctx)
+        self.assertEqual(text.strip(), "ZSPD")
+        self.assertEqual(voice.strip(), "Shanghai Pudong International Airport")
+
+    def test_without_a_name_it_falls_back_to_the_code(self):
+        text, voice = template_module.render("[FACILITY]", self.context())
+        self.assertEqual(text.strip(), "ZSPD")
+        self.assertEqual(voice.strip(), "ZSPD")
+
+
+class PresetChineseRunwayTest(unittest.TestCase):
+    """中文稿的跑道跟着预设走。
+
+    切到"北向"时英文稿的 ARR RWY 会变，中文稿要是还念着南向的跑道，同一份
+    通播里两种语言互相矛盾——而大陆机场是双语播的，两边都有人听。
+    """
+
+    def test_preset_carries_its_own_chinese_runway(self):
+        pr = Preset(name="北向", chinese_runway="三六右")
+        self.assertEqual(Preset.from_dict(pr.to_dict()).chinese_runway, "三六右")
+
+    def test_old_profiles_without_the_field_still_load(self):
+        """老配置里没有这一项，读出来该是空串而不是炸掉。"""
+        pr = Preset.from_dict({"name": "默认"})
+        self.assertEqual(pr.chinese_runway, "")
+
+    def test_empty_preset_runway_falls_back_to_the_station(self):
+        """预设没填就用席位上的那个，不能变成不念跑道。"""
+        station = Station("ZSPD", frequency="127.850", chinese_runway="三五左",
+                          presets=[Preset(name="默认")])
+        pr = station.presets[0]
+        self.assertEqual(pr.chinese_runway or station.chinese_runway, "三五左")
+
+
+class AtisWordingTest(unittest.TestCase):
+    """按本网通播稿子定下来的几处念法。"""
+
+    def test_information_letter_is_spoken_as_a_callsign_word(self):
+        """通播念的是 INFORMATION ALPHA，不是 INFORMATION A。
+
+        直接把孤零零一个 "A" 交给 SAPI，念出来是"诶"——听着不像通播，而且和
+        飞行员回报的 "information alpha" 对不上。文字稿仍然留字母本身。
+        """
+        m = Metar("ZSPD 291130Z 14005MPS CAVOK 30/25 Q1010")
+        ctx = template_module.build_context(m, facility="ZSPD", letter="A")
+        text, voice = template_module.render("[FACILITY] INFORMATION [ATIS_LETTER]", ctx)
+        self.assertEqual(text.strip(), "ZSPD INFORMATION A")
+        self.assertEqual(voice.strip(), "ZSPD INFORMATION Alpha")
+
+    def test_every_letter_has_a_word(self):
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            self.assertNotEqual(metar_module.spell_letter(letter), letter, letter)
+
+    def test_runways_in_a_list_are_all_expanded(self):
+        """ARR RWY 16L, 17R —— 列表里第二个之后也要展开。
+
+        原来只有紧跟 RWY 的那一个会展开，17R 原样留给 TTS，念成"十七阿"。
+        真实通播的进离场跑道全是这种列表写法，所以这条几乎必然被撞上。
+        """
+        out = voicefix.expand_free_text("ARR RWY 16L, 17R, DEP RWY 16R, 17L")
+        self.assertEqual(
+            out,
+            "arrival runway one six left, one seven right, "
+            "departure runway one six right, one seven left")
+
+    def test_runway_sides_are_words_not_letters(self):
+        self.assertIn("left", voicefix.expand_free_text("RWY 16L"))
+        self.assertIn("right", voicefix.expand_free_text("RWY 16R"))
+        self.assertIn("center", voicefix.expand_free_text("RWY 16C"))
+
+    def test_atc_and_rnav_are_spelled_out(self):
+        """不展开的话 TTS 会把它们当成单词念（"atk"、"arnav"）。"""
+        self.assertEqual(
+            voicefix.expand_free_text("advise ATC when requesting clearance"),
+            "advise A T C when requesting clearance")
+        self.assertEqual(voicefix.expand_free_text("RNAV departures available"),
+                         "R NAV departures available")
+
+    def test_a_runway_written_as_36Left_is_not_expanded(self):
+        """跑道必须写成 36L，不能写 36Left。
+
+        展开靠的是"两位数字紧跟 L/R/C 再收尾"这个形状。写成 36Left 的话，L 后面
+        还是字母、收不了尾，连"两位整数"那条兜底规则也匹配不上（6 后面是 L，没有
+        词边界），于是整串原样交给 TTS。真实通播里写错这一处，念出来就不是
+        "three six left"。这条钉着这个坑，免得下次有人照着英文单词去写。
+        """
+        self.assertEqual(voicefix.expand_free_text("RWY 36Left"),
+                         "runway 36Left")
+        self.assertEqual(voicefix.expand_free_text("RWY 36L"),
+                         "runway three six left")
+
+    def test_wind_says_degrees(self):
+        m = Metar("ZSPD 291130Z 14005MPS CAVOK 30/25 Q1010")
+        self.assertEqual(m.wind.voice,
+                         "wind one four zero degrees five meters per second")
+
+    def test_qnh_says_the_unit(self):
+        m = Metar("ZSPD 291130Z 14005MPS CAVOK 30/25 Q1010")
+        self.assertEqual(m.pressure.voice, "QNH one zero one zero hectopascals")
+
+
 class TemplateTest(unittest.TestCase):
 
     def setUp(self):
@@ -113,11 +275,11 @@ class TemplateTest(unittest.TestCase):
     def test_text_uses_raw_and_voice_uses_spoken(self):
         text, voice = self.render("[WIND]")
         self.assertEqual(text, "09004MPS")
-        self.assertEqual(voice, "wind zero niner zero at four meters per second")
+        self.assertEqual(voice, "wind zero niner zero degrees four meters per second")
 
     def test_vox_suffix_forces_spoken_form_in_text(self):
         text, _ = self.render("[WIND:VOX]")
-        self.assertEqual(text, "wind zero niner zero at four meters per second")
+        self.assertEqual(text, "wind zero niner zero degrees four meters per second")
 
     def test_aliases_point_at_the_same_value(self):
         for name in ("[ATIS_LETTER]", "[ATIS_CODE]", "[LETTER]", "[ID]"):
@@ -755,6 +917,119 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.fsd_port, 16809)
 
 
+class LanguageSegmentTest(unittest.TestCase):
+    """中英双语稿要按语言分段合成。
+
+    原来是整篇挑一个音色，判据是"文中有没有汉字"——双语稿里那一大段英文于是
+    也被中文音色念了，听着像外国人念中文。分段之后各用各的音色、各用各的语速，
+    切换处还能插一段静音。
+    """
+
+    def setUp(self):
+        import sys
+        from unittest import mock
+        try:
+            import opuslib  # noqa: F401
+        except Exception:
+            for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                         "opuslib.api.encoder", "opuslib.api.info",
+                         "opuslib.exceptions"):
+                sys.modules.setdefault(name, mock.MagicMock())
+        global broadcast
+        import broadcast
+
+    ENGLISH = ("Beijing Capital International Airport information Juliett, "
+               "arrival runway zero one. R NAV departures available.")
+    CHINESE = ("北京首都国际机场情报通播 朱丽叶 跑道 洞幺 进港 "
+               "本场 RNAV 离场可用 应答机置于 S 模式")
+
+    def test_bilingual_splits_into_english_then_chinese(self):
+        segments = broadcast._segments(f"{self.ENGLISH} {self.CHINESE}")
+        self.assertEqual([chinese for chinese, _ in segments], [False, True],
+                         f"应当正好切成英文、中文两段：{segments}")
+
+    def test_short_english_inside_chinese_does_not_split_it(self):
+        """`本场 RNAV 离场可用` 不该在 RNAV 处换两次音色。"""
+        segments = broadcast._segments(self.CHINESE)
+        self.assertEqual(len(segments), 1, f"中文被切碎了：{segments}")
+        self.assertTrue(segments[0][0])
+        for word in ("RNAV", "S"):
+            self.assertIn(word, segments[0][1])
+
+    def test_single_language_is_one_segment(self):
+        self.assertEqual(len(broadcast._segments(self.ENGLISH)), 1)
+        self.assertEqual(len(broadcast._segments("")), 0)
+
+    def test_chinese_is_slower_than_english(self):
+        self.assertLess(broadcast.RATE_CHINESE, broadcast.RATE_ENGLISH,
+                        "中文语速要低一档，通播是要人一遍听懂的")
+
+    def test_there_is_a_gap_at_the_language_switch(self):
+        self.assertGreater(broadcast.LANGUAGE_GAP, 0,
+                           "不留间隔的话两种语言会连在一起，像同一句说串了")
+
+    # ---------- 一次 runAndWait ----------
+    def _fake_engine(self):
+        """记下每一次调用，并且真的写出 wav，好让 _read_wav 读得回来。"""
+        import wave as wave_module
+
+        class FakeEngine:
+            def __init__(self):
+                self.calls = []          # ('rate'|'voice'|'save'|'run', 值)
+
+            def setProperty(self, name, value):
+                self.calls.append((name, value))
+
+            def getProperty(self, name):
+                return []                # 没有音色表，_pick_voice 返回 None
+
+            def save_to_file(self, text, path):
+                self.calls.append(("save", text))
+                with wave_module.open(path, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(22050)
+                    w.writeframes(b"\x00\x01" * 2205)     # 0.1 秒
+
+            def runAndWait(self):
+                self.calls.append(("run", None))
+
+        return FakeEngine()
+
+    def test_the_whole_script_uses_exactly_one_run_and_wait(self):
+        """同一个引擎连着进第二次 runAndWait()，pyttsx3 的 SAPI 驱动会永久卡住。
+
+        实测：双语稿（两段）当场挂死，日志停在合成之前——"合成完成"和
+        "语音合成失败"两条都不出现，通播一声不响。所以无论几段，整篇只能进
+        一次；每段的音色和语速靠 setProperty 排进同一个队列来区分。
+        """
+        synth = broadcast.Synthesizer()
+        engine = self._fake_engine()
+        synth._ready = lambda: engine
+
+        pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
+        self.assertIsNotNone(pcm, "双语稿没合成出来")
+
+        runs = [c for c in engine.calls if c[0] == "run"]
+        saves = [c for c in engine.calls if c[0] == "save"]
+        self.assertEqual(len(runs), 1,
+                         f"runAndWait 调了 {len(runs)} 次，第二次会卡死")
+        self.assertEqual(len(saves), 2, "两段应当各写一个 wav")
+
+        # 每段的语速要在它自己的 save_to_file 之前排进队列
+        rates = [value for name, value in engine.calls if name == "rate"]
+        self.assertEqual(rates, [broadcast.RATE_ENGLISH, broadcast.RATE_CHINESE])
+
+    def test_the_gap_really_lands_in_the_audio(self):
+        synth = broadcast.Synthesizer()
+        synth._ready = lambda: self._fake_engine()
+        pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
+        seconds = len(pcm) / (2.0 * broadcast.TARGET_RATE)
+        # 两段各 0.1 秒 + 间隔 + 0.2 秒收尾
+        self.assertAlmostEqual(seconds, 0.1 * 2 + broadcast.LANGUAGE_GAP + 0.2,
+                               delta=0.05)
+
+
 class ResampleTest(unittest.TestCase):
     """语音合成出来的采样率不一定是 48kHz，送进 Mumble 前要转换。"""
 
@@ -896,7 +1171,10 @@ class ChineseVoiceTest(unittest.TestCase):
         self.assertEqual(chinese.spell_count(0), "零")
 
     def test_wind(self):
-        self.assertEqual(chinese._wind("09004MPS"), "风 洞 九 洞 度 四 米每秒")
+        # 风向和风速各带名头，真实通播就是这么播的——只说"风 洞九洞 度 四
+        # 米每秒"听不出哪个数是什么
+        self.assertEqual(chinese._wind("09004MPS"),
+                         "风向 洞 九 洞 度 风速 四 米每秒")
 
     def test_wind_variable(self):
         self.assertIn("风向不定", chinese._wind("VRB02MPS"))
@@ -936,8 +1214,9 @@ class ChineseVoiceTest(unittest.TestCase):
         self.assertIn("附近有", chinese._weather("VCSH"))
 
     def test_temperature(self):
-        self.assertEqual(chinese._temperature("25"), "二十五")
-        self.assertEqual(chinese._temperature("M03"), "零下 三")
+        # 负号跟在名头后面、单位念出来，都是照真实通播的说法
+        self.assertEqual(chinese._temperature("气温", "25"), "气温 二十五 摄氏度")
+        self.assertEqual(chinese._temperature("露点", "M03"), "露点负 三 摄氏度")
 
     def test_pressure_hectopascals(self):
         self.assertEqual(chinese._pressure("Q1013"), "修正海压 幺 洞 幺 三 百帕")
@@ -949,9 +1228,35 @@ class ChineseVoiceTest(unittest.TestCase):
         parsed = metar_module.Metar(ZSPD)
         script = chinese.render(parsed, facility="上海浦东", letter="D",
                                 runway="三六左")
-        for fragment in ("上海浦东", "通播", "D", "风", "能见度", "温度",
-                         "修正海压", "完毕"):
+        for fragment in ("上海浦东情报通播", "德尔塔", "风向", "风速", "能见度",
+                         "气温", "露点", "修正海压",
+                         "首次与管制员联络时报告你已收到通播 德尔塔"):
             self.assertIn(fragment, script)
+
+    def test_the_letter_is_spoken_as_a_chinese_word(self):
+        """中文稿里不能出现拉丁字母 J——TTS 会在一串汉字里蹦一个英文字母。"""
+        self.assertEqual(chinese.spell_letter("J"), "朱丽叶")
+        script = chinese.render(metar_module.Metar(ZSPD),
+                                facility="北京首都国际机场", letter="J")
+        self.assertIn("朱丽叶", script)
+        self.assertNotIn("J", script)
+
+    def test_a_whole_runway_paragraph_is_not_double_prefixed(self):
+        """跑道那一格既可以只填跑道号，也可以填一整段构型说明。
+
+        真实通播里跑道构型是气象**之前**的一整段（"跑道独立平行离场，跑道
+        三六左 起始高度 六百米……"）。它自带"跑道"二字，再套一层"使用跑道"
+        就成了"使用跑道 跑道独立平行离场"。
+        """
+        paragraph = "跑道独立平行离场 跑道 三六左 起始高度 六百米"
+        script = chinese.render(metar_module.Metar(ZSPD), facility="北京首都",
+                                letter="J", runway=paragraph)
+        self.assertIn(paragraph, script)
+        self.assertNotIn("使用跑道 跑道", script)
+        # 只填跑道号时还是要有名头
+        short = chinese.render(metar_module.Metar(ZSPD), facility="北京首都",
+                               letter="J", runway="三六左")
+        self.assertIn("使用跑道 三六左", short)
 
     def test_script_has_no_latin_weather_codes(self):
         # 漏翻的电码会被 TTS 逐字母念出来，非常难听
@@ -1342,6 +1647,61 @@ class WeatherRetryTest(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", self.urlopen(ZSPD)):
             weather.fetch_metar("ZSPD", "https://例子/q?id=")
         self.assertEqual(self.calls, ["https://例子/q?id=ZSPD"])
+
+
+def _load_broadcast():
+    """延迟导入 broadcast：它会拉起 pymumble→opuslib，本机没有 opus 原生库时
+    要先放替身，所以不能放在模块顶层导。"""
+    from unittest import mock
+    for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                 "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
+        sys.modules.setdefault(name, mock.MagicMock())
+    import broadcast
+    return broadcast
+
+
+class RejectIsNotACrashTest(unittest.TestCase):
+    """服务器拒绝连接是预期内的，不该记成 CRITICAL 未捕获异常。
+
+    pymumble 的 run() 只接 socket.error，ConnectionRejectedError 会一路穿出连接
+    线程，被 applog 的 threading.excepthook 记成"未捕获异常"外加一段 traceback
+    ——实测日志里，一次普通的密码错误看上去就像程序崩了，排查时非常容易被带偏。
+
+    在 run() 外面接住是安全的：pymumble 抛之前已经把 connected 置成 FAILED、也
+    释放了 ready_lock，异常剩下的唯一作用就是终止线程，而 run() 正常返回同样
+    终止线程。
+    """
+
+    def test_rejection_does_not_reach_the_thread_excepthook(self):
+        from unittest import mock
+        broadcast = _load_broadcast()
+        import pymumble_py3 as pymumble
+        client = broadcast.RejectAwareMumble.__new__(broadcast.RejectAwareMumble)
+        escaped = []
+        saved = threading.excepthook
+        threading.excepthook = lambda args: escaped.append(args.exc_type.__name__)
+        try:
+            with mock.patch.object(
+                    pymumble.Mumble, "run",
+                    side_effect=pymumble.errors.ConnectionRejectedError("bad pw")):
+                thread = threading.Thread(target=client.run)
+                thread.start()
+                thread.join(5)
+        finally:
+            threading.excepthook = saved
+        self.assertFalse(thread.is_alive(), "连接线程要正常收尾")
+        self.assertEqual(escaped, [], "拒绝连接不该冒成未捕获异常")
+
+    def test_other_errors_still_propagate(self):
+        """只吞"被拒绝"这一种，真出别的错还是要炸出来。"""
+        from unittest import mock
+        broadcast = _load_broadcast()
+        import pymumble_py3 as pymumble
+        client = broadcast.RejectAwareMumble.__new__(broadcast.RejectAwareMumble)
+        with mock.patch.object(pymumble.Mumble, "run",
+                               side_effect=RuntimeError("别的错")):
+            with self.assertRaises(RuntimeError):
+                client.run()
 
 
 if __name__ == "__main__":

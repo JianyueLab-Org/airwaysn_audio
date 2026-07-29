@@ -66,6 +66,10 @@ ABBREVIATIONS = [
     ("TA", "transition altitude"),
     ("QNH", "Q N H"),
     ("STP", "standard time procedure"),
+    # 这两个不展开的话 TTS 会当成单词念（"atk"、"arnav"）。放在最后，前面的
+    # 规则都跑完了才轮到它们，不会被 CAT / TA 这些短缩写切到。
+    ("ATC", "A T C"),
+    ("RNAV", "R NAV"),
 ]
 
 DIGITS = {
@@ -119,6 +123,13 @@ def expand_free_text(text):
         lambda m: "RWY " + _runway(m), result, flags=re.IGNORECASE)
     result = re.sub(
         r"(?<=\bRWY )(?P<number>\d{2})(?P<sides>(?:[LRC](?:_[LRC])*)?)\b",
+        _runway, result, flags=re.IGNORECASE)
+    # 列表里的跑道：ARR RWY 16L, 17R, DEP RWY 16R, 17L —— 第二个之后不再紧跟
+    # RWY，上面那条带后顾断言的规则够不着，实测 17R 原样留下，TTS 念成"十七阿"。
+    # 真实通播的进离场跑道全是这种列表写法。带方位字母的两位数在通播自由文本里
+    # 只可能是跑道号，所以单独成一条；不带字母的两位数不管（那可能是别的数）。
+    result = re.sub(
+        r"\b(?P<number>\d{2})(?P<sides>[LRC](?:_[LRC])*)\b",
         _runway, result, flags=re.IGNORECASE)
 
     # 频率一类的小数

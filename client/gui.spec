@@ -6,6 +6,13 @@ from PyInstaller.utils.hooks import get_package_paths, collect_all
 
 block_cipher = None
 
+# build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
+# 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version
+
+version.freeze(os.path.dirname(os.path.abspath(SPEC)))
+
 # 获取SimConnect包的路径
 simconnect_pkg = get_package_paths('SimConnect')
 simconnect_dll = os.path.join(simconnect_pkg[1], 'SimConnect.dll')
@@ -56,6 +63,7 @@ a = Analysis(
     ] + qt_binaries + opus_binaries,
     datas=[
         ('radio.py', '.'),  # 添加radio.py作为数据文件
+        ('buildinfo.json', '.'),
     ] + qt_datas,
     hiddenimports=[
         'pkg_resources',

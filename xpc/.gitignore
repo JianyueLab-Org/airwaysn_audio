@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 xpc_settings.json
 xpc.log*
+buildinfo.json

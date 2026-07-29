@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 
 import airports
 import applog
+import version
 import chinese
 import datafeed
 import metar as metar_module
@@ -220,7 +221,7 @@ class AtisWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon(icon_path))
-        self.setWindowTitle('情报通播 - Airwaysn')
+        self.setWindowTitle(f'情报通播 - Airwaysn {version.full()}')
         self.setMinimumSize(900, 600)
 
         self.settings = Settings()
@@ -502,10 +503,15 @@ class AtisWindow(QMainWindow):
 
         context = template_module.build_context(
             parsed, station.identifier, station.letter,
-            preset.airport_conditions, preset.notams, preset.transition_level)
+            preset.airport_conditions, preset.notams, preset.transition_level,
+            # 语音念机场全名：念 "Z S P D" 听着像在拼写，真实通播念的是
+            # "Shanghai Pudong International Airport"。席位上没填名称才退回代码。
+            facility_voice=station.name or station.identifier,
+            # 收尾语跟着预设：不同构型要交代的事不一样。留空用内置那句。
+            closing=preset.closing or None)
         text, voice = template_module.render(preset.template, context,
                                              station.contractions)
-        voice = self.voice_for(station, parsed, voice)
+        voice = self.voice_for(station, parsed, voice, preset)
         self.text_preview.setPlainText(text)
         self.voice_preview.setPlainText(voice)
 
@@ -622,13 +628,18 @@ class AtisWindow(QMainWindow):
             return None
         context = template_module.build_context(
             parsed, station.identifier, station.letter,
-            preset.airport_conditions, preset.notams, preset.transition_level)
+            preset.airport_conditions, preset.notams, preset.transition_level,
+            # 语音念机场全名：念 "Z S P D" 听着像在拼写，真实通播念的是
+            # "Shanghai Pudong International Airport"。席位上没填名称才退回代码。
+            facility_voice=station.name or station.identifier,
+            # 收尾语跟着预设：不同构型要交代的事不一样。留空用内置那句。
+            closing=preset.closing or None)
         text, voice = template_module.render(preset.template, context,
                                              station.contractions)
-        return text, self.voice_for(station, parsed, voice)
+        return text, self.voice_for(station, parsed, voice, preset)
 
     @staticmethod
-    def voice_for(station, parsed, english):
+    def voice_for(station, parsed, english, preset=None):
         """按席位设置决定语音稿用哪种语言。
 
         中文稿不是英文的翻译，是 chinese.py 从 METAR 重新渲染的——语序和数字
@@ -639,11 +650,18 @@ class AtisWindow(QMainWindow):
         if language == profile_module.LANGUAGE_ENGLISH:
             return english
 
+        # 跑道优先取当前预设的：切到"北向"时英文稿的 ARR RWY 会变，中文稿
+        # 要是还念着南向的跑道，同一份通播里两种语言互相矛盾。预设没填才回退
+        # 到席位上那个。
+        runway = getattr(preset, "chinese_runway", "") or station.chinese_runway
         script = chinese.render(
             parsed,
             facility=station.chinese_name or station.identifier,
             letter=station.letter,
-            runway=station.chinese_runway)
+            runway=runway,
+            # 中文稿是从 METAR 独立渲染的，跑道构型、放行频率、应答机这些在
+            # 中文侧没有对应字段，整段由预设提供，接在气象之后念
+            extra=getattr(preset, "chinese_extra", "") or "")
         if language == profile_module.LANGUAGE_CHINESE:
             return script
         return f"{english} {script}"
@@ -970,7 +988,7 @@ if __name__ == '__main__':
     # --debug 会把协议细节也记进日志（FSD 收发的每个包、频道操作）。
     # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
     applog.setup(debug='--debug' in sys.argv or Settings().debug)
-    log.info("情报通播客户端启动")
+    log.info("情报通播客户端启动 %s", version.full())
 
     if '--selftest' in sys.argv:
         sys.exit(selftest())

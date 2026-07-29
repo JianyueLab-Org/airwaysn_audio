@@ -210,14 +210,84 @@ def main():
         assert len(window.stack) == before, "同一个席位被重复加了"
     check("不会重复加", does_not_add_it_twice)
 
+    def the_staffed_frequency_cannot_be_removed():
+        """正在管的席位频率不许删——手滑删掉等于把自己从工作频率上摘下去。"""
+        window.remove_radio(125900)
+        assert window.stack.get(125900) is not None, "自己的席位频率被删掉了"
+    check("自己的席位频率删不掉", the_staffed_frequency_cannot_be_removed)
+
     def respects_a_manual_removal():
-        """用户手动删掉之后，别每 60 秒跟他抢一次。"""
+        """不在管的频率，用户手动删掉之后别每 60 秒跟他抢一次。"""
+        window.on_datafeed(feed(controllers=[]))        # 先下席位，解锁
         window.remove_radio(125900)
         window.on_datafeed(feed(controllers=[{
             "cid": "1000", "callsign": "ZSPD_APP",
             "frequency": "125.900", "facility": 5}]))
         assert window.stack.get(125900) is None, "用户删掉的频率又被加回来了"
     check("用户删掉就不再自动加", respects_a_manual_removal)
+
+    def off_duty_means_receive_only():
+        """数据源上没有自己的席位时，只能收不能发。"""
+        window.on_datafeed(feed(controllers=[]))
+        assert not window.stack.transmit_allowed, "下了席位还允许发信"
+        window.stack.set_tx(118000, True)
+        assert not window.stack.get(118000).tx, "下了席位还能打开 TX"
+    check("没上席位只能收", off_duty_means_receive_only)
+
+    def going_off_duty_drops_tx():
+        """已经开着的 TX 要落下来，光把按钮画灰拦不住 VoiceTarget。"""
+        window.on_datafeed(feed(controllers=[{
+            "cid": "1000", "callsign": "ZSPD_APP",
+            "frequency": "125.900", "facility": 5}]))
+        window.stack.set_tx(118000, True)
+        assert window.stack.get(118000).tx, "前提：上着席位时能开 TX"
+        window.on_datafeed(feed(controllers=[]))
+        assert window.stack.tx_frequencies() == [], "下席位之后 TX 没有落下"
+    check("下席位把 TX 落下", going_off_duty_drops_tx)
+
+    def online_list_shows_every_position():
+        window.on_datafeed(feed(controllers=[
+            {"cid": "2001", "callsign": "ZBAA_TWR",
+             "frequency": "118.500", "facility": 4},
+            {"cid": "2002", "callsign": "ZSSS_GND",
+             "frequency": "121.900", "facility": 4}]))
+        shown = [c for c, _, _ in window.online]
+        assert shown == ["ZBAA_TWR", "ZSSS_GND"], shown
+        assert window._online_buttons, "在线频率一栏是空的"
+    check("显示所有在线频率", online_list_shows_every_position)
+
+    def refreshing_does_not_pile_up():
+        """每分钟刷一次，控件和布局项都不能越堆越多。"""
+        data = feed(controllers=[
+            {"cid": "2001", "callsign": "ZBAA_TWR",
+             "frequency": "118.500", "facility": 4},
+            {"cid": "2002", "callsign": "ZSSS_GND",
+             "frequency": "121.900", "facility": 4}])
+        window.on_datafeed(data)
+        first = window.online_box.count()
+        for _ in range(3):
+            window.on_datafeed(data)
+        assert window.online_box.count() == first, (
+            f"刷了几轮之后布局项从 {first} 变成 {window.online_box.count()}")
+    check("反复刷新不堆积", refreshing_does_not_pile_up)
+
+    def only_the_callsign_is_shown():
+        """按钮上写不下"呼号 + 频率"，实测被压成 "ZBAA ...8.500"。"""
+        window.on_datafeed(feed(controllers=[
+            {"cid": "2001", "callsign": "ZBAA_TWR",
+             "frequency": "118.500", "facility": 4}]))
+        texts = [b.text() for b in window._online_buttons if hasattr(b, "text")]
+        assert "ZBAA_TWR" in texts, texts
+        assert not any("118.500" in x for x in texts), texts
+    check("按钮只写呼号", only_the_callsign_is_shown)
+
+    def clicking_an_online_frequency_adds_it():
+        before = len(window.stack)
+        window.add_online_frequency(118500, "ZBAA_TWR")
+        assert len(window.stack) == before + 1, "点了没加进来"
+        assert window.stack.get(118500).callsign == "ZBAA_TWR"
+        window.stack.remove(118500)
+    check("点在线频率就加进栈", clicking_an_online_frequency_adds_it)
 
     def ignores_the_no_frequency_placeholder():
         window.on_datafeed(feed(controllers=[{
@@ -295,24 +365,21 @@ def main():
         assert row.mute_button.text() == "静音", row.mute_button.text()
     check("电台卡片也重译", radio_cards_are_retranslated_too)
 
-    def retranslating_does_not_wipe_a_live_warning():
-        """换语言不能把状态栏上正挂着的警告抹成"就绪"。
+    def status_bar_follows_the_language():
+        """状态栏那条也要跟着换语言。
 
-        频道监听的警告是服务器不支持时唯一的线索，被"就绪"盖掉之后，管制员会
-        以为一切正常，而实际上除主频率外一个都收不到。
+        原来这里测的是"换语言不能把频道监听的警告抹成就绪"，那条警告已经去掉了，
+        剩下的只有"就绪"，那就退回来盯它本身有没有跟着翻。
         """
         window.voice = mock.MagicMock()
-        window.voice.listeners_confirmed = False
-        for radio in window.stack:
-            radio.rx = True
-        window.update_hint()
-        assert window.status_label.text() == gui.t("status.listeners"), \
-            f"前提不成立: {window.status_label.text()!r}"
+        gui.i18n.set_language("en")
         window.retranslate()
-        assert window.status_label.text() == gui.t("status.listeners"), \
-            f"retranslate 把监听警告抹掉了: {window.status_label.text()!r}"
+        assert window.status_label.text() == "Ready", window.status_label.text()
+        gui.i18n.set_language("zh")
+        window.retranslate()
+        assert window.status_label.text() == "就绪", window.status_label.text()
         window.voice = None
-    check("换语言不抹掉状态栏警告", retranslating_does_not_wipe_a_live_warning)
+    check("状态栏跟着换语言", status_bar_follows_the_language)
 
     def cards_are_shown_in_frequency_order():
         """卡片的顺序要和电台栈一致。

@@ -63,11 +63,13 @@ DEFAULT_CLOSING = "advise on initial contact you have information [ATIS_LETTER]"
 
 
 def build_context(metar, facility="", letter="A", airport_conditions="",
-                  notams="", transition_level="", closing=None):
+                  notams="", transition_level="", closing=None,
+                  facility_voice=None):
     """把 METAR 和席位上的自由文本组装成变量表。
 
     值统一是 (text, voice) 二元组；自由文本两种形态相同。
     """
+    import metar as metar_module
     from metar import Element
 
     def free(value):
@@ -82,8 +84,14 @@ def build_context(metar, facility="", letter="A", airport_conditions="",
 
     closing_text = DEFAULT_CLOSING if closing is None else closing
     context = {
-        "facility": free(facility or metar.station),
-        "letter": Element(letter, letter),
+        # 文字稿写 ICAO（ZSPD），语音念全名（Shanghai Pudong International
+        # Airport）——真实通播念的是机场名，念四个字母听着像在拼写。
+        "facility": Element(
+            facility or metar.station,
+            voicefix.expand_free_text(
+                facility_voice or facility or metar.station)),
+        # 文字稿留字母本身（A），语音稿念通话字母（Alpha）
+        "letter": Element(letter, metar_module.spell_letter(letter)),
         "full_wx": metar.full_wx(),
         "observation_time": metar.observation_time,
         "wind": metar.wind,
@@ -101,8 +109,11 @@ def build_context(metar, facility="", letter="A", airport_conditions="",
         "transition_level": free(transition_level),
     }
     # 收尾语本身还能引用 [ATIS_LETTER]，所以要先渲染一遍
-    closing_rendered = _substitute(closing_text, context, voice=False)
-    context["closing"] = free(closing_rendered)
+    # 两遍都要渲染。只做文字那一遍的话，收尾语里的 [ATIS_LETTER] 永远是 "F"，
+    # 于是同一句通播开头念 "INFORMATION Foxtrot"、结尾念 "information F"。
+    context["closing"] = Element(
+        _substitute(closing_text, context, voice=False),
+        voicefix.expand_free_text(_substitute(closing_text, context, voice=True)))
     return context
 
 
@@ -154,8 +165,12 @@ def render(template, context, contractions=None):
         _substitute(template, context, voice=False), contractions, voice=False)
     voice = _expand_contractions(
         _substitute(template, context, voice=True), contractions, voice=True)
+    # 语音稿整体再过一遍缩写展开：模板里手写的字面量（"TRL [TL]" 里的 TRL、
+    # "EXPECT ILS APPROACH"）不属于任何自由文本字段，原来谁都不管它，TTS 就
+    # 照字母念。已经展开过的部分是幂等的——展开后的文字里既没有缩写词也没有
+    # 裸数字，各条规则都匹配不上。
     # polish 是最后一道防线：上游哪一环少了分隔符，也不该让用户听到一个怪词
-    return tidy(text), voicefix.polish(tidy(voice))
+    return tidy(text), voicefix.polish(voicefix.expand_free_text(tidy(voice)))
 
 
 def unknown_variables(template):

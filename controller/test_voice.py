@@ -288,6 +288,9 @@ class FakeServer:
         self.lock = threading.Lock()
         self.latency = latency
         self.answers = answers          # False = 服务器收下命令但什么都不做
+        # True = 进不存在的频道时什么都不做，和真服务器一样（既不报错也不照做）。
+        # 默认关着，因为多数用例根本不建频道就直接 _join(7) 试进频道的语义。
+        self.strict_moves = False
         self.by_name = {}
         self.my_channel = my_channel
         self.next_id = 1
@@ -323,7 +326,25 @@ class FakeServer:
                 }
                 self.next_id += 1
             elif "session" in params:               # MoveCmd
-                self.my_channel = params["channel_id"]
+                target = params["channel_id"]
+                if self.strict_moves and target not in {
+                        c["channel_id"] for c in self.by_name.values()}:
+                    return                          # 频道没了，服务器直接无视
+                self.my_channel = target
+
+    def remove_channel(self, name):
+        """服务器销毁一个空掉的临时频道。
+
+        频率频道都是 temporary=True，最后一个人一走服务器当场就把它删了——这
+        不需要断线重连，管制员把主频率从 A 换到 B 就够了。
+        """
+        with self.lock:
+            return self.by_name.pop(name, None)
+
+    def live_ids(self):
+        """服务器上真实存在的频道号。"""
+        with self.lock:
+            return {c["channel_id"] for c in self.by_name.values()}
 
     def send_message(self, type, message):
         self.messages.append((type, message))
@@ -460,6 +481,97 @@ class ChannelSwitchTest(unittest.TestCase):
         self.assertEqual(self.server.my_channel, joined,
                          "主频率的频道要真的进去，不然服务端不支持监听时一个"
                          "频率都听不到")
+
+
+class TemporaryChannelRemovedTest(unittest.TestCase):
+    """临时频道被销毁之后，频率→频道号的缓存必须跟着失效。
+
+    `_channel_ids` 只在重连时清空，可频道消失根本不需要重连：频率频道是
+    temporary 的，管制员把主频率从 A 换到 B、A 上又没别人，A 当场就被服务器
+    删掉了。旧号却一直留在缓存里，再用到 A 的时候：
+
+    - `_join(旧号)` 发出去的 MoveCmd 指向一个不存在的频道，服务器不会报错也
+      不会照做，日志里只剩一行接一行的"5 秒内没有生效"；
+    - `_set_voice_target` 编进 VoiceTarget 的也是那个旧号，话音被服务器直接
+      丢掉，同样一声不吭。
+
+    合起来正好是"收得到、发不动、不报错"：监听还落在活着的频道上，所以耳朵
+    是好的，嘴是哑的。
+    """
+
+    def setUp(self):
+        # 失败路径要等满一个超时，缩短一点免得整轮测试拖上半分钟
+        self._timeout = voice.CHANNEL_TIMEOUT
+        voice.CHANNEL_TIMEOUT = 0.5
+
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.05)
+        self.server.strict_moves = True
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+        self.stack = radiostack.RadioStack()
+        for khz in (118000, 121700):
+            self.stack.add(khz)
+            radio = self.stack.get(khz)
+            radio.rx = True
+            radio.tx = True
+        self.stack.select(118000)
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def sync_and_wait(self):
+        thread = threading.Thread(target=self.client.sync, args=(self.stack,),
+                                  daemon=True)
+        thread.start()
+        thread.join(voice.CHANNEL_TIMEOUT * 4 + 5)
+        self.assertFalse(thread.is_alive(), "sync 没有在预算内返回")
+
+    def switch_away_and_let_the_old_channel_die(self):
+        """切到 121.700，再让服务器把空掉的 FREQ_118000 销毁。"""
+        self.sync_and_wait()
+        old = self.client._channel_ids[118000]
+        self.assertEqual(self.server.my_channel, old, "前提：先进了 118.000")
+
+        self.stack.select(121700)
+        self.sync_and_wait()
+        self.assertNotEqual(self.server.my_channel, old, "前提：已经换到 121.700")
+
+        self.assertIsNotNone(self.server.remove_channel("FREQ_118000"))
+        return old
+
+    def test_a_removed_channel_is_not_joined_by_its_old_id(self):
+        old = self.switch_away_and_let_the_old_channel_die()
+
+        self.stack.select(118000)
+        self.sync_and_wait()
+
+        self.assertNotEqual(self.client._channel_ids[118000], old,
+                            "频道已经被销毁，旧号不能再用")
+        rebuilt = self.server.by_name.get("FREQ_118000")
+        self.assertIsNotNone(rebuilt, "频道没了就该重建，不是拿着旧号一直试")
+        self.assertEqual(self.server.my_channel, rebuilt["channel_id"],
+                         "人没有进到 118.000 里去——MoveCmd 指着一个不存在的频道，"
+                         "服务器不报错也不照做，日志里只会刷「5 秒内没有生效」")
+
+    def test_a_removed_channel_never_ends_up_in_the_voice_target(self):
+        self.switch_away_and_let_the_old_channel_die()
+
+        self.stack.select(118000)
+        self.sync_and_wait()
+
+        programmed = None
+        for _type, message in self.server.messages:
+            if getattr(message, "id", None) == voice.PTT_TARGET_ID:
+                programmed = [t.channel_id for t in message.targets]
+        self.assertIsNotNone(programmed, "根本没编 PTT 的 VoiceTarget")
+        live = self.server.live_ids()
+        for channel_id in programmed:
+            self.assertIn(channel_id, live,
+                          "发话目标里有已经不存在的频道号，话音会被服务器悄悄"
+                          "丢掉——收得到、发不动、不报错")
 
 
 class ReconnectTest(unittest.TestCase):

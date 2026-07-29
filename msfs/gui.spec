@@ -2,6 +2,14 @@
 
 import ctypes.util
 import os
+import sys
+
+# build 号在这里固化。打包之后程序里没有 .git，运行时再问 git 只会得到"不是
+# 仓库"——所以打包时把 git 状态写成 buildinfo.json 一起打进去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+import version
+
+version.freeze(os.path.dirname(os.path.abspath(SPEC)))
 
 excludes = ['torch', 'transformers', 'scipy', 'pyttsx3', 'matplotlib']
 
@@ -69,7 +77,7 @@ a = Analysis(
     pathex=[],
     binaries=binaries,
     # 窗口图标要随程序分发，否则打包后运行时取不到
-    datas=[('favicon.ico', '.')],
+    datas=[('favicon.ico', '.'), ('buildinfo.json', '.')],
     hiddenimports=[
         'pymumble_py3',
         'google.protobuf',

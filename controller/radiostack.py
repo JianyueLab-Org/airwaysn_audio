@@ -111,6 +111,15 @@ class RadioStack:
         self.on_change = on_change
         self.selected_khz = None      # 主频率：真正进入的那个 Mumble 频道
 
+        # ---------- 值守状态 ----------
+        # 数据源上本人没有在管制席位时，只许收、不许发。语音服务器没有花名册
+        # 检查（任何账号都能进任何 FREQ_* 频道），这道闸是客户端自觉守的那一层，
+        # 对应 can-fsd 上管制员必须在花名册里才能上席位。
+        self.transmit_allowed = True
+        # 数据源上本人正在管的那个频率。它不许删——手滑删掉自己的席位频率，
+        # 等于把自己从工作频率上摘下去，而且下一轮自动加回来之前谁也听不到你。
+        self.locked_khz = None
+
     # ---------- 查询 ----------
     def __iter__(self):
         return iter(self._radios)
@@ -154,9 +163,46 @@ class RadioStack:
         self._changed()
         return radio
 
+    def set_transmit_allowed(self, allowed):
+        """能不能发信。关掉时把已经打开的 TX / XC 一并落下。
+
+        只把按钮画灰是不够的：栈里已经开着的 TX 会被 voice.sync 编进
+        VoiceTarget，人照样发得出去。要真的关，就得改状态本身。
+        """
+        allowed = bool(allowed)
+        if allowed == self.transmit_allowed:
+            return False
+        self.transmit_allowed = allowed
+        changed = False
+        if not allowed:
+            for radio in self._radios:
+                if radio.tx or radio.xc:
+                    radio.tx = radio.xc = False
+                    radio.currently_tx = False
+                    changed = True
+        self._changed()
+        return changed
+
+    def set_locked(self, khz):
+        """把某个频率标成不可删除（本人正在管的席位）。None 表示解除。"""
+        if khz == self.locked_khz:
+            return False
+        self.locked_khz = khz
+        self._changed()
+        return True
+
+    def is_locked(self, khz):
+        return self.locked_khz is not None and khz == self.locked_khz
+
     def remove(self, khz):
         radio = self.get(khz)
         if not radio:
+            return False
+        if self.is_locked(khz):
+            # 静默拒绝而不是抛异常：界面上那个按钮本来就该是禁用的，走到这里
+            # 说明是别的路径（快捷键、脚本）碰到了，挡住就行
+            log.info("%s 是本人正在管的席位频率，不允许删除",
+                     format_frequency(khz))
             return False
         self._radios.remove(radio)
         if self.selected_khz == khz:
@@ -189,6 +235,9 @@ class RadioStack:
         radio = self.get(khz)
         if not radio:
             return None
+        if value and not self.transmit_allowed:
+            log.info("数据源上没有在管制席位，不允许打开 TX")
+            return radio
         radio.tx = value
         if value:
             radio.rx = True          # 不存在只发不收
@@ -202,6 +251,9 @@ class RadioStack:
         radio = self.get(khz)
         if not radio:
             return None
+        if value and not self.transmit_allowed:
+            log.info("数据源上没有在管制席位，不允许打开 XC")
+            return radio
         radio.xc = value
         if value:
             radio.rx = True

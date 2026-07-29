@@ -27,6 +27,53 @@ def pilot(cid, callsign):
     return {"cid": str(cid), "callsign": callsign, "name": "某人"}
 
 
+class OnlinePositionsTest(unittest.TestCase):
+    """在线席位一览。列出来是给人点的，所以点不进去的一律不列。"""
+
+    def test_lists_callsign_and_frequency_sorted(self):
+        data = feed(controllers=[
+            controller(1001, "ZSPD_TWR", "118.000"),
+            controller(1002, "ZBAA_APP", "126.750"),
+            controller(1003, "ZSSS_GND", "121.900"),
+        ])
+        self.assertEqual(
+            datafeed.online_positions(data),
+            [("ZSPD_TWR", 118000, 4),
+             ("ZSSS_GND", 121900, 4),
+             ("ZBAA_APP", 126750, 4)])
+
+    def test_observers_are_not_listed(self):
+        """挂观察员不算在管制，和 controller_for 的判定保持一致。"""
+        data = feed(controllers=[
+            controller(1001, "ZSPD_OBS", "118.000",
+                       facility=datafeed.FACILITY_OBSERVER),
+            controller(1002, "ZSPD_TWR", "118.100"),
+        ])
+        self.assertEqual([c for c, _, _ in datafeed.online_positions(data)],
+                         ["ZSPD_TWR"])
+
+    def test_the_no_frequency_placeholder_is_dropped(self):
+        """199.998 是 can-fsd 的"没设频率"，拿它拼出来的频道谁也不在。"""
+        data = feed(controllers=[controller(1001, "ZSPD_TWR", "199.998")])
+        self.assertEqual(datafeed.online_positions(data), [])
+
+    def test_unparsable_frequency_is_dropped(self):
+        data = feed(controllers=[controller(1001, "ZSPD_TWR", "不是频率"),
+                                 controller(1002, "ZSPD_GND", "121.900")])
+        self.assertEqual([c for c, _, _ in datafeed.online_positions(data)],
+                         ["ZSPD_GND"])
+
+    def test_two_positions_on_one_frequency_both_stay(self):
+        data = feed(controllers=[controller(1001, "ZSPD_TWR", "118.000"),
+                                 controller(1002, "ZSPD_TWR_2", "118.000")])
+        self.assertEqual(len(datafeed.online_positions(data)), 2)
+
+    def test_empty_and_missing_data(self):
+        self.assertEqual(datafeed.online_positions(None), [])
+        self.assertEqual(datafeed.online_positions({}), [])
+        self.assertEqual(datafeed.online_positions(feed()), [])
+
+
 class ControllerLookupTest(unittest.TestCase):
 
     def test_finds_my_position(self):

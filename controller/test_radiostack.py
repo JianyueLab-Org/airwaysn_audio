@@ -131,6 +131,73 @@ class FrequencySetsTest(unittest.TestCase):
         self.assertEqual(sorted(self.stack.xc_frequencies()), [118000, 128500])
 
 
+class OnDutyTest(unittest.TestCase):
+    """没在数据源上的管制席位时，只许收不许发；正在管的那个频率不许删。
+
+    语音服务器没有花名册检查——任何账号都能进任何 FREQ_* 频道，也都能对着它
+    说话。这道闸是客户端自觉守的那一层，对应 can-fsd 上"不在花名册里就不能上
+    席位"。
+    """
+
+    def setUp(self):
+        self.stack = RadioStack()
+        for freq in ("118.000", "121.700"):
+            self.stack.add(freq)
+
+    def test_tx_cannot_be_turned_on_when_not_on_duty(self):
+        self.stack.set_transmit_allowed(False)
+        self.stack.set_tx(118000, True)
+        self.assertFalse(self.stack.get(118000).tx)
+        self.assertEqual(self.stack.tx_frequencies(), [])
+
+    def test_xc_cannot_be_turned_on_when_not_on_duty(self):
+        self.stack.set_transmit_allowed(False)
+        self.stack.set_xc(118000, True)
+        self.assertFalse(self.stack.get(118000).xc)
+
+    def test_rx_still_works_when_not_on_duty(self):
+        """只是不许发，收是照常的——听不到反而更危险。"""
+        self.stack.set_transmit_allowed(False)
+        self.stack.set_rx(118000, True)
+        self.assertTrue(self.stack.get(118000).rx)
+        self.assertEqual(self.stack.rx_frequencies(), [118000])
+
+    def test_going_off_duty_drops_tx_that_is_already_on(self):
+        """光把按钮画灰拦不住：已经开着的 TX 会被 sync 编进 VoiceTarget。"""
+        self.stack.set_tx(118000, True)
+        self.stack.set_xc(121700, True)
+        self.assertEqual(self.stack.tx_frequencies(), [118000, 121700])
+
+        self.stack.set_transmit_allowed(False)
+        self.assertEqual(self.stack.tx_frequencies(), [])
+        self.assertEqual(self.stack.xc_frequencies(), [])
+        self.assertEqual(sorted(self.stack.rx_frequencies()), [118000, 121700],
+                         "收不该跟着一起关掉")
+
+    def test_coming_on_duty_allows_tx_again(self):
+        self.stack.set_transmit_allowed(False)
+        self.stack.set_transmit_allowed(True)
+        self.stack.set_tx(118000, True)
+        self.assertTrue(self.stack.get(118000).tx)
+
+    def test_the_locked_frequency_cannot_be_removed(self):
+        self.stack.set_locked(118000)
+        self.assertFalse(self.stack.remove(118000))
+        self.assertIsNotNone(self.stack.get(118000))
+        # 别的频率照删不误
+        self.assertTrue(self.stack.remove(121700))
+
+    def test_unlocking_makes_it_removable_again(self):
+        self.stack.set_locked(118000)
+        self.stack.set_locked(None)
+        self.assertTrue(self.stack.remove(118000))
+
+    def test_nothing_is_locked_by_default(self):
+        self.assertFalse(self.stack.is_locked(118000))
+        self.assertTrue(self.stack.transmit_allowed,
+                        "默认放行——没连数据源时不该把人锁死")
+
+
 class RuntimeStateTest(unittest.TestCase):
 
     def setUp(self):

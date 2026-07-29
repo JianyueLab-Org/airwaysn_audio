@@ -426,6 +426,27 @@ class ModelMatchingTest(unittest.TestCase):
         model, why = models.match(equipment="SR22")
         self.assertEqual(model.icao, "C172", why)
 
+    def test_category_beats_the_generic_guess(self):
+        """同类机身必须排在「按前缀猜通用机型」前面。
+
+        GENERIC_BY_PREFIX 是两位前缀，A3 / B7 同时盖住窄体和宽体：B77W 猜出
+        B738、A359 猜出 A320。通用那级排在前面的话，只要装了 B738 或 A320
+        （几乎人人都有），所有宽体都会退成窄体，同类机身那级永远轮不到。
+
+        关键是**装了 B738**——上面那条只装了 A319 和 B78X，通用猜出的 B738
+        找不到，自然轮到同类机身，顺序错了也照样通过。
+        """
+        models = aimatch.ModelSet([
+            aimatch.Model("737-800", icao="B738"),
+            aimatch.Model("A320neo", icao="A20N"),
+            aimatch.Model("787-9", icao="B789"),
+        ])
+        for want in ("B77W", "B77L", "A359", "A388", "B744"):
+            model, why = models.match(equipment=want)
+            self.assertEqual(model.icao, "B789",
+                             f"{want} 应当顶一架宽体，却拿到 {model.icao}（{why}）")
+            self.assertIn("宽体", why)
+
     def test_category_lookup(self):
         self.assertEqual(aimatch.category_of("B77W"), "宽体")
         self.assertEqual(aimatch.category_of("B738"), "窄体")

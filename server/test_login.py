@@ -88,12 +88,10 @@ class UpstreamTestCase(unittest.TestCase):
         self._delay = login_module.HTTP_RETRY_DELAY
         login_module.HTTP_RETRY_DELAY = 0.0      # 测试里不真的等
         self._post = login_module.requests.post
-        self._atis_password = login_module.serverconf.atis_password
 
     def tearDown(self):
         login_module.HTTP_RETRY_DELAY = self._delay
         login_module.requests.post = self._post
-        login_module.serverconf.atis_password = self._atis_password
 
     def upstream(self, *outcomes):
         fake = FakeUpstream(*outcomes)
@@ -201,13 +199,18 @@ class PasswordLoggingTest(UpstreamTestCase):
             lambda: login_module.login_ATIS("1005_atis118000", self.SECRET))
         self.assertNotIn(self.SECRET, output)
 
-    def test_the_reserved_atis_account_password_is_not_logged_either(self):
-        reserved = "保留账号的口令"
-        login_module.serverconf.atis_password = lambda required=False: reserved
+    def test_no_atis_password_reaches_the_log_whatever_the_cid(self):
+        """哪个 cid 都一样，口令不进日志。
+
+        以前 900 这个保留账号走的是另一条分支，所以单独测过一遍；旁路去掉之后
+        只剩一条路，但这条断言仍然值得留着——它盯的是"别把口令 print 出来"，
+        和走哪条分支无关。
+        """
+        secret = "另一个账号的口令"
+        self.upstream(Response(200))
         output = self.capture(
-            lambda: login_module.login_ATIS(
-                f"{login_module.ATIS_ACCOUNT}_atis118000", reserved))
-        self.assertNotIn(reserved, output)
+            lambda: login_module.login_ATIS("900_atis118000", secret))
+        self.assertNotIn(secret, output)
 
 
 class AuthenticateTest(UpstreamTestCase):
@@ -251,23 +254,29 @@ class AuthenticateTest(UpstreamTestCase):
         self.assertEqual(user_id, 118000)
         self.assertEqual(name, "1005_atis118000")
 
-    def test_the_reserved_atis_account_does_not_touch_the_network(self):
-        reserved = "保留账号的口令"
-        login_module.serverconf.atis_password = lambda required=False: reserved
-        fake = self.upstream(Response(400))     # 上游会拒绝，但根本不该问它
-        user_id, _, _ = self.authenticate(
-            f"{login_module.ATIS_ACCOUNT}_atis127800", reserved)
-        self.assertEqual(user_id, 127800)
-        self.assertEqual(fake.calls, [])
+    def test_there_is_no_shortcut_for_any_account(self):
+        """保留账号的旁路已经去掉了，谁都得去问上游。
 
-    def test_without_a_configured_password_there_is_no_shortcut(self):
-        """口令没配就不能有捷径——拿空口令去比等于谁都能冒充通播账号。"""
-        login_module.serverconf.atis_password = lambda required=False: None
+        默认部署只起 login.py，server/ATIS/ 那队服务端通播机不跑，那条免验证的
+        旁路就是死代码。去掉之后连 900 也得老老实实过上游接口——这条断言就是钉
+        住"没有任何账号能绕过认证"，免得哪天又被顺手加回来。
+        """
         fake = self.upstream(Response(400))
-        user_id, _, _ = self.authenticate(
-            f"{login_module.ATIS_ACCOUNT}_atis127800", "")
+        user_id, _, _ = self.authenticate("900_atis127800", "随便什么口令")
         self.assertEqual(user_id, login_module.AUTH_FAILED)
         self.assertEqual(len(fake.calls), 1, "应当老老实实去问上游")
+
+    def test_a_normal_atis_client_still_authenticates(self):
+        """管制员手里的桌面通播客户端不能被误伤。
+
+        airwaysn-atis 登录用的是 `{自己的cid}_atis{频率}`，走的正是 login_ATIS。
+        清理保留账号那条旁路时，很容易顺手把整条 _atis 路径一起删掉——那样管制员
+        的通播客户端会直接登不上，而这是个还在用的功能。
+        """
+        self.upstream(Response(200))
+        user_id, name, _ = self.authenticate("1005_atis127800", "pw")
+        self.assertEqual(user_id, 127800, "用户 id 要是那 6 位频率")
+        self.assertEqual(name, "1005_atis127800")
 
     def test_a_successful_login_kicks_the_previous_session(self):
         self.upstream(Response(200))

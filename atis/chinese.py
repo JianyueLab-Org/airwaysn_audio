@@ -22,6 +22,18 @@ DIGITS = {
     "5": "五", "6": "六", "7": "拐", "8": "八", "9": "九",
 }
 
+# 通话字母的中文读法。中文通播念的是"情报通播 朱丽叶"，不是拉丁字母 J——
+# 调用方传进来的是席位上的 letter（"J"），直接拼进中文句子的话，TTS 会在一串
+# 汉字中间蹦一个英文字母。
+LETTERS = {
+    "A": "阿尔法", "B": "布拉沃", "C": "查理", "D": "德尔塔", "E": "埃科",
+    "F": "福克斯特罗", "G": "高尔夫", "H": "霍特尔", "I": "印地亚",
+    "J": "朱丽叶", "K": "基洛", "L": "利马", "M": "迈克", "N": "诺文贝",
+    "O": "奥斯卡", "P": "帕帕", "Q": "魁北克", "R": "罗米欧", "S": "塞拉",
+    "T": "探戈", "U": "尤尼佛", "V": "维克多", "W": "威士忌", "X": "爱克斯瑞",
+    "Y": "洋基", "Z": "祖鲁",
+}
+
 CLOUD_AMOUNTS = {
     "FEW": "少云", "SCT": "疏云", "BKN": "多云", "OVC": "阴天",
     "NSC": "无重要云", "NCD": "未探测到云", "SKC": "碧空", "CLR": "碧空",
@@ -45,6 +57,12 @@ METRES_PER_HUNDRED_FEET = 30
 def spell(text):
     """把数字逐位念出来。非数字原样保留。"""
     return " ".join(DIGITS.get(c, c) for c in str(text))
+
+
+def spell_letter(letter):
+    """情报字母念成通话字母：J → 朱丽叶。认不出的原样返回。"""
+    letter = (letter or "").strip().upper()
+    return LETTERS.get(letter, letter)
 
 
 def spell_count(value):
@@ -95,10 +113,12 @@ def _wind(token):
     elif direction == "000" and speed == "00":
         return "静风"
     else:
-        head = f"风 {spell(direction)} 度"
+        # 真实通播念的是"风向 三洞洞 度，风速 拐 米每秒"，风向和风速各带自己的
+        # 名头；只说"风 三洞洞 度 拐 米每秒"是听不出哪个数是什么的
+        head = f"风向 {spell(direction)} 度"
 
     measure = "米每秒" if unit == "MPS" else "海里每小时"
-    parts = [f"{head} {spell_count(int(speed))} {measure}"]
+    parts = [f"{head} 风速 {spell_count(int(speed))} {measure}"]
     if gust:
         parts.append(f"阵风 {spell_count(int(gust))} {measure}")
     return " ".join(parts)
@@ -176,8 +196,12 @@ def _weather(text):
     return " ".join(parts)
 
 
-def _temperature(text):
-    """25 / M03"""
+def _temperature(label, text):
+    """25 → 气温 二十五 摄氏度；M03 → 露点负 三 摄氏度
+
+    负号紧跟在名头后面（"露点负 八"），单位要念出来——真实通播就是这么播的。
+    写成"露点 零下 八"也听得懂，但和实际播出的不是一个说法。
+    """
     text = (text or "").strip().upper()
     if not text:
         return ""
@@ -185,8 +209,7 @@ def _temperature(text):
     digits = text.lstrip("M-")
     if not digits.isdigit():
         return ""
-    value = int(digits)
-    return ("零下 " if negative else "") + spell_count(value)
+    return f"{label}{'负' if negative else ''} {spell_count(int(digits))} 摄氏度"
 
 
 def _pressure(text):
@@ -210,11 +233,12 @@ def render(metar, facility="", letter="", runway="", extra=""):
     runway    使用跑道，比如"三六左"，调用方自己写好
     extra     额外说明，接在最后
     """
+    spoken_letter = spell_letter(letter)
     parts = []
     if facility:
-        parts.append(f"{facility} 通播")
-    if letter:
-        parts.append(f"{letter} 号")
+        parts.append(f"{facility}情报通播")
+    if spoken_letter:
+        parts.append(spoken_letter)
     if metar is None:
         return " ".join(parts)
 
@@ -222,7 +246,12 @@ def render(metar, facility="", letter="", runway="", extra=""):
     if time_text:
         parts.append(time_text)
     if runway:
-        parts.append(f"使用跑道 {runway}")
+        # 这一格可以只填跑道号（"三六左"），也可以填一整段构型说明
+        # （"跑道独立平行离场，跑道 三六左 起始高度 六百米……"）——真实通播里
+        # 跑道构型就是这么一整段，而且位置在气象**之前**。后者自带"跑道"二字，
+        # 再套一层"使用跑道"就成了"使用跑道 跑道独立平行离场"。
+        parts.append(runway if runway.lstrip().startswith("跑道")
+                     else f"使用跑道 {runway}")
 
     for value in (_wind(_text_of(metar, "wind")),
                   _visibility(_text_of(metar, "visibility")),
@@ -231,12 +260,10 @@ def render(metar, facility="", letter="", runway="", extra=""):
         if value:
             parts.append(value)
 
-    temperature = _temperature(_text_of(metar, "temperature"))
-    dew_point = _temperature(_text_of(metar, "dew_point"))
-    if temperature:
-        parts.append(f"温度 {temperature}")
-    if dew_point:
-        parts.append(f"露点 {dew_point}")
+    for phrase in (_temperature("气温", _text_of(metar, "temperature")),
+                   _temperature("露点", _text_of(metar, "dew_point"))):
+        if phrase:
+            parts.append(phrase)
 
     pressure = _pressure(_text_of(metar, "pressure"))
     if pressure:
@@ -244,8 +271,9 @@ def render(metar, facility="", letter="", runway="", extra=""):
 
     if extra:
         parts.append(extra)
-    if letter:
-        parts.append(f"通播 {letter} 号 完毕")
+    if spoken_letter:
+        # 真实通播的收尾是让机组回报收到了哪一份，不是"完毕"
+        parts.append(f"首次与管制员联络时报告你已收到通播 {spoken_letter}")
     return " ".join(p for p in parts if p)
 
 
@@ -255,9 +283,12 @@ def _text_of(metar, name):
 
 
 def _observation_time(metar):
-    """251300Z → 幺三洞洞 时"""
+    """251300Z → 幺三洞洞 世界协调时
+
+    真实通播报的是"世界协调时"，只说"时"听起来像本地时间。
+    """
     text = _text_of(metar, "observation_time")
     match = re.match(r"^\d{2}(\d{4})Z$", (text or "").strip().upper())
     if not match:
         return ""
-    return f"{spell(match.group(1))} 时"
+    return f"{spell(match.group(1))} 世界协调时"

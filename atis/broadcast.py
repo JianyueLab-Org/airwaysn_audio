@@ -77,6 +77,24 @@ class RejectAwareMumble(pymumble.Mumble):
                 log.warning("解析 Reject 消息失败: %s", e)
         return super().dispatch_control_message(type, message)
 
+    def run(self):
+        """接住"服务器拒绝"，别让它变成一条 CRITICAL。
+
+        pymumble 的 run() 只接 socket.error，ConnectionRejectedError 会一路穿出
+        连接线程，被 applog 的 threading.excepthook 记成"未捕获异常"加一段
+        traceback——一次普通的密码错误看上去就像程序崩了，排查时很容易被带偏。
+
+        在这里接是安全的：pymumble 抛之前已经把 connected 置成 FAILED、也放掉了
+        ready_lock（mumble.py 的 dispatch_control_message），状态该收拾的都收拾
+        完了，异常剩下的唯一作用就是终止线程——而 run() 返回同样终止线程。
+        拒绝的原因我们在 dispatch_control_message 里已经记下来了，rejection()
+        照常能拿到。
+        """
+        try:
+            super().run()
+        except pymumble.errors.ConnectionRejectedError as e:
+            log.info("服务器拒绝了连接，连接线程正常退出: %s", e)
+
     def rejection(self):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
         if not self.reject_type and not self.reject_reason:
@@ -127,6 +145,52 @@ def resample(audio, source_rate, target_rate):
     )
 
 
+# 语速。中文比英文慢一档：同样的 rate 下 SAPI 的中文音色听起来赶，而通播是
+# 要人一遍听懂的，宁可慢。
+RATE_ENGLISH = 150
+RATE_CHINESE = 128
+
+# 中英切换处插一段静音。没有它两种语言会连在一起，听感上像是同一句话说串了。
+LANGUAGE_GAP = 5
+
+# 夹在中文里的短英文片段（"RNAV"、"S 模式"里的 S）不单独切出去。切出去的话
+# 一句话中间要换两次音色，比用中文音色念这几个字母难听得多。
+MIN_ENGLISH_RUN = 4
+
+
+def _segments(text):
+    """按语言把稿子切成 [(是否中文, 文本)]。
+
+    中英双语稿是"整段英文 + 整段中文"，所以粗粒度切就够：按空白分词，带汉字
+    的算中文，然后把连续同类的合并回去。最后把夹在中文当中的短英文片段并进
+    中文——`本场 RNAV 离场可用` 不该在 RNAV 处换两次音色。
+    """
+    tokens = (text or "").split()
+    if not tokens:
+        return []
+
+    runs = []
+    for token in tokens:
+        chinese = bool(_CHINESE.search(token))
+        if runs and runs[-1][0] == chinese:
+            runs[-1][1].append(token)
+        else:
+            runs.append([chinese, [token]])
+
+    merged = []
+    for index, (chinese, words) in enumerate(runs):
+        short_english = (not chinese and len(words) < MIN_ENGLISH_RUN
+                         and merged and merged[-1][0])
+        if short_english:
+            merged[-1][1].extend(words)
+            continue
+        if merged and merged[-1][0] == chinese:
+            merged[-1][1].extend(words)
+            continue
+        merged.append([chinese, list(words)])
+    return [(chinese, " ".join(words)) for chinese, words in merged]
+
+
 def _pick_voice(engine, chinese):
     hints = (("chinese", "zh_", "zh-", "huihui", "yaoyao", "kangkang") if chinese
              else ("english", "en_", "en-", "zira", "david", "mark", "hazel"))
@@ -166,7 +230,7 @@ class Synthesizer:
             except Exception:
                 pass
             self._engine = pyttsx3.init()
-            self._engine.setProperty('rate', 150)
+            self._engine.setProperty('rate', RATE_ENGLISH)
             self._engine.setProperty('volume', 0.9)
         return self._engine
 
@@ -185,64 +249,99 @@ class Synthesizer:
         return pcm
 
     def _render(self, text):
+        """整篇合成。中英双语时按语言分段，各用各的音色和语速。
+
+        原来是整篇挑一个音色，判据是"文中有没有汉字"——于是双语稿里那一大段
+        英文也是中文音色念的，听着像外国人念中文。
+        """
+        segments = _segments(text)
+        if not segments:
+            return None
+
         try:
             engine = self._ready()
-            voice_id = _pick_voice(engine, bool(_CHINESE.search(text)))
-            if voice_id:
-                engine.setProperty('voice', voice_id)
 
             # cleanup() 会把这个目录整个删掉，而 Broadcaster 停了之后再 start()
             # 是允许的——目录没了的话 save_to_file 会静默失败，只留一句
             # "语音合成失败"，看不出是这个原因
             os.makedirs(self._temp_dir, exist_ok=True)
-            path = os.path.join(self._temp_dir, "atis.wav")
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
 
-            engine.save_to_file(text, path)
+            # **整篇只能进一次 runAndWait()。** 同一个引擎连着调第二次时
+            # pyttsx3 的 SAPI 驱动会永久卡在里面——实测双语稿（两段）就此挂死，
+            # 日志停在合成之前，"合成完成"和"语音合成失败"两条都不会出现，
+            # 表现出来就是通播一声不响。
+            #
+            # 不过 setProperty 和 save_to_file 都是排进同一个队列、按 FIFO 执行
+            # 的（pyttsx3 driver.py 的 _Proxy._push），所以一次循环里就能把每段
+            # 用各自的音色和语速写成各自的 wav。
+            paths = []
+            for index, (chinese, part) in enumerate(segments):
+                path = os.path.join(self._temp_dir, f"atis{index}.wav")
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                engine.setProperty('rate',
+                                   RATE_CHINESE if chinese else RATE_ENGLISH)
+                voice_id = _pick_voice(engine, chinese)
+                if voice_id:
+                    engine.setProperty('voice', voice_id)
+                engine.save_to_file(part, path)
+                paths.append(path)
+
             engine.runAndWait()
 
-            # save_to_file 是异步落盘的，runAndWait 返回后文件可能还没写完
-            for _ in range(25):
-                if os.path.exists(path) and os.path.getsize(path) > 0:
-                    break
-                time.sleep(0.2)
-            else:
-                raise FileNotFoundError("语音文件未生成")
-
-            with wave.open(path, 'rb') as wav:
-                channels, width = wav.getnchannels(), wav.getsampwidth()
-                rate = wav.getframerate()
-                frames = wav.readframes(wav.getnframes())
-
-            if width != 2:
-                raise ValueError(f"不支持的采样宽度: {width * 8} bit")
-            if not frames:
-                raise ValueError("语音文件为空")
-
-            audio = np.frombuffer(frames, dtype=np.int16)
-            if channels > 1:
-                audio = audio.reshape(-1, channels).mean(axis=1)
-            audio = resample(audio, rate, TARGET_RATE)
-            audio = np.clip(audio, np.iinfo(np.int16).min,
-                            np.iinfo(np.int16).max).astype(np.int16)
+            gap = np.zeros(int(TARGET_RATE * LANGUAGE_GAP), dtype=np.int16)
+            pieces = []
+            for index, path in enumerate(paths):
+                if index:
+                    pieces.append(gap)      # 换语言之前留一口气
+                pieces.append(self._read_wav(path))
 
             # 结尾补 0.2 秒静音，免得最后一个音节被截掉
-            tail = np.zeros(int(TARGET_RATE * 0.2), dtype=np.int16)
-            pcm = np.concatenate([audio, tail]).tobytes()
-
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-            log.info(f"合成完成 {len(pcm) / (2.0 * TARGET_RATE):.1f} 秒")
+            pieces.append(np.zeros(int(TARGET_RATE * 0.2), dtype=np.int16))
+            pcm = np.concatenate(pieces).tobytes()
+            log.info("合成完成 %.1f 秒（%d 段：%s）",
+                     len(pcm) / (2.0 * TARGET_RATE), len(segments),
+                     "、".join("中文" if c else "英文" for c, _ in segments))
             return pcm
         except Exception as e:
             log.warning(f"语音合成失败: {e}")
             return None
+
+    def _read_wav(self, path):
+        """读回一段合成结果，重采样到 48kHz 单声道。出错就抛，由 _render 记账。"""
+        # save_to_file 是异步落盘的，runAndWait 返回后文件可能还没写完
+        for _ in range(25):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                break
+            time.sleep(0.2)
+        else:
+            raise FileNotFoundError(f"语音文件未生成: {path}")
+
+        with wave.open(path, 'rb') as wav:
+            channels, width = wav.getnchannels(), wav.getsampwidth()
+            rate = wav.getframerate()
+            frames = wav.readframes(wav.getnframes())
+
+        if width != 2:
+            raise ValueError(f"不支持的采样宽度: {width * 8} bit")
+        if not frames:
+            raise ValueError("语音文件为空")
+
+        audio = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1)
+        audio = resample(audio, rate, TARGET_RATE)
+        audio = np.clip(audio, np.iinfo(np.int16).min,
+                        np.iinfo(np.int16).max).astype(np.int16)
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return audio
 
     def cleanup(self):
         self._engine = None
