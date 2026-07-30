@@ -1,6 +1,6 @@
 """多语言的测试。
 
-    python -m unittest test_i18n -v      （在 controller 目录下运行）
+    python -m unittest test_i18n -v      （在 xpc 目录下运行）
 
 最要紧的一条是**每个键两种语言都得有**：只翻一半的话，用户看到的是中英混排，
 而这种缺失单看代码是发现不了的——界面上那句话照样显示，只是显示的是另一种
@@ -108,18 +108,16 @@ class NoHardcodedUiStringTest(unittest.TestCase):
         return bad
 
     def test_gui_has_no_hardcoded_chinese(self):
+        """主窗口、设置对话框和飞行计划对话框都在 gui.py 里。"""
         self.assertEqual(self.offenders("gui.py"), [])
 
-    def test_settings_dialog_has_no_hardcoded_chinese(self):
-        self.assertEqual(self.offenders("settings.py"), [])
-
     def test_voice_status_messages_are_translated(self):
-        """voice.py 的 _state 会直接进状态栏和登录页。"""
+        """voice.py 的 _status 消息会直接进消息区。"""
         self.assertEqual(self.offenders("voice.py"), [])
 
-    def test_radiostack_errors_are_translated(self):
-        """这些 ValueError 会原样显示在 InfoBar 里。"""
-        self.assertEqual(self.offenders("radiostack.py"), [])
+    def test_fsd_status_messages_are_translated(self):
+        """fsdpilot.py 同理，还包括本地先查一遍的呼号错误。"""
+        self.assertEqual(self.offenders("fsdpilot.py"), [])
 
 
 class LookupTest(unittest.TestCase):
@@ -132,19 +130,25 @@ class LookupTest(unittest.TestCase):
 
     def test_switching_changes_what_comes_out(self):
         i18n.set_language("zh")
-        chinese = i18n.t("main.settings")
+        chinese = i18n.t("settings.title")
         i18n.set_language("en")
-        english = i18n.t("main.settings")
+        english = i18n.t("settings.title")
         self.assertNotEqual(chinese, english)
         self.assertEqual(chinese, "设置")
         self.assertEqual(english, "Settings")
 
     def test_placeholders_are_filled(self):
         i18n.set_language("zh")
-        text = i18n.t("radio.last_rx", who="CES2345", stamp="12:00:00")
-        self.assertIn("CES2345", text)
-        self.assertIn("12:00:00", text)
+        text = i18n.t("fsd.connecting", callsign="CCA1501", server="fsd.example")
+        self.assertIn("CCA1501", text)
+        self.assertIn("fsd.example", text)
         self.assertNotIn("{", text)
+
+    def test_a_placeholder_named_key_does_not_collide(self):
+        """`t()` 的第一个形参也叫 key。位置限定参数（`/`）挡住了这次撞车——
+        没有它的话，任何带 {key} 的文案都会报 "multiple values for argument"。"""
+        text = i18n.t("ptt.keyboard", key="V")
+        self.assertIn("V", text)
 
     def test_an_unknown_key_returns_the_key(self):
         """返回键本身，界面上很扎眼——正好当成"这里漏翻了"的信号。"""
@@ -152,13 +156,13 @@ class LookupTest(unittest.TestCase):
 
     def test_a_missing_placeholder_does_not_crash(self):
         # 调用方漏传参数时，宁可显示带 {} 的原文，也不能让界面炸掉
-        text = i18n.t("radio.last_rx", who="CES2345")
+        text = i18n.t("fsd.connecting", callsign="CCA1501")
         self.assertIsInstance(text, str)
 
     def test_an_unknown_language_falls_back(self):
         i18n.set_language("kl")            # 克林贡语
         self.assertEqual(i18n.current(), i18n.DEFAULT)
-        self.assertEqual(i18n.t("main.settings"), "设置")
+        self.assertEqual(i18n.t("settings.title"), "设置")
 
     def test_empty_language_falls_back(self):
         i18n.set_language("")
@@ -200,6 +204,62 @@ class SystemLanguageTest(unittest.TestCase):
 
     def test_it_always_returns_something_supported(self):
         self.assertIn(i18n.system_language(), i18n.LANGUAGES)
+
+
+class BindingLabelTest(unittest.TestCase):
+    """一条 PTT 绑定在界面上的说法。
+
+    ptt.py 在三个客户端之间逐字节共享，所以它只给键名（"V" / "X1" / "3"），
+    说法在 i18n 这边拼。让它自己产出中文的话，同一套文案会躺在三份副本里，
+    翻译时必然漏掉其中两份。
+    """
+
+    def setUp(self):
+        self._saved = i18n.current()
+        i18n.set_language("zh")
+
+    def tearDown(self):
+        i18n.set_language(self._saved)
+
+    def test_each_kind_reads_differently(self):
+        import ptt
+        labels = {
+            "keyboard": i18n.binding_label(ptt.keyboard_binding("v")),
+            "mouse": i18n.binding_label(ptt.Binding(ptt.MOUSE, button="x1")),
+            "joystick": i18n.binding_label(ptt.Binding(ptt.JOYSTICK, button=3)),
+        }
+        self.assertEqual(len(set(labels.values())), 3, labels)
+        for text in labels.values():
+            self.assertNotIn("{", text)
+
+    def test_a_named_device_is_shown(self):
+        import ptt
+        binding = ptt.Binding(ptt.JOYSTICK, button=3, device_name="Saitek X52")
+        self.assertIn("Saitek X52", i18n.binding_label(binding))
+
+    def test_ptt_module_carries_no_ui_text(self):
+        """ptt.py 里的字符串字面量不该有中文（注释和文档字符串不算）。"""
+        import ast
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "ptt.py"), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        chinese = re.compile(r"[一-鿿]")
+        # 文档字符串是 Expr 包着的 Constant，而 ast.walk 会连它里面的 Constant
+        # 一起走到，所以得先把这些节点记下来再跳过——只在 Expr 那一层 continue
+        # 是拦不住的。
+        docstrings = {id(node.value) for node in ast.walk(tree)
+                      if isinstance(node, ast.Expr)
+                      and isinstance(node.value, ast.Constant)}
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if id(node) in docstrings:
+                    continue
+                if chinese.search(node.value):
+                    offenders.append(node.value[:40])
+        self.assertEqual(offenders, [],
+                         f"ptt.py 里有中文字面量，应该交给 i18n: {offenders}")
 
 
 if __name__ == "__main__":

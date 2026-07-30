@@ -2,13 +2,17 @@ import logging
 import json
 import os
 
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                             QPushButton, QLineEdit, QCheckBox, QComboBox)
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
+from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon,
+                            LineEdit, PrimaryPushButton, PushButton)
 
 import applog
 import datafeed
+import i18n
 import netconfig
+import theme
 import weather
+from i18n import t
 
 log = logging.getLogger("settings")
 
@@ -66,6 +70,10 @@ class Settings:
         self.compact = False
         # 窗口置顶。和精简是一对，同样要记住
         self.always_on_top = False
+        # 界面语言。空字符串表示"还没选过"，第一次启动跟系统走。
+        # 注意这是**操作界面**的语言，和每个席位的 voice_language（通播稿播出去
+        # 用哪种语言）没有关系——英文界面的操作者照样可能在管一份中文通播。
+        self.language = ""
         self.debug = False
         self.load_settings()
 
@@ -95,6 +103,7 @@ class Settings:
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
                 self.compact = bool(data.get("compact", False))
                 self.always_on_top = bool(data.get("always_on_top", False))
+                self.language = data.get("language", "") or ""
                 self.debug = bool(data.get("debug", False))
         except Exception as e:
             log.warning(f"could not load the settings: {e}")
@@ -116,106 +125,136 @@ class Settings:
                     "metar_refresh": self.metar_refresh,
                     "compact": self.compact,
                     "always_on_top": self.always_on_top,
+                    "language": self.language,
                     "debug": self.debug,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.warning(f"could not save the settings: {e}")
 
 
+def _find_data(combo, value):
+    """qfluentwidgets 的 ComboBox 没有 findData()。"""
+    for i in range(combo.count()):
+        if combo.itemData(i) == value:
+            return i
+    return -1
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("设置")
+        self.setWindowTitle(t("settings.title"))
+        # QDialog 不吃 Fluent 主题，不铺底色的话，深色界面上会弹出一个纯白的框
+        self.setStyleSheet(theme.dialog_qss())
         self.setMinimumWidth(460)
         self.setup_ui()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
-        self.connect_fsd = QCheckBox("播出时同时登录 FSD"
-                                     "（席位出现在在线列表，并回答文字通播查询）")
+        self.connect_fsd = CheckBox(t("settings.connect_fsd")
+                                    + t("settings.connect_fsd_note"))
         self.connect_fsd.setChecked(self.settings.connect_fsd)
         layout.addWidget(self.connect_fsd)
 
         fsd_row = QHBoxLayout()
-        self.fsd_host_input = QLineEdit(self.settings.fsd_host)
-        self.fsd_port_input = QLineEdit(str(self.settings.fsd_port))
+        self.fsd_host_input = LineEdit()
+        self.fsd_host_input.setText(self.settings.fsd_host)
+        self.fsd_port_input = LineEdit()
+        self.fsd_port_input.setText(str(self.settings.fsd_port))
         self.fsd_port_input.setFixedWidth(70)
-        fsd_row.addWidget(QLabel("FSD 服务器:"))
+        fsd_row.addWidget(BodyLabel(t("settings.fsd_host")))
         fsd_row.addWidget(self.fsd_host_input)
-        fsd_row.addWidget(QLabel("端口:"))
+        fsd_row.addWidget(BodyLabel(t("settings.fsd_port")))
         fsd_row.addWidget(self.fsd_port_input)
         layout.addLayout(fsd_row)
 
         refresh_row = QHBoxLayout()
-        self.refresh_input = QComboBox()
-        for seconds, label in ((60, "1 分钟"), (120, "2 分钟"), (300, "5 分钟"),
-                               (600, "10 分钟"), (900, "15 分钟"),
-                               (1800, "30 分钟"), (3600, "1 小时")):
-            self.refresh_input.addItem(label, seconds)
-        index = self.refresh_input.findData(
-            clamp_refresh(getattr(self.settings, "metar_refresh",
-                                  DEFAULT_METAR_REFRESH)))
+        self.refresh_input = ComboBox()
+        for seconds, key in ((60, "refresh.1m"), (120, "refresh.2m"),
+                             (300, "refresh.5m"), (600, "refresh.10m"),
+                             (900, "refresh.15m"), (1800, "refresh.30m"),
+                             (3600, "refresh.60m")):
+            self.refresh_input.addItem(t(key), userData=seconds)
+        index = _find_data(self.refresh_input,
+                           clamp_refresh(getattr(self.settings, "metar_refresh",
+                                                 DEFAULT_METAR_REFRESH)))
         self.refresh_input.setCurrentIndex(index if index >= 0 else 2)
-        refresh_row.addWidget(QLabel("天气自动刷新:"))
+        refresh_row.addWidget(BodyLabel(t("settings.refresh")))
         refresh_row.addWidget(self.refresh_input)
-        refresh_row.addWidget(QLabel("（报文变化时自动推进情报字母并换稿）"))
+        refresh_row.addWidget(CaptionLabel(t("settings.refresh_hint")))
         refresh_row.addStretch()
         layout.addLayout(refresh_row)
 
         rating_row = QHBoxLayout()
-        self.rating_input = QComboBox()
-        for value, label in ((0, "自动（按 CID 从数据源获取）"),
-                             (1, "OBS 观察员"), (2, "S1"), (3, "S2"), (4, "S3"),
+        self.rating_input = ComboBox()
+        # 等级名（S1/C1/I3 …）是 FSD 的术语，两种语言里都是这么写的，不进 i18n
+        for value, label in ((0, t("rating.auto")), (1, t("rating.obs")),
+                             (2, "S1"), (3, "S2"), (4, "S3"),
                              (5, "C1"), (7, "C3"), (8, "I1"), (10, "I3")):
             self.rating_input.addItem(label if value == 0 else f"{value}  {label}",
-                                      value)
-        index = self.rating_input.findData(self.settings.rating)
+                                      userData=value)
+        index = _find_data(self.rating_input, self.settings.rating)
         self.rating_input.setCurrentIndex(index if index >= 0 else 0)
-        rating_row.addWidget(QLabel("登录等级:"))
+        rating_row.addWidget(BodyLabel(t("settings.rating")))
         rating_row.addWidget(self.rating_input)
-        rating_row.addWidget(QLabel("（不能高于本人实际等级）"))
+        rating_row.addWidget(CaptionLabel(t("settings.rating_hint")))
         layout.addLayout(rating_row)
 
         name_row = QHBoxLayout()
-        self.real_name_input = QLineEdit(self.settings.real_name)
-        self.real_name_input.setPlaceholderText("登录 FSD 时显示的姓名")
-        name_row.addWidget(QLabel("真实姓名:"))
+        self.real_name_input = LineEdit()
+        self.real_name_input.setText(self.settings.real_name)
+        self.real_name_input.setPlaceholderText(t("settings.real_name_hint"))
+        name_row.addWidget(BodyLabel(t("settings.real_name")))
         name_row.addWidget(self.real_name_input)
         layout.addLayout(name_row)
 
         row = QHBoxLayout()
-        self.metar_input = QLineEdit(self.settings.metar_url)
+        self.metar_input = LineEdit()
+        self.metar_input.setText(self.settings.metar_url)
         self.metar_input.setPlaceholderText(weather.DEFAULT_METAR_URL)
-        row.addWidget(QLabel("备用气象源:"))
+        row.addWidget(BodyLabel(t("settings.weather_source")))
         row.addWidget(self.metar_input)
         layout.addLayout(row)
 
-        hint = QLabel("登录 FSD 之后天气直接向自己的服务器要（$AX）；这个地址只在"
-                      "还没连上 FSD 时用来预览，机场代码会直接拼在后面。")
+        hint = CaptionLabel(t("settings.weather_hint"))
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #777777;")
+        hint.setStyleSheet(f"color: {theme.IDLE_COLOR};")
         layout.addWidget(hint)
+
+        language_row = QHBoxLayout()
+        self.language_input = ComboBox()
+        for code, name in i18n.available().items():
+            self.language_input.addItem(name, userData=code)
+        index = _find_data(self.language_input, i18n.current())
+        if index >= 0:
+            self.language_input.setCurrentIndex(index)
+        language_row.addWidget(BodyLabel(t("settings.language")))
+        language_row.addWidget(self.language_input)
+        language_row.addStretch()
+        layout.addLayout(language_row)
 
         # 日志：出问题时让用户能一键找到文件，而不是去解释路径
         log_row = QHBoxLayout()
-        self.debug_checkbox = QCheckBox("记录调试信息（重启后生效）")
+        self.debug_checkbox = CheckBox(t("settings.debug"))
         self.debug_checkbox.setChecked(self.settings.debug)
-        self.debug_checkbox.setToolTip("打开后连 FSD 收发的每个包都会记下来")
-        open_log = QPushButton("打开日志")
+        self.debug_checkbox.setToolTip(t("settings.debug_tip"))
+        open_log = PushButton(FluentIcon.FOLDER, t("settings.open_log"))
         open_log.clicked.connect(lambda: applog.open_log_folder())
         log_row.addWidget(self.debug_checkbox)
+        log_row.addStretch()
         log_row.addWidget(open_log)
         layout.addLayout(log_row)
 
         buttons = QHBoxLayout()
-        save = QPushButton("保存")
+        save = PrimaryPushButton(t("common.save"))
         save.clicked.connect(self.save_and_close)
-        cancel = QPushButton("取消")
+        cancel = PushButton(t("common.cancel"))
         cancel.clicked.connect(self.reject)
-        buttons.addWidget(save)
+        buttons.addStretch()
         buttons.addWidget(cancel)
+        buttons.addWidget(save)
         layout.addLayout(buttons)
 
     def save_and_close(self):
@@ -232,5 +271,7 @@ class SettingsDialog(QDialog):
         self.settings.real_name = self.real_name_input.text().strip()
         self.settings.rating = self.rating_input.currentData()
         self.settings.debug = self.debug_checkbox.isChecked()
+        self.settings.language = self.language_input.currentData()
+        i18n.set_language(self.settings.language)
         self.settings.save_settings()
         self.accept()

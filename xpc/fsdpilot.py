@@ -25,6 +25,10 @@ import socket
 import threading
 import time
 
+# _status() 的消息会直接进消息区，是界面文字，所以要过 i18n。日志那一半仍然
+# 是英文——分界线在"这句话最后到哪儿去"，不在它写在哪个模块里。
+from i18n import t
+
 log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
@@ -106,10 +110,10 @@ def callsign_problem(callsign):
     """呼号不合服务端规矩时返回说明。规则来自 can-fsd 的 IsValidCallsign。"""
     callsign = (callsign or "").strip().upper()
     if not 2 <= len(callsign) <= MAX_CALLSIGN_LENGTH:
-        return (f"呼号 {callsign} 有 {len(callsign)} 个字符，"
-                f"服务端只接受 2-{MAX_CALLSIGN_LENGTH} 个")
+        return t("callsign.length", callsign=callsign, count=len(callsign),
+                 limit=MAX_CALLSIGN_LENGTH)
     if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in callsign):
-        return f"呼号 {callsign} 含有服务端不接受的字符（只能是字母、数字、_ 和 -）"
+        return t("callsign.charset", callsign=callsign)
     return None
 
 
@@ -303,7 +307,7 @@ class FSDPilot:
             log.debug("→ %s", self._redact(packet))
             return True
         except Exception as e:
-            self._status('error', f"发送失败: {e}")
+            self._status('error', t("fsd.send_failed", error=e))
             return False
 
     def _run(self):
@@ -330,7 +334,7 @@ class FSDPilot:
                     self._retryable = True
                     self._loop()
             except Exception as e:
-                self._status('error', f"FSD 连接异常: {e}")
+                self._status('error', t("fsd.exception", error=e))
             finally:
                 self._close()
 
@@ -344,11 +348,12 @@ class FSDPilot:
                 self.gave_up = True
                 self._retryable = False
                 self._status('offline',
-                             f"与 FSD 断开后重连 {self.reconnect_limit} 次都没成功，已下线")
+                             t("fsd.give_up", limit=self.reconnect_limit))
                 return
 
             self._status('reconnecting',
-                         f"与 FSD 的连接断开，正在重连（{attempts}/{self.reconnect_limit}）")
+                         t("fsd.reconnecting", attempt=attempts,
+                           limit=self.reconnect_limit))
             if self.stop_event.wait(RECONNECT_DELAY):
                 return
 
@@ -358,12 +363,14 @@ class FSDPilot:
             self._status('error', problem)
             return False
 
-        self._status('connecting', f"正在以 {self.callsign} 登录 {self.host} …")
+        self._status('connecting',
+                     t("fsd.connecting", callsign=self.callsign, server=self.host))
         try:
             self._sock = socket.create_connection((self.host, self.port), timeout=10)
             self._sock.settimeout(1.0)
         except Exception as e:
-            self._status('error', f"无法连接 FSD 服务器 {self.host}:{self.port}（{e}）")
+            self._status('error', t("fsd.connect_failed", host=self.host,
+                                            port=self.port, error=e))
             return False
 
         greeting = self._read_packet(timeout=5)
@@ -385,12 +392,12 @@ class FSDPilot:
             if packet is None:
                 continue
             if packet == "":
-                self._status('error', "FSD 服务器关闭了连接")
+                self._status('error', t("fsd.closed"))
                 return False
             if self._handle_packet(packet) is False:
                 return False
             if self._logged_in:
-                self._status('online', f"已作为 {self.callsign} 上线")
+                self._status('online', t("fsd.online", callsign=self.callsign))
                 # 这里曾经发过 $CQ…:SERVER:ATC 想要一份在线管制列表。那是误解：
                 # can-fsd 的 handleQueryATC 是问"某个指定呼号是不是在线管制"，
                 # 第 3 段必须带目标呼号，不带就回 "Missing callsign"（真实日志
@@ -398,7 +405,7 @@ class FSDPilot:
                 # 主动广播过来的，_note_controller 已经在收了。
                 return True
 
-        self._status('error', "FSD 登录超时，未收到服务器回应")
+        self._status('error', t("fsd.login_timeout"))
         return False
 
     def _loop(self):
@@ -406,7 +413,7 @@ class FSDPilot:
         while self.running and not self.stop_event.is_set():
             packet = self._read_packet(timeout=0.2)
             if packet == "":
-                self._status('error', "与 FSD 服务器的连接已断开")
+                self._status('error', t("fsd.dropped"))
                 return
             if packet and self._handle_packet(packet) is False:
                 return
@@ -471,7 +478,7 @@ class FSDPilot:
             code = fields[2] if len(fields) > 2 else "?"
             message = fields[4] if len(fields) > 4 else packet
             if not self._logged_in:
-                self._status('error', f"FSD 拒绝登录（{code}）: {message}")
+                self._status('error', t("fsd.rejected", code=code, message=message))
                 return False
             log.warning("the server returned an error (%s): %s", code, message)
             return True
@@ -643,4 +650,4 @@ class FSDPilot:
                 pass
             self._sock = None
         self._logged_in = False
-        self._status('stopped', "已从 FSD 下线")
+        self._status('stopped', t("fsd.stopped"))

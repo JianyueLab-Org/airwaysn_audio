@@ -161,6 +161,18 @@ jobs:
         # 必须在组件目录里跑：spec 里 favicon.ico、opus.dll 都是相对路径
         run: pyinstaller gui.spec --noconfirm --clean
 
+      - name: 把 X-Plane 插件放到包的顶层
+        if: matrix.component == 'xpc'
+        working-directory: ${{ matrix.component }}
+        shell: pwsh
+        # 插件本来就随包分发（gui.spec 的 datas），但它落在 _internal/plugin/ 下，
+        # 那是 PyInstaller 的运行时目录，正常用户不会去翻，README 也不好指。
+        # 客户端设置里能一键装，这一份是给装不成的人手工拷的——权限不够、
+        # 绿色版探测不到目录、或者 X-Plane 装在另一台机器上。
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.output }}/plugin" | Out-Null
+          Copy-Item "plugin/PI_XpcTraffic.py" "dist/${{ matrix.output }}/plugin/"
+
       - name: 验原生库和版本号
         working-directory: ${{ matrix.component }}
         shell: pwsh
@@ -175,6 +187,18 @@ jobs:
           if ("${{ matrix.component }}" -eq "msfs" -and
               -not (Test-Path "$root/SimConnect/SimConnect.dll")) {
             $missing += "SimConnect/SimConnect.dll"
+          }
+          if ("${{ matrix.component }}" -eq "xpc") {
+            # _internal 里那份是设置里"安装插件"按钮真正拷过去的源文件
+            # （xpinstall.bundled_plugin() 走 sys._MEIPASS）。漏了的话程序照常
+            # 启动，只是一点安装就报"随包的插件不见了"。
+            if (-not (Test-Path "$root/plugin/PI_XpcTraffic.py")) {
+              $missing += "_internal/plugin/PI_XpcTraffic.py"
+            }
+            # 顶层那份是给手工安装用的
+            if (-not (Test-Path "dist/${{ matrix.output }}/plugin/PI_XpcTraffic.py")) {
+              $missing += "plugin/PI_XpcTraffic.py"
+            }
           }
           if ($missing.Count) { throw "包里缺这些运行时必需的文件: $($missing -join ', ')" }
 
@@ -240,6 +264,20 @@ jobs:
             解压后运行目录里的 exe。**不要**去 `build/` 里找同名的那个——
             那只是引导程序，缺 `_internal/` 里的运行库，双击会报
             "Failed to load Python DLL"。
+
+            ### X-Plane 的他机插件
+
+            `xpc-for-can` 包里带了 `plugin/PI_XpcTraffic.py`。**一般不用管它**
+            ——在客户端的 设置 → 他机 里点「安装插件」就行，它会自己找到
+            X-Plane 目录并拷过去，之后重启 X-Plane 生效。
+
+            那一份是留给自动安装不成的情况的（X-Plane 装在需要管理员权限的
+            位置、绿色版探测不到目录），手工拷到
+
+                <X-Plane>/Resources/plugins/PythonPlugins/PI_XpcTraffic.py
+
+            插件要先装 XPPython3 才会被加载，**版本取决于模拟器**：X-Plane 12
+            用 v4.x，X-Plane 11.52 用 v3.1.5（v4 是拿 SDK 420 编的，不兼容 XP11）。
 
             早期的纯语音飞行员端（`client` / `xplane_client`）不再出包，
             功能已并入 `xpc-for-can` 和 `msfs-for-can`。

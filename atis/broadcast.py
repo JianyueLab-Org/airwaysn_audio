@@ -30,6 +30,7 @@ from pymumble_py3.constants import (
 )
 
 import mumblecompat
+from i18n import t
 
 # pymumble 用的 ssl.wrap_socket 在 Python 3.12 里已被删除，导入时先补上，
 # 否则连接线程一起来就抛 AttributeError
@@ -40,16 +41,10 @@ log = logging.getLogger("atis")
 # Mumble 服务器拒绝时给的类型，逐条翻译成人能看懂的原因。
 # 全都笼统说成"用户名或密码"会把人引到错误的方向——比如认证器挂了的时候，
 # 用户会一直去改密码。
-REJECT_REASONS = {
-    "WrongUserPW": "密码错误",
-    "WrongServerPW": "服务器密码错误",
-    "InvalidUsername": "用户名不符合服务器的规则",
-    "UsernameInUse": "这个用户名已经在线了",
-    "ServerFull": "服务器已满",
-    "NoCertificate": "服务器要求证书",
-    "AuthenticatorFail": "服务端认证器故障（服务器上的 login.py 可能没在运行）",
-    "WrongVersion": "客户端版本不被服务器接受",
-}
+# 服务器 Reject 的类型。文案在 i18n 里，这里只留一张"认得的类型"清单——
+# 写成 kind → 文案的字典的话，文案会在模块导入时定死，用户之后切语言不会跟着变。
+REJECT_TYPES = ("WrongUserPW", "WrongServerPW", "InvalidUsername", "UsernameInUse",
+                "ServerFull", "NoCertificate", "AuthenticatorFail", "WrongVersion")
 
 class RejectAwareMumble(pymumble.Mumble):
     """截下服务器的 Reject 消息，把拒绝类型留下来。
@@ -101,9 +96,10 @@ class RejectAwareMumble(pymumble.Mumble):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
         if not self.reject_type and not self.reject_reason:
             return None
-        reason = REJECT_REASONS.get(self.reject_type)
+        reason = (t("reject." + self.reject_type)
+                  if self.reject_type in REJECT_TYPES else None)
         if reason and self.reject_reason:
-            return f"{reason}（服务器附言：{self.reject_reason}）"
+            return t("reject.with_note", reason=reason, note=self.reject_reason)
         if reason:
             return reason
         if self.reject_reason:
@@ -414,9 +410,9 @@ class Synthesizer:
             frames = wav.readframes(wav.getnframes())
 
         if width != 2:
-            raise ValueError(f"不支持的采样宽度: {width * 8} bit")
+            raise ValueError(t("voice.bad_width", bits=width * 8))
         if not frames:
-            raise ValueError("语音文件为空")
+            raise ValueError(t("voice.empty_audio"))
 
         audio = np.frombuffer(frames, dtype=np.int16)
         if channels > 1:
@@ -515,7 +511,7 @@ class Broadcaster:
                 return
             self._loop()
         except Exception as e:
-            self._state('error', f"播报异常: {e}")
+            self._state('error', t("voice.round_failed", error=e))
         finally:
             self._disconnect()
 
@@ -530,7 +526,7 @@ class Broadcaster:
     def _on_reconnect_attempt(self, attempt, limit):
         """每发起一次重连报一次，界面上能看到"重连中 1/3"。"""
         self._state('reconnecting',
-                    f"语音掉线，正在重连（{attempt}/{limit}）")
+                    t("voice.reconnecting", attempt=attempt, limit=limit))
 
     def _on_give_up(self):
         """重连次数用尽：这个席位停播。
@@ -544,8 +540,8 @@ class Broadcaster:
         """
         self.gave_up = True
         self._state('offline',
-                    f"语音掉线后重连 {self.reconnect_limit} 次都没成功，"
-                    f"{self.station.callsign} 已停播")
+                    t("voice.give_up", limit=self.reconnect_limit,
+                      callsign=self.station.callsign))
         self.stop_event.set()
 
     def _on_sound(self, user, soundchunk):
@@ -562,7 +558,7 @@ class Broadcaster:
             self._last_other_sound = time.time()
 
     def _connect(self):
-        self._state('connecting', f"正在以 {self.user} 连接 {self.server} …")
+        self._state('connecting', t("voice.connecting", user=self.user, server=self.server))
         try:
             # reconnect=True 仍然要，掉线自己连回来是对的；上限由
             # BoundedReconnect 管，用尽了这个席位就停播。
@@ -579,7 +575,7 @@ class Broadcaster:
                                                self._on_permission_denied)
             self.mumble.start()
         except Exception as e:
-            self._state('error', f"连接失败: {e}")
+            self._state('error', t("voice.connect_failed", error=e))
             return False
 
         deadline = time.time() + CONNECT_TIMEOUT
@@ -591,16 +587,16 @@ class Broadcaster:
                 # 后者以前会被一律说成"服务器拒绝"，把人往密码上引。
                 reason = self.mumble.rejection()
                 self._state('error',
-                            f"语音服务器拒绝了 {self.user}：{reason}" if reason else
-                            f"到 {self.server} 的连接意外中断，"
-                            f"服务器没有说明原因（详见日志）")
+                            t("voice.rejected", user=self.user, reason=reason) if reason
+                            else t("voice.rejected_plain", server=self.server))
                 return False
             time.sleep(0.1)
 
         if not self._connected:
             reason = self.mumble.rejection()
-            self._state('error', f"连接 {self.server} 超时" +
-                        (f"：{reason}" if reason else "，服务器没有响应"))
+            self._state('error',
+                        t("voice.timeout_reason", server=self.server, reason=reason)
+                        if reason else t("voice.timeout", server=self.server))
             return False
 
         return self._join_channel()
@@ -663,11 +659,11 @@ class Broadcaster:
                 # 而前者再等多久也不会有。
                 if self._denial:
                     self._state('error',
-                                f"服务器不允许建立频道 {name}：{self._denial}")
+                                t("voice.channel_denied", name=name, reason=self._denial))
                 else:
                     self._state('error',
-                                f"建立频道 {name} 后 {CHANNEL_TIMEOUT:.0f} 秒内"
-                                f"没有出现，服务器没有说明原因")
+                                t("voice.channel_timeout", name=name,
+                                  seconds=CHANNEL_TIMEOUT))
                 return False
 
             channel_id = channel["channel_id"]
@@ -676,13 +672,13 @@ class Broadcaster:
                 self._move_in(channel_id)
                 if not self._wait_until_in(channel_id):
                     self._state('error',
-                                f"发出了进入频道 {name} 的请求，但 "
-                                f"{CHANNEL_TIMEOUT:.0f} 秒内没有生效")
+                                t("voice.move_timeout", name=name,
+                                  seconds=CHANNEL_TIMEOUT))
                     return False
-            self._state('online', f"已在 {self.station.frequency} 播出")
+            self._state('online', t("voice.online", frequency=self.station.frequency))
             return True
         except Exception as e:
-            self._state('error', f"进入频道失败: {e}")
+            self._state('error', t("voice.join_failed", error=e))
             return False
 
     def _in_expected_channel(self):
@@ -738,15 +734,11 @@ class Broadcaster:
         # 不要叫 messages：模块顶上 `from pymumble_py3 import messages` 是发
         # CreateChannel / MoveCmd 用的，在这里被局部变量盖住，以后谁在这个函数
         # 里加一句发命令就会莫名其妙地炸
-        reasons = {
-            "Permission": "没有权限（建立频率频道需要根频道的 MakeTempChannel 权限）",
-            "ChannelName": "频道名不合服务器的规矩",
-            "NestingLimit": "频道层级超过了服务器上限",
-            "ChannelCountLimit": "服务器上的频道数已达上限",
-        }
-        self._denial = reasons.get(kind, f"服务器拒绝了操作: {kind}")
+        known = ("Permission", "ChannelName", "NestingLimit", "ChannelCountLimit")
+        self._denial = (t("denied." + kind) if kind in known
+                        else t("denied.other", kind=kind))
         if getattr(event, "reason", ""):
-            self._denial += f"（{event.reason}）"
+            self._denial = t("denied.with_note", reason=self._denial, note=event.reason)
         log.warning("%s: %s", self.station.callsign, self._denial)
 
     def _disconnect(self):
@@ -769,7 +761,7 @@ class Broadcaster:
             if self._channel_is_quiet():
                 return True
             if not announced:
-                self._state('online', "频率上有通话，等待中…")
+                self._state('online', t("voice.waiting"))
                 announced = True
             if self.stop_event.wait(0.2) or time.time() > deadline:
                 return False
@@ -780,7 +772,7 @@ class Broadcaster:
         position, total = 0, len(pcm)
         while position < total and self.running and not self.stop_event.is_set():
             if not self._channel_is_quiet():
-                self._state('online', "有人讲话，中止本轮播报")
+                self._state('online', t("voice.interrupted"))
                 return False
             try:
                 buffered = self.mumble.sound_output.get_buffer_size()
@@ -797,7 +789,7 @@ class Broadcaster:
             try:
                 self.mumble.sound_output.add_sound(chunk)
             except Exception as e:
-                self._state('error', f"发送音频失败: {e}")
+                self._state('error', t("voice.send_failed", error=e))
                 return False
             position += FRAME_BYTES
 
@@ -819,12 +811,12 @@ class Broadcaster:
                 if self._pending_text is not None:
                     self._voice_text = self._pending_text
                     self._pending_text = None
-                    self._state('online', "已换用新的通播稿")
+                    self._state('online', t("voice.script_swapped"))
                 text = self._voice_text
 
             pcm = self._synth.synthesize(text)
             if pcm is None:
-                self._state('error', "语音合成失败，请检查系统 TTS 语音")
+                self._state('error', t("voice.tts_failed"))
                 return
 
             # 每一轮开播前都对着服务器确认一次，别信自己记的
@@ -838,7 +830,7 @@ class Broadcaster:
 
             if not self._wait_for_quiet():
                 break
-            self._state('online', f"正在播报 {self.station.letter}")
+            self._state('online', t("voice.speaking", letter=self.station.letter))
             spoken = self._transmit(pcm)
 
             if not self.running or self.stop_event.is_set():
@@ -849,4 +841,4 @@ class Broadcaster:
         # 重连用尽那条已经报过 offline 了，再报一句"通播已停止"会把原因盖掉，
         # 界面上就只剩一个没有解释的停止。
         if not self.gave_up:
-            self._state('stopped', "通播已停止")
+            self._state('stopped', t("voice.stopped"))

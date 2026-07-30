@@ -550,12 +550,31 @@ def main():
           if len(window.rows) != 1 else None)
 
     from settings import SettingsDialog
+    import ptt
     dialog = SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: dialog)
-    check("PTT 按键字段", lambda: dialog.ptt_input.text())
+    check("PTT 绑定列表", lambda: dialog.ptt_list.bindings)
+
+    def a_binding_can_be_added_and_removed():
+        """录制那条路要真的走一遍：它是唯一能加绑定的入口。"""
+        added = ptt.Binding(ptt.MOUSE, button="x2")
+        before = len(dialog.ptt_list.bindings)
+        dialog.ptt_list.on_captured(added)      # 模拟录到了鼠标侧键
+        assert dialog.ptt_list.bindings[-1] == added, "绑定没加进去"
+        dialog.ptt_list.on_captured(added)      # 重复的一条不该再加一遍
+        assert len(dialog.ptt_list.bindings) == before + 1, "重复绑定被加了两次"
+        dialog.ptt_list.remove(added)
+        assert added not in dialog.ptt_list.bindings, "绑定没移除掉"
+    check("加/删一条 PTT 绑定", a_binding_can_be_added_and_removed)
+
+    def an_empty_list_still_builds():
+        """一条绑定都没有时也得能画出来——这时界面上是一句"PTT 用不了"。"""
+        dialog.ptt_list.bindings = []
+        dialog.ptt_list.rebuild()
+    check("绑定清空后仍能重画", an_empty_list_still_builds)
 
     window.remove_radio(121700)
-    window.ptt_listener.stop()
+    window.ptt_watcher.stop()
 
     print()
     if failures:

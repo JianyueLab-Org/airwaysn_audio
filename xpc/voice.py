@@ -15,6 +15,7 @@ import threading
 import time
 
 import mumblecompat
+from i18n import t
 
 # pymumble 建 TLS 用的 ssl.wrap_socket 在 Python 3.12 里已被删除。它自己那个
 # except AttributeError 的兜底又调回同一个函数，异常从 pymumble 的线程里抛出
@@ -315,13 +316,13 @@ class Voice:
         if self.running:
             return
         self.running = True
-        self._status('connecting', f"正在连接语音服务器 {self.host} …")
+        self._status('connecting', t("voice.connecting", server=self.host))
         try:
             self._open_audio()
         except Exception as e:
             self.running = False
             self._release()
-            self._status('error', f"打不开音频设备: {e}")
+            self._status('error', t("voice.audio_failed", error=e))
             return
 
         try:
@@ -414,7 +415,7 @@ class Voice:
         except Exception as e:
             self.running = False
             self._release()
-            self._status('error', f"语音服务器连接失败: {e}")
+            self._status('error', t("voice.connect_failed", error=e))
             return
 
         # is_ready() 返回不代表连上了：服务器拒绝时 pymumble 的连接线程会带着
@@ -423,16 +424,16 @@ class Voice:
         # "语音已连接"，然后一切都莫名其妙地不工作。
         if not self.connected:
             self.running = False
-            reason = self._reject_reason or "用户名或密码不对？"
+            reason = self._reject_reason or t("voice.rejected_guess")
             self._release()
-            self._status('error', f"语音服务器拒绝了 {self.username}（{reason}）")
+            self._status('error', t("voice.rejected", username=self.username, reason=reason))
             return
 
         # 连上那一刻的现场快照。切频道紧接着就发生（日志里两条常在同一秒），
         # 所以这一刻哪些东西还没就绪，直接决定了后面切不切得过去。
         self._snapshot("刚连上")
 
-        self._status('online', f"语音已连接（{self.username}）")
+        self._status('online', t("voice.online", username=self.username))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self._channel_thread = threading.Thread(target=self._channel_loop,
@@ -545,13 +546,19 @@ class Voice:
                 pass
             self.mumble = None
 
-    def stop(self, state='stopped', message="语音已断开"):
+    def stop(self, state='stopped', message=None):
         """收掉整条连接。
 
         `state`/`message` 只为了区分"用户点的断开"和"重连次数用尽自己下线的"
         （`_give_up()` 传 offline）——界面对后者要连 FSD 一起收，不能只把语音
         那一行标红。
+
+        `message` 默认是 None 而不是那句"语音已断开"：默认参数在**导入时**就求值
+        了，写成 `message=t("voice.stopped")` 的话，用户之后切到英文，这一句仍然
+        是当初那门语言。所有默认文案都得这样往后推到调用时。
         """
+        if message is None:
+            message = t("voice.stopped")
         self.running = False
 
         # 先收线程再动 PyAudio。反过来的话发送线程可能正卡在 stream.read()
@@ -822,17 +829,14 @@ class Voice:
             kind = self.mumble.denial_type(event.type)
         except Exception:
             kind = str(getattr(event, "type", "?"))
-        reasons = {
-            "Permission": "没有权限（建频率频道要根频道的 MakeTempChannel，"
-                          "进频道要 Enter）",
-            "ChannelName": "频道名不合服务器的规矩",
-            "NestingLimit": "频道层级超过了服务器上限",
-            "ChannelCountLimit": "服务器上的频道数已达上限",
-            "UserListenerLimit": "服务器限制了每个用户能监听的频道数",
-        }
-        reason = reasons.get(kind, f"服务器拒绝了操作: {kind}")
+        # 拒绝类型直接当 i18n 的键用。这里**不能**建一张 kind → 文案的字典：
+        # 字典在模块导入时就把文案定死了，之后切语言不会跟着变。
+        known = ("Permission", "ChannelName", "NestingLimit",
+                 "ChannelCountLimit", "UserListenerLimit")
+        reason = (t("denied." + kind) if kind in known
+                  else t("denied.other", kind=kind))
         if getattr(event, "reason", ""):
-            reason += f"（{event.reason}）"
+            reason = t("denied.with_note", reason=reason, note=event.reason)
         # 走已有的"卡住原因"这条路，界面和日志都已经在看它了
         self._note_stuck(reason)
         self._status("denied", reason)
@@ -853,7 +857,7 @@ class Voice:
             # 码倒推。自己跑就能把服务器的原话带给用户。
             gave_up = getattr(self.mumble, "gave_up", False)
             if not gave_up:
-                self._reject_reason = str(e) or "服务器拒绝了连接"
+                self._reject_reason = str(e) or t("voice.rejected_plain")
                 log.warning("the server rejected the connection: %s", e)
         except Exception as e:
             log.warning("the Mumble main loop exited with an exception: %s", e)
@@ -878,11 +882,12 @@ class Voice:
         """
         self.gave_up = True
         self.stop(state='offline',
-                  message=f"掉线后重连 {self.reconnect_limit} 次都没成功，语音已下线")
+                  message=t("voice.give_up", limit=self.reconnect_limit))
 
     def _on_reconnect_attempt(self, attempt, limit):
         """每发起一次重连报一次，界面上能看到"重连中 1/3"。"""
-        self._status('reconnecting', f"语音连接断开，正在重连（{attempt}/{limit}）")
+        self._status('reconnecting',
+                     t("voice.reconnecting", attempt=attempt, limit=limit))
 
     def _on_connected(self):
         """pymumble 收到 ServerSync，连接真的建立了。"""
@@ -898,7 +903,7 @@ class Voice:
         # 负责把状态说清楚。
         if self.running and getattr(self, "_was_dropped", False):
             self._was_dropped = False
-            self._status('online', f"语音已重连（{self.username}）")
+            self._status('online', t("voice.reconnected", username=self.username))
 
     def _on_disconnected(self):
         """一条已经建立的连接断掉了。
@@ -918,7 +923,7 @@ class Voice:
         log.warning("voice connection dropped, waiting for pymumble to reconnect "
                     "(up to %d attempts)", self.reconnect_limit)
         self._status('reconnecting',
-                     f"语音连接断开，正在重连（最多 {self.reconnect_limit} 次）")
+                     t("voice.dropped_retrying", limit=self.reconnect_limit))
 
     def _on_sound(self, user, chunk):
         """pymumble 的库线程调用。"""

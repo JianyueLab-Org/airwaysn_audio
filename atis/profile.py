@@ -14,6 +14,9 @@ import logging
 import json
 import os
 
+# 这些 ValueError 会原样进 QMessageBox，是界面文字
+from i18n import t
+
 log = logging.getLogger("profile")
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -29,11 +32,18 @@ TYPE_SUFFIX = {
     TYPE_ARRIVAL: "_A_ATIS",
 }
 
-TYPE_LABELS = {
-    TYPE_COMBINED: "综合",
-    TYPE_DEPARTURE: "离场",
-    TYPE_ARRIVAL: "进场",
+# 席位类型在界面上的说法。和 LANGUAGES 一样只留键，文案在 i18n 里——
+# 写成 值 → 文案的字典的话，文案会在模块导入时定死，切语言不跟着变。
+TYPE_KEYS = {
+    TYPE_COMBINED: "station_type.combined",
+    TYPE_DEPARTURE: "station_type.departure",
+    TYPE_ARRIVAL: "station_type.arrival",
 }
+
+
+def type_label(value):
+    """席位类型在界面上的说法。"""
+    return t(TYPE_KEYS.get(value, TYPE_KEYS[TYPE_COMBINED]))
 
 # 语音语言。中文稿由 chinese.py 单独渲染——中文通播不是英文的逐词翻译，
 # 语序和数字读法都是民航自己的一套。
@@ -41,11 +51,21 @@ LANGUAGE_ENGLISH = "en"
 LANGUAGE_CHINESE = "zh"
 LANGUAGE_BOTH = "both"
 
-LANGUAGES = {
-    LANGUAGE_ENGLISH: "英文",
-    LANGUAGE_CHINESE: "中文",
-    LANGUAGE_BOTH: "中英双语",
+# 通播稿的语言，**不是界面语言**：这是播给飞行员听的，一个英文界面的操作者照样
+# 可能在管一份中文通播。说法在 i18n 里，这里只留下认得的取值——写成 值 → 文案的
+# 字典的话，文案会在模块导入时定死，用户之后切界面语言不会跟着变。
+LANGUAGES = (LANGUAGE_ENGLISH, LANGUAGE_CHINESE, LANGUAGE_BOTH)
+
+LANGUAGE_KEYS = {
+    LANGUAGE_ENGLISH: "voice_language.english",
+    LANGUAGE_CHINESE: "voice_language.chinese",
+    LANGUAGE_BOTH: "voice_language.both",
 }
+
+
+def language_label(value):
+    """通播稿语言在界面上的说法。"""
+    return t(LANGUAGE_KEYS.get(value, LANGUAGE_KEYS[LANGUAGE_ENGLISH]))
 
 
 class Preset:
@@ -250,7 +270,7 @@ class Profile:
 
     def add(self, station):
         if self.get(station.callsign):
-            raise ValueError(f"{station.callsign} 已经存在了")
+            raise ValueError(t("station.duplicate", callsign=station.callsign))
         self.stations.append(station)
         self.stations.sort(key=lambda s: s.callsign)
         return station
@@ -375,13 +395,13 @@ class ProfileSet:
         """新建一份空的。名字重复时抛 ValueError。"""
         name = (name or "").strip()
         if not name:
-            raise ValueError("名字不能为空")
+            raise ValueError(t("profile.name_empty"))
         # **必须写 is not None。** Profile 定义了 __len__，所以一份还没有席位的
         # 配置是**假值**——`if self.get(name):` 会认为它不存在，于是允许重名建
         # 第二份，两份同名之后选中哪一份全看顺序。和 xpc 的 TrafficTable 是同
         # 一个坑。
         if self.get(name) is not None:
-            raise ValueError(f"已经有一份叫「{name}」的配置了")
+            raise ValueError(t("profile.exists", name=name))
         profile = Profile(name=name)
         self.profiles.append(profile)
         return profile
@@ -389,13 +409,13 @@ class ProfileSet:
     def rename(self, old, new):
         new = (new or "").strip()
         if not new:
-            raise ValueError("名字不能为空")
+            raise ValueError(t("profile.name_empty"))
         profile = self.get(old)
         if profile is None:
-            raise ValueError(f"没有叫「{old}」的配置")
+            raise ValueError(t("profile.missing", name=old))
         # 同样是 is not None——空 profile 是假值，见 add() 里那段
         if new != old and self.get(new) is not None:
-            raise ValueError(f"已经有一份叫「{new}」的配置了")
+            raise ValueError(t("profile.exists", name=new))
         profile.name = new
         if self.active_name == old:
             self.active_name = new
@@ -404,7 +424,7 @@ class ProfileSet:
     def remove(self, name):
         """删一份。**最后一份不许删**——删光了界面就没有可操作的对象了。"""
         if len(self.profiles) <= 1:
-            raise ValueError("至少要留一份配置")
+            raise ValueError(t("profile.last_one"))
         profile = self.get(name)
         if profile is None:
             return False
