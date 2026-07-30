@@ -272,6 +272,14 @@ class VoiceClient:
         # 电台栈每变一次界面就新起一个线程调 sync，而 sync 会阻塞好几秒，
         # 两个同时推会把监听列表和发话目标写乱
         self._sync_lock = threading.Lock()
+        # 门口最多站一个人等着（见 sync 的说明）。这两个只保护那个标记，
+        # 不能用 _sync_lock——那把锁要被持有好几秒。
+        self._sync_pending = False
+        self._sync_pending_lock = threading.Lock()
+        # 服务器最近一次拒绝某个动作的说明。建频道时用来提前退出等待：
+        # 被拒之后再干等满 CHANNEL_TIMEOUT 是纯浪费，而这段等待是在
+        # _sync_lock 里面的，会把后面排队的 sync 一起拖住。
+        self._denial = None
         self._volumes = {}               # frequency_khz -> 0-100
         self._last_rx = {}               # frequency_khz -> 最后收到话音的时间
 
@@ -478,6 +486,9 @@ class VoiceClient:
             # 括号也得跟着语言走，直接拼中文全角括号的话，英文界面上会冒出
             # "Not permitted (…)（server said…）" 这种中英混排
             reason = t("denied.with_note", reason=reason, note=event.reason)
+        # 记下来给建频道那段用：被拒了就别再等下去了
+        self._denial = reason
+        log.warning("the server refused an operation: %s", kind)
         self._state('denied', reason)
 
     def _give_up(self):
@@ -617,12 +628,22 @@ class VoiceClient:
 
         建频道只是发一条消息，频道要等服务器回 ChannelState 才进本地表——这是
         一次网络往返。原来固定 sleep(0.2) 再找，连远程服务器时经常还没回来。
+
+        **被拒就立刻回来，别等满。** 服务器用 PermissionDenied 明确说了不给建
+        （少 MakeTempChannel 权限、或者重名），再干等 5 秒不会有别的结果——而这
+        段等待是在 _sync_lock 里面的，会把后面排队的 sync 一起拖住。实测日志里
+        一分钟内建了 34 次频道，就是这么攒出来的。atis/broadcast.py 一直是这么
+        做的，管制端漏了这条。
         """
         deadline = time.time() + CHANNEL_TIMEOUT
         while time.time() < deadline and self.running:
             channel = self._find_channel(name)
             if channel is not None:
                 return channel
+            if self._denial:
+                log.warning("the server refused to create channel %s: %s",
+                            name, self._denial)
+                return None
             time.sleep(0.1)
         return self._find_channel(name)
 
@@ -650,6 +671,8 @@ class VoiceClient:
             self._forget_channel(khz, name)
             try:
                 log.info("channel %s does not exist, creating a temporary one", name)
+                # 清掉上一次的拒绝说明，否则 _wait_for_channel 会拿旧的当这一次的
+                self._denial = None
                 self._create_channel(name)
                 channel = self._wait_for_channel(name)
             except Exception as e:
@@ -689,15 +712,34 @@ class VoiceClient:
         串行执行。界面每改一次电台栈就新起一个线程调这里，而这个函数里
         `_resolve_channel` 每个新频道最多要等 CHANNEL_TIMEOUT 秒，也就是说它会
         活好几秒；两个 sync 交错着写 `_join` / 监听列表 / `_tx_channels`，最后
-        留下的组合可能跟任何一次栈状态都对不上。数据源那条 60 秒的定时器现在会
-        自己往栈里加频率，这种交错已经不需要用户点任何东西就会发生。
+        留下的组合可能跟任何一次栈状态都对不上。
 
-        排队而不是丢弃：每一轮都重新读栈，所以后来的那次自然覆盖前面的结果。
+        **门口最多站一个人等着，其余的直接返回。** 原来是全部排队——理由写的是
+        "每一轮都重新读栈，后来的那次自然覆盖前面的"，但正因为每一轮都重读栈，
+        排在中间的那些轮**做的是完全一样的事**，纯属白干；而每一轮都要几秒，
+        队列于是变成一场风暴。实测日志里：`RadioStack(on_change=…)` 覆盖了加删、
+        RX/TX/XC 开关、音量、静音、选主频率，加上数据源那条 60 秒定时器带来的
+        set_transmit_allowed / set_locked / 自动加频率——一阵操作排出十几轮 sync，
+        每轮重建两三个频道，一分钟内建了 34 次频道，服务器开始用 ChannelName
+        （重名）回拒，而真正要紧的进频道请求一直没成。
+
+        合并之后：正在跑的那一轮照跑，最多再排一轮，那一轮读的是**最新的**栈
+        （所以用 self._stack 而不是参数），中间的调用全部丢掉——它们要推的状态
+        已经被那一轮包含了。
         """
-        # 记下来，重连之后要照着它重推一遍
+        # 记下来，重连之后和排队的那一轮都要照着它推
         self._stack = stack
+
+        with self._sync_pending_lock:
+            if self._sync_pending:
+                return              # 已经有一轮排着了，它会读到最新的栈
+            self._sync_pending = True
+
         with self._sync_lock:
-            self._sync(stack)
+            with self._sync_pending_lock:
+                self._sync_pending = False
+            # 读 self._stack：排队期间栈可能又变过，要推的是最新的那份
+            self._sync(self._stack or stack)
 
     def _sync(self, stack):
         if not self.connected or not self.mumble:
@@ -705,28 +747,43 @@ class VoiceClient:
 
         self._volumes = {r.frequency_khz: r.effective_volume() for r in stack}
 
-        rx_channels = {}
-        for khz in stack.rx_frequencies():
+        # **一轮 sync 里每个频率只解析一次。**
+        #
+        # TX 集合是 RX 集合的子集（开 TX 会强制开 RX），XC 又是 TX 的子集，所以
+        # 原来那三段各自调 _resolve_channel，同一个频率一轮里要解析两三遍。平时
+        # 只是多查两次本地字典，不要紧；但只要第一遍的建频道在 CHANNEL_TIMEOUT
+        # 内没回来（远程服务器上很常见），后面几遍就会看到"频道还是不存在"，
+        # 于是**再各发一次 CreateChannel**——服务器随后用 ChannelName（重名）
+        # 回拒，日志里同一秒里连着好几行"建一个临时的"就是这么来的。
+        wanted_khz = list(dict.fromkeys(
+            list(stack.rx_frequencies())
+            + list(stack.tx_frequencies())
+            + list(stack.xc_frequencies())))
+        resolved = {}
+        for khz in wanted_khz:
             channel_id = self._resolve_channel(khz)
             if channel_id is not None:
-                rx_channels[khz] = channel_id
+                resolved[khz] = channel_id
+
+        rx_channels = {khz: resolved[khz] for khz in stack.rx_frequencies()
+                       if khz in resolved}
 
         # 主频率：真正进入的那个频道。服务端不支持监听时，至少这个频率能听到
         primary = stack.selected_khz if stack.selected_khz in rx_channels else None
         if primary is None and rx_channels:
             primary = next(iter(rx_channels))
         if primary is not None:
-            self._join(rx_channels[primary])
+            self._join_frequency(primary, rx_channels[primary])
 
         # 其余频率用频道监听
         wanted = {cid for khz, cid in rx_channels.items() if khz != primary}
         self._set_listening(wanted)
 
         # 发话目标
-        self._tx_channels = [self._resolve_channel(khz) for khz in stack.tx_frequencies()]
-        self._tx_channels = [c for c in self._tx_channels if c is not None]
-        self._xc_channels = [self._resolve_channel(khz) for khz in stack.xc_frequencies()]
-        self._xc_channels = [c for c in self._xc_channels if c is not None]
+        self._tx_channels = [resolved[khz] for khz in stack.tx_frequencies()
+                             if khz in resolved]
+        self._xc_channels = [resolved[khz] for khz in stack.xc_frequencies()
+                             if khz in resolved]
         self._set_voice_target(self._tx_channels)
         self._program_cross_couple_targets()
         log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
@@ -734,6 +791,28 @@ class VoiceClient:
                   [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
+
+    def _join_frequency(self, khz, channel_id):
+        """进这个频率的频道，一次不成就按名字重新解析再试一次。
+
+        频率频道是 temporary 的，最后一个人离开服务器当场销毁。所以从"解析出
+        频道号"到"MoveCmd 被服务器处理"这中间，那个频道可能已经没了——服务器对
+        指向不存在频道的 MoveCmd **既不照做也不报错**，我们只会等满
+        CHANNEL_TIMEOUT 然后记一行"没有生效"。实测日志里这行出现了 40 次，
+        管制员那一晚一直留在根频道：听不到、也发不出，而界面全是绿的。
+
+        重解析一次的代价是一次本地字典查找加一次建频道；不重试的代价是这一轮
+        彻底没进去，要等下一次栈变化才有机会——而那可能是几分钟以后。
+        """
+        if self._join(channel_id):
+            return True
+
+        again = self._resolve_channel(khz)
+        if again is None or again == channel_id:
+            return False
+        log.info("channel for %s came back as id %s, joining again",
+                 radiostack.format_frequency(khz), again)
+        return self._join(again)
 
     def _join(self, channel_id):
         try:
