@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 
-log = logging.getLogger("机场")
+log = logging.getLogger("airports")
 
 DATA_FILE = "airports.json"
 
@@ -33,9 +33,10 @@ def table():
         try:
             with open(_data_path(), encoding="utf-8") as f:
                 _table = json.load(f)
-            log.info("已加载 %d 个机场的坐标", len(_table))
+            log.info("loaded coordinates for %d airports", len(_table))
         except Exception as e:
-            log.warning("机场坐标表加载失败，席位位置将需要手填: %s", e)
+            log.warning("could not load the airport coordinate table, station "
+                        "positions will have to be typed in: %s", e)
             _table = {}
     return _table
 

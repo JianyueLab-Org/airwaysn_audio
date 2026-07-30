@@ -25,6 +25,7 @@ from pymumble_py3.constants import (
     PYMUMBLE_CLBK_CONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
     PYMUMBLE_CLBK_SOUNDRECEIVED,
+    PYMUMBLE_CONN_STATE_FAILED,
     PYMUMBLE_MSG_TYPES_REJECT,
 )
 
@@ -34,7 +35,7 @@ import mumblecompat
 # 否则连接线程一起来就抛 AttributeError
 mumblecompat.install()
 
-log = logging.getLogger("通播")
+log = logging.getLogger("atis")
 
 # Mumble 服务器拒绝时给的类型，逐条翻译成人能看懂的原因。
 # 全都笼统说成"用户名或密码"会把人引到错误的方向——比如认证器挂了的时候，
@@ -71,10 +72,10 @@ class RejectAwareMumble(pymumble.Mumble):
                 reject.ParseFromString(message)
                 self.reject_type = mumble_pb2.Reject.RejectType.Name(reject.type)
                 self.reject_reason = reject.reason or ""
-                log.warning("服务器拒绝连接: type=%s reason=%r",
+                log.warning("the server rejected the connection: type=%s reason=%r",
                             self.reject_type, self.reject_reason)
             except Exception as e:
-                log.warning("解析 Reject 消息失败: %s", e)
+                log.warning("could not parse the Reject message: %s", e)
         return super().dispatch_control_message(type, message)
 
     def run(self):
@@ -93,7 +94,8 @@ class RejectAwareMumble(pymumble.Mumble):
         try:
             super().run()
         except pymumble.errors.ConnectionRejectedError as e:
-            log.info("服务器拒绝了连接，连接线程正常退出: %s", e)
+            log.info("the server rejected the connection, the connection thread "
+                     "exited normally: %s", e)
 
     def rejection(self):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
@@ -108,7 +110,93 @@ class RejectAwareMumble(pymumble.Mumble):
             return self.reject_reason
         return self.reject_type
 
-TARGET_RATE = 48000                          # pymumble 要求 48kHz 单声道 16bit
+
+# 连上过之后掉线，最多再试这么多次；都失败就这个席位整个停播，不留一条后台无限
+# 重试的僵尸连接。四个客户端同一条策略（xpc/msfs 的 voice.py、controller 的
+# voice.py 也是这个数）。
+RECONNECT_LIMIT = 3
+
+
+class BoundedReconnect:
+    """pymumble 的重连是无限的，这个混入给它一个上限。
+
+    默认的 `reconnect=True` 会让 `run()` 一直重试到进程结束。对通播尤其糟：
+    服务端 `login.py` 对认证失败**按 ASN ID 限流**，而所有通播都用同一个保留
+    账号——一个席位的僵尸连接能把整台机器上其它席位的语音一起锁死。
+
+    **必须挂在 connect() 上，不能去数 DISCONNECTED 回调。** pymumble 的
+    `run()`（mumble.py:120-143）丢连接时发一次 DISCONNECTED，然后 sleep 再
+    connect()，而**失败的重连尝试是完全静默的**：连接失败那一支只
+    `sleep + continue`，一个回调都不发。所以数回调数到的是"掉了几次"而不是
+    "试了几次"——服务器一直起不来时回调只有一次，后面它安静地重试到天亮。
+
+    **"连上了"只能以 ServerSync 为准。** `connect()` 成功时返回的是
+    `AUTHENTICATING` 而不是 `CONNECTED`：它只负责建 TLS 并把 Authenticate 发出
+    去，认证结果要等服务器回话。密码错的连接同样返回那个值，然后在 `loop()` 里
+    因为 Reject 结束——把返回值当成功就等于每次都把计数清零，又变回无限重试。
+    所以计数只在 `_session_established()`（由 CONNECTED 回调调用）里清零。
+
+    `on_give_up` 是给"自己不拥有那条主循环"的调用方用的：这里是
+    `mumble.start()`，pymumble 的线程放弃之后自己就没了，外面收不到任何信号，
+    所以放弃的那一刻要主动喊一声。xpc/msfs 自己跑 `run()`，从它的返回就能知道。
+
+    这一份和 xpc/msfs 的 voice.py、controller 的 voice.py 是同一段逻辑的副本——
+    这个仓库靠复制共享代码，改一处要把四处一起改。
+    """
+
+    reconnect_limit = RECONNECT_LIMIT
+    reconnect_attempts = 0
+    gave_up = False
+    on_reconnect = None            # 回调 (第几次, 上限)，用来更新界面
+    on_give_up = None              # 放弃时喊一声
+    _established = False
+
+    def _session_established(self):
+        """真的建立过一次会话（收到 ServerSync）。计数从这里清零。"""
+        self._established = True
+        self.reconnect_attempts = 0
+
+    def connect(self):
+        # 判定放在发起连接之前：两种失败（连不上服务器、服务器拒绝认证）都被
+        # 同一处挡住，也不会多试出第四次。
+        if self._established and self.reconnect_attempts >= self.reconnect_limit:
+            self.gave_up = True
+            self.reconnect = False
+            self.connected = PYMUMBLE_CONN_STATE_FAILED
+            log.warning("%d reconnect attempts after the drop all failed, "
+                        "giving up", self.reconnect_attempts)
+            if self.on_give_up:
+                try:
+                    self.on_give_up()
+                except Exception as e:
+                    log.warning("give-up callback raised: %s", e)
+            return self.connected
+
+        if self._established:
+            self.reconnect_attempts += 1
+            log.info("reconnecting to the voice server (attempt %d/%d)",
+                     self.reconnect_attempts, self.reconnect_limit)
+            if self.on_reconnect:
+                try:
+                    self.on_reconnect(self.reconnect_attempts,
+                                      self.reconnect_limit)
+                except Exception as e:
+                    log.warning("reconnect callback raised: %s", e)
+
+        return super().connect()
+
+
+def bounded_mumble(base=None):
+    """把 BoundedReconnect 套在 RejectAwareMumble 上，返回那个类。
+
+    现取现套而不是在顶层写死一个子类：测试里是替换类来放替身的，import 时钉死
+    基类会让替身进不来。`base` 是给测试直接指定假基类用的。
+    """
+    return type("BoundedRejectAwareMumble",
+                (BoundedReconnect, base or RejectAwareMumble), {})
+
+
+TARGET_RATE = 48000                        # pymumble 要求 48kHz 单声道 16bit
 FRAME_BYTES = int(TARGET_RATE * 0.02) * 2    # 一帧 20ms
 PREBUFFER_SECONDS = 0.5                      # 发送时保持的缓冲长度
 SILENCE_HOLD = 0.8                           # 频道里静默多久才算空闲
@@ -302,12 +390,12 @@ class Synthesizer:
             # 结尾补 0.2 秒静音，免得最后一个音节被截掉
             pieces.append(np.zeros(int(TARGET_RATE * 0.2), dtype=np.int16))
             pcm = np.concatenate(pieces).tobytes()
-            log.info("合成完成 %.1f 秒（%d 段：%s）",
+            log.info("synthesised %.1f s of audio (%d segments: %s)",
                      len(pcm) / (2.0 * TARGET_RATE), len(segments),
-                     "、".join("中文" if c else "英文" for c, _ in segments))
+                     ", ".join("zh" if c else "en" for c, _ in segments))
             return pcm
         except Exception as e:
-            log.warning(f"语音合成失败: {e}")
+            log.warning(f"speech synthesis failed: {e}")
             return None
 
     def _read_wav(self, path):
@@ -359,12 +447,18 @@ class Synthesizer:
 class Broadcaster:
     """一个席位的语音播出。on_state(state, message) 在后台线程调用。"""
 
-    def __init__(self, server, cid, password, station, on_state=None):
+    def __init__(self, server, cid, password, station, on_state=None,
+                 reconnect_limit=RECONNECT_LIMIT):
         self.server = server
         self.cid = str(cid).strip()
         self.password = password
         self.station = station
         self.on_state = on_state
+        # 掉线后最多重连几次，用尽就这个席位停播，见 BoundedReconnect
+        self.reconnect_limit = reconnect_limit
+        # 重连次数用尽、已经停播。和"停了"是两回事：界面要知道是掉线掉没的，
+        # 而不是有人按了停止播出。
+        self.gave_up = False
 
         self.user = f"{self.cid}_atis{str(station.frequency_khz).zfill(6)}"
         self.running = False
@@ -387,7 +481,7 @@ class Broadcaster:
             try:
                 self.on_state(state, message)
             except Exception as e:
-                log.warning(f"状态回调出错: {e}")
+                log.warning(f"status callback raised: {e}")
 
     # ---------- 生命周期 ----------
     def start(self, voice_text):
@@ -428,6 +522,31 @@ class Broadcaster:
     # ---------- 连接 ----------
     def _on_connected(self):
         self._connected = True
+        # 计数只在这里清零：connect() 返回成功只代表 TLS 建好、Authenticate 发出
+        # 去了，密码错的连接同样是那个返回值。详见 BoundedReconnect。
+        if self.mumble is not None and hasattr(self.mumble, "_session_established"):
+            self.mumble._session_established()
+
+    def _on_reconnect_attempt(self, attempt, limit):
+        """每发起一次重连报一次，界面上能看到"重连中 1/3"。"""
+        self._state('reconnecting',
+                    f"语音掉线，正在重连（{attempt}/{limit}）")
+
+    def _on_give_up(self):
+        """重连次数用尽：这个席位停播。
+
+        **只停这一个席位**，同一个客户端上的其它席位各有自己的连接，不受影响。
+
+        走回调而不是等某个循环发现：这里的连接是 `mumble.start()` 起的，
+        pymumble 那条线程放弃之后自己就没了，外面收不到任何信号——播报循环最多
+        要等一整轮（`_wait_for_quiet` 能等到 60 秒）才可能注意到。`stop_event`
+        一置，那些 `wait` 全部立刻返回。
+        """
+        self.gave_up = True
+        self._state('offline',
+                    f"语音掉线后重连 {self.reconnect_limit} 次都没成功，"
+                    f"{self.station.callsign} 已停播")
+        self.stop_event.set()
 
     def _on_sound(self, user, soundchunk):
         # 开了接收就必须及时取走，否则 pymumble 会一直堆内存
@@ -445,8 +564,14 @@ class Broadcaster:
     def _connect(self):
         self._state('connecting', f"正在以 {self.user} 连接 {self.server} …")
         try:
-            self.mumble = RejectAwareMumble(self.server, self.user,
-                                            password=self.password, reconnect=True)
+            # reconnect=True 仍然要，掉线自己连回来是对的；上限由
+            # BoundedReconnect 管，用尽了这个席位就停播。
+            self.mumble = bounded_mumble()(self.server, self.user,
+                                           password=self.password,
+                                           reconnect=True)
+            self.mumble.reconnect_limit = self.reconnect_limit
+            self.mumble.on_reconnect = self._on_reconnect_attempt
+            self.mumble.on_give_up = self._on_give_up
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED, self._on_connected)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
@@ -529,7 +654,7 @@ class Broadcaster:
             channel = self._find_channel(name)
             if channel is None:
                 self._denial = None
-                log.info("频道 %s 不存在，建一个临时的", name)
+                log.info("channel %s does not exist, creating a temporary one", name)
                 self._create_channel(name)
                 channel = self._wait_for_channel(name)
 
@@ -629,7 +754,7 @@ class Broadcaster:
             try:
                 self.mumble.stop()
             except Exception as e:
-                log.warning(f"断开出错: {e}")
+                log.warning(f"disconnecting raised: {e}")
             self.mumble = None
         self._connected = False
 
@@ -704,8 +829,8 @@ class Broadcaster:
 
             # 每一轮开播前都对着服务器确认一次，别信自己记的
             if not self._in_expected_channel():
-                log.info("已经不在 %s 里了（多半是断线重连过），重新进频道",
-                         self.station.channel)
+                log.info("no longer in %s (most likely a reconnect), rejoining the "
+                         "channel", self.station.channel)
                 if not self._join_channel():
                     if self.stop_event.wait(REPEAT_GAP):
                         break
@@ -721,4 +846,7 @@ class Broadcaster:
             if self.stop_event.wait(REPEAT_GAP if spoken else 1.0):
                 break
 
-        self._state('stopped', "通播已停止")
+        # 重连用尽那条已经报过 offline 了，再报一句"通播已停止"会把原因盖掉，
+        # 界面上就只剩一个没有解释的停止。
+        if not self.gave_up:
+            self._state('stopped', "通播已停止")

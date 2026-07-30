@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import metar as metar_module
 import profile as profile_module
@@ -1148,6 +1149,357 @@ class VoiceFixTest(unittest.TestCase):
         self.assertEqual(voicefix.polish("a ,b .c"), "a, b. c")
 
 
+class ProfileSetTest(unittest.TestCase):
+    """多份 profile。vATIS 的模型：一份 profile 装一组席位。
+
+    同一个人可能同时管华东和华北，两边的席位、模板、跑道构型完全不同；混在
+    一张列表里，值班时要在十几个不相关的席位里找自己那两个。
+    """
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(), "atis_profile.json")
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def read(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    # ---------- 向后兼容：这一条最重要 ----------
+    def test_an_old_single_profile_file_still_loads(self):
+        """现有的 atis_profile.json 是 {"stations": [...]}，没有 profile 这一层。
+
+        读不进来的后果不是"少个功能"，是所有人打开就是空配置。
+        """
+        self.write({"stations": [Station("ZSPD", frequency="127.850").to_dict()]})
+        store = profile_module.ProfileSet(self.path)
+        self.assertEqual(len(store), 1)
+        self.assertEqual(store.active().name, profile_module.DEFAULT_PROFILE_NAME)
+        self.assertIsNotNone(store.active().get("ZSPD_ATIS"))
+
+    def test_saving_upgrades_the_file_shape(self):
+        self.write({"stations": []})
+        store = profile_module.ProfileSet(self.path)
+        store.save()
+        data = self.read()
+        self.assertIn("profiles", data)
+        self.assertEqual(data["active"], profile_module.DEFAULT_PROFILE_NAME)
+
+    def test_a_missing_file_still_gives_one_profile(self):
+        """界面不该到处判 None。"""
+        store = profile_module.ProfileSet(self.path)
+        self.assertEqual(len(store), 1)
+        self.assertIsNotNone(store.active())
+
+    # ---------- 增删改 ----------
+    def test_add_select_and_round_trip(self):
+        store = profile_module.ProfileSet(self.path)
+        store.add("华北")
+        store.get("华北").add(Station("ZBAA", frequency="127.000"))
+        self.assertTrue(store.select("华北"))
+        store.save()
+
+        again = profile_module.ProfileSet(self.path)
+        self.assertEqual(again.active_name, "华北")
+        self.assertIsNotNone(again.active().get("ZBAA_ATIS"))
+        self.assertEqual(sorted(again.names),
+                         sorted([profile_module.DEFAULT_PROFILE_NAME, "华北"]))
+
+    def test_duplicate_and_empty_names_are_refused(self):
+        store = profile_module.ProfileSet(self.path)
+        store.add("华北")
+        with self.assertRaises(ValueError):
+            store.add("华北")
+        with self.assertRaises(ValueError):
+            store.add("   ")
+
+    def test_renaming_follows_the_selection(self):
+        store = profile_module.ProfileSet(self.path)
+        store.add("华北")
+        store.select("华北")
+        store.rename("华北", "华北区域")
+        self.assertEqual(store.active_name, "华北区域")
+        self.assertIsNone(store.get("华北"))
+
+    def test_renaming_onto_an_existing_name_is_refused(self):
+        store = profile_module.ProfileSet(self.path)
+        store.add("华北")
+        with self.assertRaises(ValueError):
+            store.rename("华北", profile_module.DEFAULT_PROFILE_NAME)
+
+    def test_the_last_profile_cannot_be_removed(self):
+        """删光了界面就没有可操作的对象了。"""
+        store = profile_module.ProfileSet(self.path)
+        self.assertEqual(len(store), 1)
+        with self.assertRaises(ValueError):
+            store.remove(store.active_name)
+
+    def test_removing_the_active_one_falls_back(self):
+        store = profile_module.ProfileSet(self.path)
+        store.add("华北")
+        store.select("华北")
+        self.assertTrue(store.remove("华北"))
+        self.assertEqual(store.active_name, profile_module.DEFAULT_PROFILE_NAME)
+
+    def test_an_unknown_active_name_falls_back(self):
+        """文件被手改过、active 指向一个不存在的名字。"""
+        self.write({"active": "没有这份", "profiles": [{"name": "甲", "stations": []}]})
+        store = profile_module.ProfileSet(self.path)
+        self.assertEqual(store.active().name, "甲")
+        self.assertEqual(store.active_name, "甲")
+
+
+class NetworkConfigTest(unittest.TestCase):
+    """从 can-web 取全网配置（/api/v1/atis/config）并并进本地。
+
+    和下面那个 AtisStationsFromFeedTest 取的东西**不是一回事**：数据源的
+    atis[] 是此刻谁在播（只有机场和频率，是运行状态），这个接口给的是配置
+    本身——席位、频率、跑道构型预设、模板、中文用词。
+    """
+
+    def setUp(self):
+        global netconfig
+        import netconfig
+        self.path = os.path.join(tempfile.mkdtemp(), "atis_profile.json")
+
+    def entry(self, identifier="ZSPD", frequency="127.850", **extra):
+        station = Station(identifier, frequency=frequency,
+                          voice_language=profile_module.LANGUAGE_BOTH,
+                          chinese_name="上海浦东")
+        station.presets = [profile_module.Preset(
+            "南向", "[FACILITY] information [ATIS_LETTER]",
+            chinese_runway="跑道 幺六左 进港。")]
+        data = station.to_dict()
+        data.pop("letter")              # 服务端不发情报字母，它是运行状态
+        data.update(extra)
+        return data
+
+    def document(self, *entries, **head):
+        doc = {"version": "abc123", "updated": "2026-07-30",
+               "notes": "华东五场", "stations": list(entries) or [self.entry()]}
+        doc.update(head)
+        return doc
+
+    def profile(self, *stations):
+        store = Profile(path=self.path)
+        for station in stations:
+            store.add(station)
+        return store
+
+    # ---------- 解析 ----------
+    def test_reads_a_whole_station_not_just_the_frequency(self):
+        """要点就在这里：网络上以前只能拿到机场和频率，模板得自己打。"""
+        config = netconfig.parse(self.document())
+        self.assertEqual(config.version, "abc123")
+        self.assertEqual(config.updated, "2026-07-30")
+        station = config.stations[0]
+        self.assertEqual(station.callsign, "ZSPD_ATIS")
+        self.assertEqual(station.frequency, "127.850")
+        self.assertEqual(station.voice_language, profile_module.LANGUAGE_BOTH)
+        self.assertEqual(station.chinese_name, "上海浦东")
+        self.assertEqual(station.presets[0].name, "南向")
+        self.assertEqual(station.presets[0].chinese_runway, "跑道 幺六左 进港。")
+
+    def test_unknown_fields_do_not_sink_the_document(self):
+        """服务端加了新字段，旧客户端只应当忽略它，不是整份读不进来。"""
+        config = netconfig.parse(self.document(
+            self.entry(**{"some_future_field": {"a": 1}})))
+        self.assertEqual(len(config), 1)
+
+    def test_a_bad_station_is_skipped_and_reported(self):
+        config = netconfig.parse(self.document(
+            {"name": "缺 identifier"},
+            self.entry("ZBAA", "127.000"),
+            self.entry("ZSHC", "abc")))
+        self.assertEqual([s.identifier for s in config.stations], ["ZBAA"])
+        self.assertEqual(len(config.problems), 2)
+
+    def test_a_frequency_outside_the_vhf_band_is_refused(self):
+        """开播时才炸的话，用户看到的是"频道里没人"，不是"配置有问题"。"""
+        with self.assertRaises(netconfig.NetConfigError):
+            netconfig.parse(self.document(self.entry("ZSPD", "88.500")))
+
+    def test_an_empty_document_is_an_error_not_an_empty_merge(self):
+        for bad in ({}, {"stations": []}, {"stations": "nope"}):
+            with self.assertRaises(netconfig.NetConfigError):
+                netconfig.parse(bad)
+
+    def test_a_saved_profile_file_can_be_used_as_the_source(self):
+        """也认本客户端自己的存盘形状，这样 config_url 可以指向自建的一份。"""
+        config = netconfig.parse(
+            {"profiles": [{"name": "华东", "stations": [self.entry()]}]})
+        self.assertEqual(config.stations[0].callsign, "ZSPD_ATIS")
+
+    # ---------- 取 ----------
+    def test_fetch_failures_say_why(self):
+        """用户明确按了更新，失败必须给出原因，不能只是"什么都没发生"。"""
+        import urllib.error
+
+        cases = [
+            (urllib.error.HTTPError("u", 429, "Too Many", None, None), "限流"),
+            (urllib.error.HTTPError("u", 500, "Boom", None, None), "500"),
+            (urllib.error.URLError("名字解析失败"), "连不上"),
+        ]
+        for error, fragment in cases:
+            with mock.patch("urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(netconfig.NetConfigError) as caught:
+                    netconfig.fetch("https://example.invalid/config")
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_garbage_body_is_reported_as_such(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"<html>404</html>"
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaises(netconfig.NetConfigError) as caught:
+                netconfig.fetch("https://example.invalid/config")
+        self.assertIn("JSON", str(caught.exception))
+
+    # ---------- 比对 ----------
+    def test_compare_splits_missing_differing_and_same(self):
+        local_same = Station.from_dict(self.entry("ZSPD"))
+        local_differs = Station.from_dict(self.entry("ZBAA", "127.000"))
+        local_differs.presets[0].notams = "本地自己加的"
+        store = self.profile(local_same, local_differs)
+
+        config = netconfig.parse(self.document(
+            self.entry("ZSPD"), self.entry("ZBAA", "127.000"),
+            self.entry("ZSHC", "127.250")))
+        missing, differing, same = netconfig.compare(store, config.stations)
+        self.assertEqual([s.identifier for s in missing], ["ZSHC"])
+        self.assertEqual([s.identifier for s in differing], ["ZBAA"])
+        self.assertEqual([s.identifier for s in same], ["ZSPD"])
+
+    def test_a_different_information_letter_is_not_a_difference(self):
+        """字母每几分钟推进一格。带着它比，每个席位永远都"和网络版不一样"。"""
+        local = Station.from_dict(self.entry("ZSPD"))
+        local.advance_letter()
+        store = self.profile(local)
+        config = netconfig.parse(self.document(self.entry("ZSPD")))
+        _, differing, same = netconfig.compare(store, config.stations)
+        self.assertEqual(differing, [])
+        self.assertEqual(len(same), 1)
+
+    # ---------- 合并 ----------
+    def test_merge_adds_what_is_missing(self):
+        store = self.profile()
+        config = netconfig.parse(self.document(self.entry("ZSPD"),
+                                               self.entry("ZBAA", "127.000")))
+        added, replaced, kept, skipped = netconfig.merge(store, config.stations)
+        self.assertEqual(len(added), 2)
+        self.assertEqual((replaced, kept, skipped), ([], [], []))
+        self.assertIsNotNone(store.get("ZBAA_ATIS"))
+
+    def test_local_edits_survive_by_default(self):
+        """值班时改过的构型和 NOTAM 都在预设里，默认一律不能盖。"""
+        local = Station.from_dict(self.entry("ZSPD"))
+        local.presets[0].notams = "临时：跑道 17L 关闭"
+        store = self.profile(local)
+        config = netconfig.parse(self.document(self.entry("ZSPD")))
+
+        added, replaced, kept, _ = netconfig.merge(store, config.stations)
+        self.assertEqual((added, replaced), ([], []))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(store.get("ZSPD_ATIS").presets[0].notams,
+                         "临时：跑道 17L 关闭")
+
+    def test_overwrite_replaces_but_keeps_the_letter(self):
+        """播了一半把字母退回 A，飞行员报的和听到的就对不上了。"""
+        local = Station.from_dict(self.entry("ZSPD"))
+        local.presets[0].notams = "本地的"
+        local.set_letter("F")
+        store = self.profile(local)
+        config = netconfig.parse(self.document(self.entry("ZSPD")))
+
+        _, replaced, _, _ = netconfig.merge(store, config.stations,
+                                            overwrite=True)
+        self.assertEqual(len(replaced), 1)
+        again = store.get("ZSPD_ATIS")
+        self.assertEqual(again.presets[0].notams, "")
+        self.assertEqual(again.letter, "F")
+
+    def test_a_broadcasting_station_is_never_touched(self):
+        """播出中的 Station 被 Broadcaster 和 FSDClient 拿着。
+
+        换掉它只会让在播的内容和界面上显示的稿子对不上，而界面看起来一切正常。
+        """
+        local = Station.from_dict(self.entry("ZSPD"))
+        local.presets[0].notams = "正在播的这份"
+        store = self.profile(local)
+        config = netconfig.parse(self.document(self.entry("ZSPD")))
+
+        added, replaced, _, skipped = netconfig.merge(
+            store, config.stations, overwrite=True, protected={"ZSPD_ATIS"})
+        self.assertEqual((added, replaced), ([], []))
+        self.assertEqual([s.callsign for s in skipped], ["ZSPD_ATIS"])
+        self.assertEqual(store.get("ZSPD_ATIS").presets[0].notams, "正在播的这份")
+
+    def test_merge_does_not_save_by_itself(self):
+        """存盘归调用方——它那边可能是 ProfileSet，路径也在它手上。"""
+        store = self.profile()
+        config = netconfig.parse(self.document())
+        netconfig.merge(store, config.stations)
+        self.assertFalse(os.path.exists(self.path))
+
+
+class AtisStationsFromFeedTest(unittest.TestCase):
+    """从 can-fsd 数据源的 atis[] 里抽席位。
+
+    **这不是取配置。** 配置在 can-web 的 /api/v1/atis/config，由 netconfig.py
+    取（见 NetworkConfigTest）；atis[] 是**此刻在线的运行状态**，只能拿到机场
+    和频率。/api/v1/atis 是第三样东西：给 EuroScope 用的文本生成器。
+    """
+
+    def setUp(self):
+        global datafeed
+        import datafeed
+
+    def feed(self, *entries):
+        return {"general": {}, "pilots": [], "controllers": [],
+                "atis": list(entries)}
+
+    def entry(self, callsign, frequency="128.500"):
+        return {"cid": "900", "callsign": callsign, "frequency": frequency,
+                "rating": 2, "text_atis": ["ATIS A"]}
+
+    def test_reads_icao_frequency_and_type(self):
+        data = self.feed(self.entry("ZSPD_ATIS", "127.850"),
+                         self.entry("ZBAA_D_ATIS", "126.250"),
+                         self.entry("ZGGG_A_ATIS", "121.900"))
+        self.assertEqual(
+            datafeed.atis_stations(data=data),
+            [("ZBAA", "ZBAA_D_ATIS", "126.250", "departure"),
+             ("ZGGG", "ZGGG_A_ATIS", "121.900", "arrival"),
+             ("ZSPD", "ZSPD_ATIS", "127.850", "combined")])
+
+    def test_the_no_frequency_placeholder_is_dropped(self):
+        """199.998 是 can-fsd 的"没设频率"，拿它建席位会得到一个空频道。"""
+        data = self.feed(self.entry("ZSPD_ATIS", datafeed.NO_FREQUENCY))
+        self.assertEqual(datafeed.atis_stations(data=data), [])
+
+    def test_a_departure_suffix_is_not_mistaken_for_combined(self):
+        """_D_ATIS 也以 _ATIS 结尾，长后缀必须先匹配。"""
+        data = self.feed(self.entry("ZSPD_D_ATIS"))
+        icao, _, _, kind = datafeed.atis_stations(data=data)[0]
+        self.assertEqual((icao, kind), ("ZSPD", "departure"))
+
+    def test_non_atis_callsigns_are_ignored(self):
+        data = self.feed(self.entry("ZSPD_TWR"), self.entry("ZSPD_ATIS"))
+        self.assertEqual([c for _, c, _, _ in datafeed.atis_stations(data=data)],
+                         ["ZSPD_ATIS"])
+
+    def test_a_bad_icao_is_ignored(self):
+        data = self.feed(self.entry("X_ATIS"), self.entry("ZSPD_ATIS"))
+        self.assertEqual([i for i, _, _, _ in datafeed.atis_stations(data=data)],
+                         ["ZSPD"])
+
+    def test_empty_and_missing_data(self):
+        self.assertEqual(datafeed.atis_stations(data=None), [])
+        self.assertEqual(datafeed.atis_stations(data={}), [])
+        self.assertEqual(datafeed.atis_stations(data=self.feed()), [])
+
+
 class BroadcastRulesTest(unittest.TestCase):
     """开播前的拦截规则。
 
@@ -1550,6 +1902,220 @@ class FakeMumble:
     def moves(self):
         return [c.parameters["channel_id"] for c in self.commands
                 if "session" in c.parameters]
+
+
+class ReconnectLimitTest(unittest.TestCase):
+    """掉线之后最多重连三次，都失败就**这个席位**停播。
+
+    以前是 `reconnect=True` 一路无限重试。通播这边尤其糟：所有席位都用同一个
+    保留账号（默认 900），而服务端 `login.py` 对认证失败按 ASN ID 限流——一个
+    席位的僵尸连接足以把这台机器上其它席位的语音一起锁死。
+
+    停播只停这一个席位：同一个客户端上的其它席位各有自己的连接。
+    """
+
+    def setUp(self):
+        try:
+            import opuslib  # noqa: F401
+        except Exception:
+            for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                         "opuslib.api.encoder", "opuslib.api.info",
+                         "opuslib.exceptions"):
+                sys.modules.setdefault(name, mock.MagicMock())
+        global broadcast
+        import broadcast
+        self.broadcast = broadcast
+        self.FAILED = broadcast.PYMUMBLE_CONN_STATE_FAILED
+
+    def make_mumble(self, results, limit=3):
+        """假基类：connect() 按 results 依次返回状态码，并记下调用次数。"""
+        test = self
+
+        class FakeBase:
+            def __init__(self, *args, **kwargs):
+                self.reconnect = kwargs.get("reconnect", False)
+                self.connected = 0
+                self.calls = 0
+                test.base = self
+
+            def connect(self):
+                index = self.calls
+                self.calls += 1
+                value = results[index] if index < len(results) else test.FAILED
+                self.connected = value
+                return value
+
+        mumble = self.broadcast.bounded_mumble(FakeBase)(
+            "host", "900_atis127800", reconnect=True)
+        mumble.reconnect_limit = limit
+        return mumble
+
+    def test_the_limit_stops_the_retrying(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()          # 先有过一次真会话
+        for expected in (1, 2, 3):
+            mumble.connect()
+            self.assertEqual(mumble.reconnect_attempts, expected)
+            self.assertFalse(mumble.gave_up)
+
+        mumble.connect()
+        self.assertTrue(mumble.gave_up)
+        self.assertFalse(mumble.reconnect,
+                         "reconnect 必须置假，否则 pymumble 的 run() 还会继续转")
+        self.assertEqual(self.base.calls, 3, "放弃那一次不该真的再连一遍")
+
+    def test_authenticating_is_not_a_successful_connect(self):
+        """`connect()` 成功返回的是 AUTHENTICATING，不是 CONNECTED。
+
+        密码错的连接同样返回它，随后才在 loop() 里因为 Reject 结束。按返回值判
+        "连上了"就会每次清零计数，于是无限重连——正好撞上按账号的限流。
+        """
+        mumble = self.make_mumble([1] * 10)        # 1 = AUTHENTICATING
+        mumble._session_established()
+        for _ in range(4):
+            mumble.connect()
+        self.assertTrue(mumble.gave_up, "被拒的重连被当成了成功")
+
+    def test_a_real_session_resets_the_count(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()
+        mumble.connect()
+        mumble.connect()
+        mumble._session_established()          # 连回来了
+        self.assertEqual(mumble.reconnect_attempts, 0)
+        for _ in range(3):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up, "重连成功后没有重新给满三次")
+
+    def test_the_first_connection_is_not_a_reconnect(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        for _ in range(5):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up)
+        self.assertTrue(mumble.reconnect)
+
+    def test_giving_up_shouts_because_nobody_is_watching_that_thread(self):
+        """连接是 mumble.start() 起的，pymumble 那条线程放弃后自己就没了。
+
+        外面收不到任何信号：播报循环最多要等一整轮（_wait_for_quiet 能等 60 秒）
+        才可能注意到。所以放弃的那一刻必须主动喊，并且把 stop_event 置上让所有
+        wait 立刻返回。
+        """
+        caster = self.broadcast.Broadcaster.__new__(self.broadcast.Broadcaster)
+        caster.running = True
+        caster.gave_up = False
+        caster.reconnect_limit = 3
+        caster.stop_event = threading.Event()
+        caster.station = type("S", (), {"callsign": "ZSPD_ATIS"})()
+        states = []
+        caster._state = lambda state, message: states.append((state, message))
+
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble.on_give_up = caster._on_give_up
+        mumble._session_established()
+        for _ in range(4):
+            mumble.connect()
+
+        self.assertTrue(caster.gave_up)
+        self.assertEqual(states[-1][0], 'offline', states)
+        self.assertIn("ZSPD_ATIS", states[-1][1])
+        self.assertTrue(caster.stop_event.is_set(),
+                        "没有把 stop_event 置上，播报循环还会干等一整轮")
+
+    def test_the_stop_message_does_not_bury_the_reason(self):
+        """播报循环结束时那句"通播已停止"不能盖掉下线的原因。
+
+        盖掉的话界面上只剩一个没有解释的停止，用户不知道是掉线还是自己按的。
+        """
+        caster = self.broadcast.Broadcaster.__new__(self.broadcast.Broadcaster)
+        caster.running = False
+        caster.gave_up = True
+        caster.stop_event = threading.Event()
+        caster.stop_event.set()
+        caster._text_lock = threading.Lock()
+        caster._voice_text = "x"
+        caster._pending_text = None
+        states = []
+        caster._state = lambda state, message: states.append((state, message))
+
+        caster._loop()
+        self.assertEqual(states, [], f"不该再报一句停止：{states}")
+
+
+class AtisFsdReconnectTest(unittest.TestCase):
+    """席位的 FSD 链路同一条策略：掉线重连三次，用尽就整个下线。
+
+    两条链路必须一致，否则"整个下线"没有统一含义：语音三次、FSD 一次就放弃的
+    话，一次服务器重启会让席位从网络上消失而频率上还在播。
+    """
+
+    def setUp(self):
+        global fsdclient
+        import fsdclient
+        self.fsdclient = fsdclient
+
+    def make_client(self, connect_results, limit=3):
+        """把 _connect / _loop / _close 换成替身，只测重连那一层的控制流。"""
+        client = fsdclient.FSDClient.__new__(fsdclient.FSDClient)
+        client.callsign = "ZSPD_ATIS"
+        client.running = True
+        client.stop_event = threading.Event()
+        client.reconnect_limit = limit
+        client.gave_up = False
+        client._retryable = False
+        client.on_status = None
+        client.states = []
+        # 照抄 _status 里那次翻译：重连期间的 error/stopped 不是终态
+        client._status = lambda state, message: client.states.append(
+            ('reconnecting' if client._retryable and state in ('error', 'stopped')
+             else state, message))
+        client.connect_calls = 0
+
+        def fake_connect():
+            index = client.connect_calls
+            client.connect_calls += 1
+            ok = connect_results[index] if index < len(connect_results) else False
+            return ok
+
+        client._connect = fake_connect
+        client._loop = lambda: None
+        client._close = lambda: None
+        return client
+
+    def test_three_attempts_then_the_station_goes_offline(self):
+        client = self.make_client([True] + [False] * 10)
+        # 不真的等 3 秒 × 3
+        self.fsdclient.RECONNECT_DELAY = 0
+        client._run()
+        self.assertTrue(client.gave_up)
+        self.assertEqual(client.connect_calls, 4, "一次首连 + 三次重连")
+        self.assertEqual(client.states[-1][0], 'offline', client.states)
+        self.assertIn("ZSPD_ATIS", client.states[-1][1])
+
+    def test_a_reconnect_that_works_resets_the_count(self):
+        client = self.make_client([True, False, True] + [False] * 10)
+        self.fsdclient.RECONNECT_DELAY = 0
+        client._run()
+        self.assertTrue(client.gave_up)
+        self.assertEqual(client.connect_calls, 6,
+                         "首连 + 失败一次 + 重连成功，之后第二轮再给满三次")
+
+    def test_the_first_connection_is_not_retried(self):
+        """首连失败多半是密码不对或者呼号被占，重试只会把同一条错误刷三遍。"""
+        client = self.make_client([False] * 10)
+        client._run()
+        self.assertFalse(client.gave_up)
+        self.assertEqual(client.connect_calls, 1)
+
+    def test_stopping_does_not_look_like_reconnecting(self):
+        """有人按了停止播出，界面上不能写"重连中"。"""
+        client = self.make_client([True] + [False] * 10)
+        client._retryable = True
+        client.running = False
+        client.stop_event.set()
+        client.thread = None
+        fsdclient.FSDClient.stop(client)
+        self.assertFalse(client._retryable)
 
 
 class JoinChannelTest(unittest.TestCase):

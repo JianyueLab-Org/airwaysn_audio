@@ -74,7 +74,8 @@ class LogSetupTest(unittest.TestCase):
             sys.excepthook(*sys.exc_info())
 
         content = self.read_log(path)
-        self.assertIn("没有被接住", content)
+        # 日志文本是英文（界面文字仍是中文），见 CLAUDE.md 的日志约定
+        self.assertIn("went uncaught", content)
         self.assertIn("故意抛的", content)
         self.assertIn("ValueError", content)
 

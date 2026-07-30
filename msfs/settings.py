@@ -8,7 +8,7 @@ import json
 import logging
 import os
 
-log = logging.getLogger("设置")
+log = logging.getLogger("settings")
 
 SETTINGS_FILE = "msfs_settings.json"
 
@@ -56,7 +56,7 @@ class Settings:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError) as e:
-            log.warning("读取配置失败，用默认值: %s", e)
+            log.warning("could not read the settings, using the defaults: %s", e)
             return
         for key in DEFAULTS:
             if key in data:
@@ -66,7 +66,7 @@ class Settings:
         self.speaker_volume = max(0, min(200, int(self.speaker_volume or 100)))
         if not isinstance(self.package_roots, list):
             self.package_roots = []
-        log.info("已读取配置 %s", os.path.abspath(self.path))
+        log.info("read the settings from %s", os.path.abspath(self.path))
 
     def save(self):
         data = {key: getattr(self, key, DEFAULTS[key]) for key in DEFAULTS}
@@ -74,4 +74,4 @@ class Settings:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except OSError as e:
-            log.warning("保存配置失败: %s", e)
+            log.warning("could not save the settings: %s", e)

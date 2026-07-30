@@ -162,6 +162,110 @@ def main():
         assert Settings().compact is False
     check("精简状态记得住", compact_state_is_remembered)
 
+    def importing_from_the_network_adds_stations():
+        """从数据源取席位。不联网——把 datafeed.atis_stations 换成替身。"""
+        import datafeed
+        original = datafeed.atis_stations
+        datafeed.atis_stations = lambda *a, **k: [
+            ("ZGGG", "ZGGG_ATIS", "126.500", "combined"),
+            ("ZSPD", "ZSPD_ATIS", "127.850", "combined"),   # 已存在，应当跳过
+        ]
+        try:
+            before = len(window.profile)
+            window.import_from_network()
+            assert len(window.profile) == before + 1, "新席位没加进来"
+            added = window.profile.get("ZGGG_ATIS")
+            assert added is not None, "ZGGG 没加进来"
+            assert added.frequency == "126.500", added.frequency
+        finally:
+            datafeed.atis_stations = original
+            window.profile.remove("ZGGG_ATIS")
+            window.refresh_stations()
+    check("从网络取席位", importing_from_the_network_adds_stations)
+
+    # 从 can-web 取**配置**（席位 + 预设 + 模板 + 中文用词），和上面取在线席位
+    # 不是一回事。不联网：换掉 netconfig.fetch。
+    def _network_document(notams=""):
+        station = profile_module.Station("ZGGG", "白云", "126.500")
+        station.presets = [profile_module.Preset(
+            "东向", "[FACILITY] information [ATIS_LETTER]", notams=notams,
+            chinese_runway="跑道 洞两左 进港。")]
+        entry = station.to_dict()
+        entry.pop("letter")          # 服务端不发情报字母，它是运行状态
+        return {"version": "smoke1", "updated": "2026-07-30",
+                "notes": "冒烟用的一份", "stations": [entry]}
+
+    def _with_network(document, answer, action):
+        """把 fetch 和"要不要"的回答都换成固定值，跑完恢复。"""
+        import netconfig
+        original_fetch, original_question = netconfig.fetch, QMessageBox.question
+        netconfig.fetch = lambda url=None, timeout=15: document
+        QMessageBox.question = staticmethod(lambda *a, **k: answer)
+        try:
+            action()
+        finally:
+            netconfig.fetch = original_fetch
+            QMessageBox.question = staticmethod(original_question)
+
+    def updating_from_the_network_brings_whole_stations():
+        before = len(window.profile)
+        _with_network(_network_document(), QMessageBox.StandardButton.Yes,
+                      window.update_from_network)
+        added = window.profile.get("ZGGG_ATIS")
+        assert len(window.profile) == before + 1, "席位没加进来"
+        assert added is not None, "ZGGG_ATIS 没加进来"
+        assert added.frequency == "126.500", added.frequency
+        # 这才是这个功能的意义：预设和模板一起来，不用自己再打一遍
+        assert added.presets[0].name == "东向", [p.name for p in added.presets]
+        assert added.presets[0].chinese_runway, "中文跑道词没跟过来"
+        assert window.settings.config_version == "smoke1", "版本号没记下来"
+    check("取到完整席位（含预设）", updating_from_the_network_brings_whole_stations)
+
+    def a_second_update_reports_no_change():
+        _dialogs.clear()
+        before = len(window.profile)
+        _with_network(_network_document(), QMessageBox.StandardButton.Yes,
+                      window.update_from_network)
+        assert len(window.profile) == before, "同一份配置又加了一遍"
+        assert any("一致" in text for _, text in _dialogs), _dialogs
+    check("已是最新时不重复加", a_second_update_reports_no_change)
+
+    def declining_the_overwrite_keeps_local_edits():
+        """值班时改过的构型和 NOTAM 都在预设里，选「否」就一个字都不能动。"""
+        window.profile.get("ZGGG_ATIS").presets[0].notams = "临时：跑道 02R 关闭"
+        _with_network(_network_document("网络版的 NOTAM"),
+                      QMessageBox.StandardButton.No, window.update_from_network)
+        assert window.profile.get("ZGGG_ATIS").presets[0].notams == \
+            "临时：跑道 02R 关闭", "选了否还是被覆盖了"
+    check("拒绝覆盖时保留本地修改", declining_the_overwrite_keeps_local_edits)
+
+    def accepting_the_overwrite_keeps_the_letter():
+        """覆盖可以，但播了一半把情报字母退回 A 是不行的。"""
+        window.profile.get("ZGGG_ATIS").set_letter("F")
+        _with_network(_network_document("网络版的 NOTAM"),
+                      QMessageBox.StandardButton.Yes, window.update_from_network)
+        again = window.profile.get("ZGGG_ATIS")
+        assert again.presets[0].notams == "网络版的 NOTAM", again.presets[0].notams
+        assert again.letter == "F", f"情报字母被重置成了 {again.letter}"
+        window.profile.remove("ZGGG_ATIS")
+        window.refresh_stations()
+    check("覆盖时保留情报字母", accepting_the_overwrite_keeps_the_letter)
+
+    def a_failed_fetch_says_why():
+        import netconfig
+        _dialogs.clear()
+        original = netconfig.fetch
+
+        def boom(url=None, timeout=15):
+            raise netconfig.NetConfigError("连不上 airwaysn（测试）")
+        netconfig.fetch = boom
+        try:
+            window.update_from_network()
+        finally:
+            netconfig.fetch = original
+        assert any("连不上" in text for _, text in _dialogs), _dialogs
+    check("取不到时给出原因", a_failed_fetch_says_why)
+
     def departure_and_arrival_are_distinguishable():
         """同一个机场的综合/离场/进场不能长得一模一样。"""
         texts = [window.station_list.item(i).text()

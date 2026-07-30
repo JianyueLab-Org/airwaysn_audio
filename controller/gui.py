@@ -39,7 +39,7 @@ from radiostack import RadioStack
 from settings import Settings, SettingsDialog
 from voice import VoiceClient
 
-log = logging.getLogger("界面")
+log = logging.getLogger("gui")
 
 SERVER = "hjdczy.top"
 
@@ -768,7 +768,7 @@ class ControllerWindow(QMainWindow):
         # 启动时还没 show 过就别抢焦点
         if was_visible:
             self.showMaximized() if maximised else self.show()
-        log.info("窗口置顶: %s", "开" if on else "关")
+        log.info("always on top: %s", "on" if on else "off")
 
     def retranslate(self):
         """换语言之后把界面上的字全部重刷一遍。
@@ -976,7 +976,8 @@ class ControllerWindow(QMainWindow):
             if dropped:
                 # 值守掉了会把已经开着的 TX 落下来，这事必须说出来，否则管制员
                 # 会对着一个自以为开着的频率讲话
-                log.info("数据源上已经不在管制席位，TX / XC 全部落下")
+                log.info("no longer staffing a position on the datafeed, dropping "
+                         "every TX / XC")
                 self.status_label.setStyleSheet(f"color: {IDLE_COLOR};")
                 self.status_label.setText(t("duty.tx_dropped"))
         else:
@@ -998,7 +999,7 @@ class ControllerWindow(QMainWindow):
         try:
             self.stack.add(khz, callsign)
         except ValueError as e:
-            log.warning("自动加入席位频率失败: %s", e)
+            log.warning("could not auto-add the position frequency: %s", e)
             return
         # 自己的席位频率默认就开 RX + TX：管制员上了席位，本来就是要在这个
         # 频率上收发的，还要手动点两下才能说话是多余的一步——而且漏点了不会
@@ -1009,7 +1010,8 @@ class ControllerWindow(QMainWindow):
         self.stack.set_tx(khz, True)
         self.stack.select(khz)          # 顺带设成主频率：真正进入的那个频道
 
-        log.info("按数据源上的席位 %s 自动加入 %s（默认 RX + TX）",
+        log.info("auto-added %s from position %s on the datafeed (RX + TX by "
+             "default)",
                  callsign, radiostack.format_frequency(khz))
         self.status_label.setStyleSheet(f"color: {ON_COLOR};")
         self.status_label.setText(t(
@@ -1104,6 +1106,21 @@ class ControllerWindow(QMainWindow):
 
     # ---------- 语音回调（已在界面线程） ----------
     def on_voice_state(self, state, message):
+        if state == 'reconnecting':
+            # 还在重连：连接没死，别弹框也别退回登录页——一次抖动就把值守中的
+            # 管制员踢回登录页是不能接受的。状态栏用"正在收发"的橙色，一眼能看
+            # 出不是正常状态。
+            self.status_label.setStyleSheet(f"color: {ACTIVE_COLOR};")
+            self.status_label.setText(message)
+            return
+        if state == 'offline':
+            # 重连次数用尽：语音已经自己收摊了，这里把界面一起退回登录页，
+            # 并留下原因——不然只剩一句"已断开"，看不出是掉线还是自己点的。
+            self.disconnect_voice()
+            self.login_status.setStyleSheet(f"color: {OFFLINE_COLOR};")
+            self.login_status.setText(message)
+            QMessageBox.warning(self, t("login.failed"), message)
+            return
         if state == 'error':
             self.status_label.setStyleSheet(f"color: {OFFLINE_COLOR};")
             self.status_label.setText(message)
@@ -1185,7 +1202,7 @@ class ControllerWindow(QMainWindow):
             if self.voice:
                 self.voice.disconnect()
         except Exception as e:
-            log.warning(f"关闭时出错: {e}")
+            log.warning(f"error while closing: {e}")
         finally:
             event.accept()
 
@@ -1202,7 +1219,7 @@ if __name__ == '__main__':
     debug = '--debug' in sys.argv or Settings().debug
     applog.setup(debug=debug)
     # 版本号必须进日志：用户发上来的日志是唯一能确认他跑的是哪个 build 的东西
-    log.info("Audio for CAN 启动 %s", version.full())
+    log.info("Audio for CAN starting, %s", version.full())
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(icon_path))

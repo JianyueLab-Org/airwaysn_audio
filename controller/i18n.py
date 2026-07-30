@@ -24,7 +24,7 @@ import locale
 import logging
 import os
 
-log = logging.getLogger("多语言")
+log = logging.getLogger("i18n")
 
 DEFAULT = "zh"
 LANGUAGES = {"zh": "中文", "en": "English"}
@@ -133,6 +133,19 @@ TEXT = {
     "voice.online":         {"zh": "已连接，账号 {cid}", "en": "Connected as {cid}"},
     "voice.dropped":        {"zh": "与语音服务器的连接已断开",
                              "en": "Lost the connection to the voice server"},
+    # 掉线之后：先重连，最多 RECONNECT_LIMIT 次，都失败才真的下线。
+    # 这三条要说清"还在试"和"不再试了"的区别——原来一律是上面那句 dropped，
+    # 一次抖动看上去就和彻底断了一样。
+    "voice.dropped_retrying": {"zh": "与语音服务器的连接已断开，正在重连（最多 {limit} 次）",
+                               "en": "Lost the connection to the voice server — "
+                                     "reconnecting (up to {limit} attempts)"},
+    "voice.reconnecting":   {"zh": "正在重连语音服务器（{attempt}/{limit}）",
+                             "en": "Reconnecting to the voice server ({attempt}/{limit})"},
+    "voice.reconnected":    {"zh": "语音服务器已重连",
+                             "en": "Reconnected to the voice server"},
+    "voice.reconnect_failed": {"zh": "掉线后重连 {limit} 次都没成功，已下线",
+                               "en": "Reconnected {limit} times without success — "
+                                     "went offline"},
     "voice.stopped":        {"zh": "已断开", "en": "Disconnected"},
     "voice.rejected":       {"zh": "语音服务器拒绝了 {cid}：{reason}",
                              "en": "The voice server rejected {cid}: {reason}"},
@@ -212,7 +225,7 @@ def set_language(code):
     code = (code or "").strip().lower()
     if code not in LANGUAGES:
         if code:
-            log.warning("不认识的语言 %r，用 %s", code, DEFAULT)
+            log.warning("unknown language %r, falling back to %s", code, DEFAULT)
         code = DEFAULT
     _current = code
     return _current
@@ -240,7 +253,7 @@ def system_language():
         if code in LANGUAGES:
             return code
     except Exception as e:
-        log.debug("判断系统语言失败: %s", e)
+        log.debug("could not determine the system language: %s", e)
     return DEFAULT
 
 
@@ -252,13 +265,13 @@ def t(key, **kwargs):
     """
     entry = TEXT.get(key)
     if entry is None:
-        log.warning("没有这条文字: %s", key)
+        log.warning("no such string: %s", key)
         return key
     text = entry.get(_current) or entry.get(DEFAULT) or key
     if kwargs:
         try:
             return text.format(**kwargs)
         except (KeyError, IndexError) as e:
-            log.warning("文字 %s 的占位符对不上: %s", key, e)
+            log.warning("the placeholders of string %s do not match: %s", key, e)
             return text
     return text

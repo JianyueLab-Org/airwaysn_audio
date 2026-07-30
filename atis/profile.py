@@ -14,7 +14,7 @@ import logging
 import json
 import os
 
-log = logging.getLogger("配置")
+log = logging.getLogger("profile")
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -225,13 +225,28 @@ class Station:
         return station
 
 
-class Profile:
-    """一套席位配置，存成 JSON。"""
+DEFAULT_PROFILE_NAME = "默认"
 
-    def __init__(self, path="atis_profile.json"):
+# 配置文件名。相对当前目录——所以客户端必须在自己那个目录里跑（见 CLAUDE.md）。
+# 有名字的常量是为了别再写第二遍字面量：`Profile()` 不带 path 是**内存里的一份**，
+# 不读不存，界面拿它当配置用的话打开就是空的，而且改了什么都存不下来。
+DEFAULT_PROFILE_PATH = "atis_profile.json"
+
+
+class Profile:
+    """一套席位配置。vATIS 的说法：一份 profile 装一组席位。
+
+    自己不再管文件——存盘交给 ProfileSet，它才知道整个文件里有几份 profile。
+    `path` 还留着是为了兼容直接 `Profile(path=…)` 的老调用（测试里有）：那种
+    用法下它自己读自己存，行为和以前一样。
+    """
+
+    def __init__(self, path=None, name=DEFAULT_PROFILE_NAME, stations=None):
         self.path = path
-        self.stations = []
-        self.load()
+        self.name = name
+        self.stations = list(stations or [])
+        if path is not None:
+            self.load()
 
     def add(self, station):
         if self.get(station.callsign):
@@ -259,20 +274,47 @@ class Profile:
     def __len__(self):
         return len(self.stations)
 
+    # ---------- 序列化 ----------
+    @staticmethod
+    def stations_from(entries):
+        """一份 profile 里的席位列表。认不出的单个跳过，不连累整份。"""
+        stations = []
+        for entry in entries or []:
+            try:
+                stations.append(Station.from_dict(entry))
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning(f"skipping an unrecognisable station: {e}")
+        stations.sort(key=lambda s: s.callsign)
+        return stations
+
+    def to_dict(self):
+        return {"name": self.name,
+                "stations": [s.to_dict() for s in self.stations]}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(name=str(data.get("name") or DEFAULT_PROFILE_NAME).strip()
+                   or DEFAULT_PROFILE_NAME,
+                   stations=cls.stations_from(data.get("stations")))
+
+    # ---------- 单份直读直写（兼容老调用） ----------
     def load(self):
         try:
             if os.path.exists(self.path):
                 with open(self.path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.stations = []
-                for entry in data.get("stations", []):
-                    try:
-                        self.stations.append(Station.from_dict(entry))
-                    except (KeyError, TypeError, ValueError) as e:
-                        log.warning(f"跳过一个无法识别的席位: {e}")
-                self.stations.sort(key=lambda s: s.callsign)
+                # 新格式是 {"profiles": [...]}，这里只取当前那一份
+                if "profiles" in data:
+                    active = data.get("active")
+                    chosen = next(
+                        (p for p in data["profiles"] if p.get("name") == active),
+                        (data["profiles"] or [{}])[0])
+                    self.name = str(chosen.get("name") or self.name)
+                    self.stations = self.stations_from(chosen.get("stations"))
+                else:
+                    self.stations = self.stations_from(data.get("stations"))
         except Exception as e:
-            log.warning(f"读取失败: {e}")
+            log.warning(f"could not read the profile file: {e}")
 
     def save(self):
         try:
@@ -280,4 +322,132 @@ class Profile:
                 json.dump({"stations": [s.to_dict() for s in self.stations]},
                           f, ensure_ascii=False, indent=2)
         except Exception as e:
-            log.warning(f"保存失败: {e}")
+            log.warning(f"could not save the profile file: {e}")
+
+
+class ProfileSet:
+    """整个文件：几份 profile，加上当前用哪一份。
+
+    为什么要多份：同一个人可能同时管华东和华北，两边的席位、模板、跑道构型
+    完全不同；混在一张列表里，值班时要在十几个不相关的席位里找自己那两个。
+    vATIS 也是这个模型。
+
+    **老文件必须读得进来。** 现有的 atis_profile.json 是 `{"stations": [...]}`，
+    没有 profile 这一层。读到那种形状就当成一份名叫"默认"的 profile——不能因为
+    加了这个功能，让所有人打开就是空配置。
+    """
+
+    def __init__(self, path=DEFAULT_PROFILE_PATH):
+        self.path = path
+        self.profiles = []
+        self.active_name = DEFAULT_PROFILE_NAME
+        self.load()
+
+    # ---------- 查询 ----------
+    def __iter__(self):
+        return iter(self.profiles)
+
+    def __len__(self):
+        return len(self.profiles)
+
+    @property
+    def names(self):
+        return [p.name for p in self.profiles]
+
+    def get(self, name):
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        return None
+
+    def active(self):
+        """当前那一份。文件是空的也保证有一份，界面不用到处判 None。"""
+        found = self.get(self.active_name)
+        if found is None:
+            if not self.profiles:
+                self.profiles.append(Profile(name=DEFAULT_PROFILE_NAME))
+            found = self.profiles[0]
+            self.active_name = found.name
+        return found
+
+    # ---------- 增删改 ----------
+    def add(self, name):
+        """新建一份空的。名字重复时抛 ValueError。"""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("名字不能为空")
+        # **必须写 is not None。** Profile 定义了 __len__，所以一份还没有席位的
+        # 配置是**假值**——`if self.get(name):` 会认为它不存在，于是允许重名建
+        # 第二份，两份同名之后选中哪一份全看顺序。和 xpc 的 TrafficTable 是同
+        # 一个坑。
+        if self.get(name) is not None:
+            raise ValueError(f"已经有一份叫「{name}」的配置了")
+        profile = Profile(name=name)
+        self.profiles.append(profile)
+        return profile
+
+    def rename(self, old, new):
+        new = (new or "").strip()
+        if not new:
+            raise ValueError("名字不能为空")
+        profile = self.get(old)
+        if profile is None:
+            raise ValueError(f"没有叫「{old}」的配置")
+        # 同样是 is not None——空 profile 是假值，见 add() 里那段
+        if new != old and self.get(new) is not None:
+            raise ValueError(f"已经有一份叫「{new}」的配置了")
+        profile.name = new
+        if self.active_name == old:
+            self.active_name = new
+        return profile
+
+    def remove(self, name):
+        """删一份。**最后一份不许删**——删光了界面就没有可操作的对象了。"""
+        if len(self.profiles) <= 1:
+            raise ValueError("至少要留一份配置")
+        profile = self.get(name)
+        if profile is None:
+            return False
+        self.profiles.remove(profile)
+        if self.active_name == name:
+            self.active_name = self.profiles[0].name
+        return True
+
+    def select(self, name):
+        if self.get(name) is None:
+            return False
+        self.active_name = name
+        return True
+
+    # ---------- 文件 ----------
+    def load(self):
+        self.profiles = []
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if "profiles" in data:
+                    for entry in data.get("profiles") or []:
+                        self.profiles.append(Profile.from_dict(entry))
+                    self.active_name = str(
+                        data.get("active") or DEFAULT_PROFILE_NAME)
+                else:
+                    # 老格式：整个文件就是一份配置
+                    self.profiles.append(Profile(
+                        name=DEFAULT_PROFILE_NAME,
+                        stations=Profile.stations_from(data.get("stations"))))
+                    self.active_name = DEFAULT_PROFILE_NAME
+                    log.info("read a profile file in the old shape, treating it as one "
+                             "profile named %r", DEFAULT_PROFILE_NAME)
+        except Exception as e:
+            log.warning(f"could not read the profile file: {e}")
+        self.active()        # 保证至少有一份，并把 active_name 校正到存在的名字
+
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"active": self.active_name,
+                           "profiles": [p.to_dict() for p in self.profiles]},
+                          f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"could not save the profile file: {e}")

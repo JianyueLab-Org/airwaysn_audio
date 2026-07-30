@@ -657,5 +657,153 @@ class ReconnectTest(unittest.TestCase):
         self.assertEqual(resynced, [self.stack], "作废了缓存却没有重新推一遍")
 
 
+class ReconnectLimitTest(unittest.TestCase):
+    """掉线之后最多重连三次，都失败就整个下线。
+
+    以前是 `reconnect=True` 一路无限重试。后果不是"多试几次"：服务端
+    `login.py` 对认证失败**按 ASN ID 限流**，一个在后台不停重连的僵尸足以把这个
+    账号的语音锁死——管制员把密码改对了也连不上，直到重启客户端。而界面那边只
+    有一句"连接已断开"，没人能说清此刻到底还在不在连。
+    """
+
+    FAILED = voice.PYMUMBLE_CONN_STATE_FAILED
+
+    def make_class(self, results):
+        """假基类：connect() 按 results 依次返回状态码，并记下调用次数。"""
+        test = self
+
+        class FakeBase:
+            def __init__(self, *args, **kwargs):
+                self.reconnect = kwargs.get("reconnect", False)
+                self.connected = 0
+                self.calls = 0
+                self.stopped = 0
+                test.base = self
+
+            def connect(self):
+                index = self.calls
+                self.calls += 1
+                value = results[index] if index < len(results) else test.FAILED
+                self.connected = value
+                return value
+
+            def stop(self):
+                self.stopped += 1
+
+        return voice.bounded_mumble(FakeBase)
+
+    def make_mumble(self, results, limit=3):
+        mumble = self.make_class(results)("host", "1000", reconnect=True)
+        mumble.reconnect_limit = limit
+        return mumble
+
+    # ---------- 计数本身 ----------
+    def test_the_limit_stops_the_retrying(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()          # 先有过一次真会话
+
+        for expected in (1, 2, 3):
+            mumble.connect()
+            self.assertEqual(mumble.reconnect_attempts, expected)
+            self.assertFalse(mumble.gave_up)
+            self.assertTrue(mumble.reconnect, "还有次数就不该停")
+
+        # 第四次连接不再发起，直接放弃
+        self.assertEqual(mumble.connect(), self.FAILED)
+        self.assertTrue(mumble.gave_up)
+        self.assertFalse(mumble.reconnect,
+                         "reconnect 必须置假，否则 pymumble 的 run() 还会继续转")
+        self.assertEqual(self.base.calls, 3,
+                         "放弃那一次不该真的再去连一遍服务器")
+
+    def test_a_real_session_resets_the_count(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()
+        mumble.connect()
+        mumble.connect()
+        self.assertEqual(mumble.reconnect_attempts, 2)
+
+        mumble._session_established()          # 第三次连回来了
+        self.assertEqual(mumble.reconnect_attempts, 0)
+        for _ in range(3):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up, "重连成功之后没有重新给满三次")
+
+    def test_the_first_connection_is_not_a_reconnect(self):
+        """从没连上过就不进这套计数——首连失败多半是密码不对，重试没有意义。"""
+        mumble = self.make_mumble([self.FAILED] * 10)
+        for _ in range(5):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up)
+        self.assertEqual(mumble.reconnect_attempts, 0)
+        self.assertTrue(mumble.reconnect)
+
+    def test_authenticating_is_not_a_successful_connect(self):
+        """`connect()` 成功返回的是 AUTHENTICATING（1），不是 CONNECTED（2）。
+
+        密码错的连接同样返回 1，随后才在 loop() 里因为 Reject 结束。要是按返回值
+        判定"连上了"就会每次清零计数，于是无限重连——而这一次撞的正好是服务端按
+        账号的认证失败限流。计数只能由 ServerSync（CONNECTED 回调）清零。
+        """
+        authenticating = 1
+        mumble = self.make_mumble([authenticating] * 10)
+        mumble._session_established()
+        for _ in range(3):
+            mumble.connect()
+        self.assertEqual(mumble.reconnect_attempts, 3)
+        mumble.connect()
+        self.assertTrue(mumble.gave_up, "被拒的重连被当成了成功")
+
+    def test_each_attempt_is_reported(self):
+        seen = []
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble.on_reconnect = lambda attempt, limit: seen.append((attempt, limit))
+        mumble._session_established()
+        for _ in range(3):
+            mumble.connect()
+        self.assertEqual(seen, [(1, 3), (2, 3), (3, 3)])
+
+    # ---------- 接到客户端上 ----------
+    def test_the_monitor_takes_the_client_offline(self):
+        """次数用尽后连接线程就结束了，只剩连接监控还在跑——收摊只能挂在它上面。"""
+        client = VoiceClient("host", "1000", "pw")
+        states = []
+        client.on_state = lambda state, message: states.append((state, message))
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble.gave_up = True
+        client.mumble = mumble
+        client.running = True
+
+        thread = threading.Thread(target=client._connection_monitor, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "监控线程没有退出")
+
+        self.assertTrue(client.gave_up)
+        self.assertEqual(states[-1][0], 'offline', states)
+        self.assertIn("3", states[-1][1])
+        self.assertEqual(mumble.stopped, 1,
+                         "下线时必须真的 stop() 掉连接，否则麦克风和连接都还占着")
+        self.assertIsNone(client.mumble)
+        self.assertFalse(client.running)
+
+    def test_an_ordinary_drop_is_reported_as_reconnecting(self):
+        """一次抖动不能报成终态错误——原来它和"彻底断开"是同一句话。"""
+        client = VoiceClient("host", "1000", "pw")
+        states = []
+        client.on_state = lambda state, message: states.append((state, message))
+        client.mumble = self.make_mumble([self.FAILED] * 10)
+        client.running = True
+
+        client._on_disconnected()
+        self.assertEqual(states[-1][0], 'reconnecting', states)
+
+        # 已经放弃了就不该再报"正在重连"
+        client.mumble.gave_up = True
+        states.clear()
+        client._on_disconnected()
+        self.assertEqual([s for s, _ in states], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

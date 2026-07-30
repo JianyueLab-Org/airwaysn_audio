@@ -18,7 +18,7 @@ import logging
 
 from i18n import t
 
-log = logging.getLogger("电台栈")
+log = logging.getLogger("radiostack")
 
 
 def parse_frequency(text):
@@ -201,7 +201,8 @@ class RadioStack:
         if self.is_locked(khz):
             # 静默拒绝而不是抛异常：界面上那个按钮本来就该是禁用的，走到这里
             # 说明是别的路径（快捷键、脚本）碰到了，挡住就行
-            log.info("%s 是本人正在管的席位频率，不允许删除",
+            log.info("%s is the frequency of the position being staffed, refusing "
+                     "to remove it",
                      format_frequency(khz))
             return False
         self._radios.remove(radio)
@@ -236,7 +237,7 @@ class RadioStack:
         if not radio:
             return None
         if value and not self.transmit_allowed:
-            log.info("数据源上没有在管制席位，不允许打开 TX")
+            log.info("not staffing a position on the datafeed, refusing to turn TX on")
             return radio
         radio.tx = value
         if value:
@@ -252,7 +253,7 @@ class RadioStack:
         if not radio:
             return None
         if value and not self.transmit_allowed:
-            log.info("数据源上没有在管制席位，不允许打开 XC")
+            log.info("not staffing a position on the datafeed, refusing to turn XC on")
             return radio
         radio.xc = value
         if value:
@@ -319,7 +320,7 @@ class RadioStack:
             try:
                 self._radios.append(Radio.from_dict(entry))
             except (KeyError, TypeError, ValueError) as e:
-                log.warning(f"跳过一条无法识别的记录: {e}")
+                log.warning(f"skipping an unrecognisable entry: {e}")
         self._radios.sort(key=lambda r: r.frequency_khz)
         active = [r for r in self._radios if r.rx]
         self.selected_khz = (active or self._radios)[0].frequency_khz if self._radios else None

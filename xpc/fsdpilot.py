@@ -25,7 +25,7 @@ import socket
 import threading
 import time
 
-log = logging.getLogger("FSD")
+log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
 PROTO_REVISION = 100          # ProtoRevisionClassic
@@ -33,6 +33,11 @@ RATING_OBSERVER = 1
 POSITION_INTERVAL = 0.2       # 每秒 5 次，和 VATSIM 客户端一致
 SLOW_POSITION_INTERVAL = 5.0  # 停在地面上没动时降频
 LOGIN_TIMEOUT = 10.0
+# 已经登录过之后掉线，最多再试这么多次；都失败就整个下线。和语音那边同一条
+# 策略（voice.RECONNECT_LIMIT），两条链路的行为要一致，不然"整个下线"就没有
+# 统一的含义。
+RECONNECT_LIMIT = 3
+RECONNECT_DELAY = 3.0         # 每次重连之间等一下，别贴着服务器猛敲
 # can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）
 MAX_CALLSIGN_LENGTH = 12
 
@@ -117,15 +122,19 @@ class FSDPilot:
     """飞行员的 FSD 连接。
 
     回调都在后台线程触发：
-        on_status(state, message)     connecting / online / error / stopped
+        on_status(state, message)     connecting / online / reconnecting /
+                                     error / offline / stopped
         on_text(sender, recipient, message)
         on_controllers(list)          附近的管制席位
+
+    掉线相关的两条状态和语音那边一个意思：`reconnecting` 是暂时的，还在试；
+    `offline` 是 RECONNECT_LIMIT 次都失败、这条链路彻底完了，界面应当整个下线。
     """
 
     def __init__(self, host, callsign, cid, password, real_name="",
                  port=DEFAULT_PORT, rating=RATING_OBSERVER, aircraft="",
                  on_status=None, on_text=None, on_controllers=None,
-                 traffic=None):
+                 traffic=None, reconnect_limit=RECONNECT_LIMIT):
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = (callsign or "").strip().upper()
@@ -153,6 +162,13 @@ class FSDPilot:
         self._sock = None
         self._buffer = b""
         self._logged_in = False
+        # 掉线后最多重连几次，用尽就整个下线
+        self.reconnect_limit = int(reconnect_limit)
+        self.gave_up = False
+        # 登录成功过之后，失败就先当"可以重连"。这个标记让 _status 把中途的
+        # error 翻成 reconnecting——否则界面收到一次 error 就把整条连接当没了，
+        # 而我们其实马上就要再试。
+        self._retryable = False
 
         self._lock = threading.Lock()
         self._position = None       # 最近一次从模拟器拿到的快照
@@ -172,6 +188,9 @@ class FSDPilot:
 
     def stop(self):
         self.running = False
+        # 先把"可以重连"撤掉，否则 _close() 的 stopped 会被翻成 reconnecting，
+        # 用户明明自己点的断开，界面上却写着重连中。
+        self._retryable = False
         self.stop_event.set()
         thread = self.thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -254,12 +273,17 @@ class FSDPilot:
 
     # ---------- 内部 ----------
     def _status(self, state, message):
+        # 重连期间的失败不是终态。这里翻一次比在每个报错点各判一次可靠：
+        # _connect 有四条报错路径、_loop 还有一条，漏掉任何一条，界面就会在
+        # 我们正准备重连的时候把这条连接当成彻底没了。
+        if self._retryable and state in ('error', 'stopped'):
+            state = 'reconnecting'
         log.info("%s %s: %s", self.callsign, state, message)
         if self.on_status:
             try:
                 self.on_status(state, message)
             except Exception as e:
-                log.warning("状态回调失败: %s", e)
+                log.warning("status callback raised: %s", e)
 
     @staticmethod
     def _redact(packet):
@@ -283,14 +307,50 @@ class FSDPilot:
             return False
 
     def _run(self):
-        try:
-            if not self._connect():
+        """连接 → 收发 → 掉线重连，最多 reconnect_limit 次。
+
+        **首次连不上不重试。** 那多半是呼号被占、密码不对或者地址填错——重试三
+        次只会把同一条错误刷三遍，还可能触发服务端对认证失败的限流。只有"登录
+        成功过之后掉的线"才重连：那种是服务器重启或者网络抖动，重连是对的。
+
+        次数用尽后报 offline 并结束，界面据此整个下线，而不是留一条谁也说不清
+        状态的连接。
+        """
+        attempts = 0
+        established_once = False
+
+        while self.running and not self.stop_event.is_set():
+            connected = False
+            try:
+                connected = self._connect()
+                if connected:
+                    attempts = 0
+                    established_once = True
+                    # 从这一刻起，掉线是可以重连的
+                    self._retryable = True
+                    self._loop()
+            except Exception as e:
+                self._status('error', f"FSD 连接异常: {e}")
+            finally:
+                self._close()
+
+            if not established_once:
+                return                  # 首次就没连上，原因已经报过了
+            if not self.running or self.stop_event.is_set():
+                return                  # 用户自己断的
+
+            attempts += 1
+            if attempts > self.reconnect_limit:
+                self.gave_up = True
+                self._retryable = False
+                self._status('offline',
+                             f"与 FSD 断开后重连 {self.reconnect_limit} 次都没成功，已下线")
                 return
-            self._loop()
-        except Exception as e:
-            self._status('error', f"FSD 连接异常: {e}")
-        finally:
-            self._close()
+
+            self._status('reconnecting',
+                         f"与 FSD 的连接断开，正在重连（{attempts}/{self.reconnect_limit}）")
+            if self.stop_event.wait(RECONNECT_DELAY):
+                return
 
     def _connect(self):
         problem = callsign_problem(self.callsign)
@@ -308,7 +368,7 @@ class FSDPilot:
 
         greeting = self._read_packet(timeout=5)
         if greeting:
-            log.info("服务端问候: %s", greeting)
+            log.info("server greeting: %s", greeting)
 
         machine_id = sum(ord(c) for c in self.callsign) * 7919
         self._send(f"$ID{self.callsign}:SERVER:{CLIENT_ID}:{CLIENT_NAME}:"
@@ -413,7 +473,7 @@ class FSDPilot:
             if not self._logged_in:
                 self._status('error', f"FSD 拒绝登录（{code}）: {message}")
                 return False
-            log.warning("服务器返回错误（%s）: %s", code, message)
+            log.warning("the server returned an error (%s): %s", code, message)
             return True
 
         if head.startswith("$AR") and len(fields) >= 4 and fields[2] == "METAR":
@@ -431,7 +491,7 @@ class FSDPilot:
                 try:
                     self.on_text(sender, recipient, body)
                 except Exception as e:
-                    log.warning("文字消息回调出错: %s", e)
+                    log.warning("text-message callback raised: %s", e)
             return True
 
         if head.startswith("%") and len(fields) >= 3:
@@ -504,7 +564,7 @@ class FSDPilot:
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
                 squawk=int(fields[2]), mode=fields[0][1:] or "S")
         except (IndexError, ValueError) as e:
-            log.debug("位置包解析失败 %s: %s", fields[:2], e)
+            log.debug("could not parse the position packet %s: %s", fields[:2], e)
 
     def request_plane_info(self, callsign):
         """问对方的机型，用于模型匹配。"""
@@ -562,14 +622,14 @@ class FSDPilot:
             try:
                 self.on_controllers(list(self.controllers.values()))
             except Exception as e:
-                log.warning("管制列表回调出错: %s", e)
+                log.warning("controller-list callback raised: %s", e)
 
     def _forget_controller(self, callsign):
         if self.controllers.pop(callsign, None) and self.on_controllers:
             try:
                 self.on_controllers(list(self.controllers.values()))
             except Exception as e:
-                log.warning("管制列表回调出错: %s", e)
+                log.warning("controller-list callback raised: %s", e)
 
     def _close(self):
         if self._sock:

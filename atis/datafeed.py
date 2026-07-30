@@ -15,7 +15,7 @@ import json
 import logging
 import urllib.request
 
-log = logging.getLogger("数据源")
+log = logging.getLogger("datafeed")
 
 DEFAULT_DATAFEED_URL = "https://data.airwaysn.org/v1/data.json"
 
@@ -33,7 +33,7 @@ def fetch(url=None, timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        log.warning("读取数据源失败: %s", e)
+        log.warning("could not read the datafeed: %s", e)
         return None
 
 
@@ -67,6 +67,54 @@ def controller_for(cid, url=None, data=None):
     return None
 
 
+# can-fsd 用这个频率表示"没设频率"。拿它建席位会得到一个谁也不在的频道。
+NO_FREQUENCY = "199.998"
+
+# 呼号后缀 → 通播类型。和 profile.TYPE_SUFFIX 是同一套约定，反过来查。
+_SUFFIXES = (("_D_ATIS", "departure"), ("_A_ATIS", "arrival"),
+             ("_ATIS", "combined"))
+
+
+def atis_stations(url=None, data=None):
+    """数据源上此刻在线的通播席位，[(ICAO, 呼号, 频率, 类型)]。
+
+    **这不是"从 airwaysn 取配置"。** 配置在 can-web 的 `/api/v1/atis/config`，
+    由 `netconfig.py` 取（席位、频率、跑道构型预设、模板、中文用词）。这里读的
+    是 can-fsd 数据源里的 `atis[]`，那是**此刻在线的运行状态**：只有机场和
+    频率，没有模板也没有预设。
+
+    `/api/v1/atis` 是第三样东西——给 EuroScope 用的文本生成器，和这两个都无关。
+
+    所以它能省掉的只是查 ICAO 和频率这一步。
+
+    按 can-fsd 的约定过滤：只有呼号以 _ATIS 结尾的才在 atis[] 里；频率是整数
+    兆赫字符串（"128.500"），199.998 表示没设，挡掉。
+    """
+    if data is None:
+        data = fetch(url)
+    found = []
+    if not data:
+        return found
+
+    for entry in data.get("atis") or []:
+        callsign = str(entry.get("callsign", "")).strip().upper()
+        frequency = str(entry.get("frequency", "")).strip()
+        if not callsign or not frequency or frequency == NO_FREQUENCY:
+            continue
+        for suffix, kind in _SUFFIXES:
+            if callsign.endswith(suffix):
+                icao = callsign[:-len(suffix)]
+                break
+        else:
+            continue                     # 不是通播呼号，跳过
+        if len(icao) != 4 or not icao.isalnum():
+            continue
+        found.append((icao, callsign, frequency, kind))
+
+    found.sort(key=lambda item: item[1])
+    return found
+
+
 def rating_for(cid, url=None, data=None):
     """查这个 CID 此刻在网络上的等级。查不到返回 None。"""
     cid = str(cid or "").strip()
@@ -87,8 +135,9 @@ def rating_for(cid, url=None, data=None):
             except (TypeError, ValueError):
                 continue
             if rating > 0:
-                log.info("从数据源查到 CID %s 的等级: %s（%s）",
+                log.info("the datafeed gives CID %s the rating %s (%s)",
                          cid, rating, entry.get("callsign", group))
                 return rating
-    log.info("数据源上没有 CID %s 在线，等级用配置里的值", cid)
+    log.info("CID %s is not online on the datafeed, using the rating from "
+             "the settings", cid)
     return None

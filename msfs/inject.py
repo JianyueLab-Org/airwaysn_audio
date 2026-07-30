@@ -24,7 +24,7 @@ import logging
 import threading
 import time
 
-log = logging.getLogger("他机注入")
+log = logging.getLogger("inject")
 
 # 我们自己的 requestID 从这里开始编，避开包里内建请求用的号段
 REQUEST_BASE = 10000
@@ -76,7 +76,7 @@ class TrafficInjector:
             self._setup()
             self.available = True
         except Exception as e:
-            log.warning("他机注入不可用: %s", e)
+            log.warning("traffic injection is unavailable: %s", e)
 
     # ---------- 初始化 ----------
     def _setup(self):
@@ -112,7 +112,7 @@ class TrafficInjector:
                         pData,
                         ctypes.POINTER(enums.SIMCONNECT_RECV_EXCEPTION)).contents)
             except Exception as e:
-                log.debug("处理 SimConnect 消息出错: %s", e)
+                log.debug("handling a SimConnect message raised: %s", e)
             return original(pData, cbData, pContext)
 
         sc.my_dispatch_proc = dispatch
@@ -150,8 +150,9 @@ class TrafficInjector:
         with self._lock:
             titles = list(self._requested_titles.values())
             waiting = list(self._pending.values())
-        log.warning("模拟器拒绝生成他机：%s。等待中的飞机 %s，用到的模型 %s",
-                    reason, waiting or "无", titles or "无")
+        log.warning("the simulator refused to create traffic: %s. waiting: %s, "
+                    "models in use: %s", reason, waiting or "none",
+                    titles or "none")
         # 模型建不出来才拉黑；位置太远是暂时的，换个地方就好了，别把好模型
         # 永久排除掉
         blacklist = code == int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED)
@@ -204,7 +205,7 @@ class TrafficInjector:
             try:
                 self._sync_one(callsign, entry)
             except Exception as e:
-                log.debug("更新 %s 出错: %s", callsign, e)
+                log.debug("updating %s raised: %s", callsign, e)
 
         for callsign in [c for c in self.aircraft if c not in seen]:
             self.remove(callsign)
@@ -227,7 +228,7 @@ class TrafficInjector:
                 record = self.aircraft.get(callsign)
                 if record is not None:
                     record["object_id"] = oid
-                    log.info("%s 已放入模拟器（对象 %d，模型 %s）",
+                    log.info("%s is in the simulator (object %d, model %s)",
                              callsign, oid, record.get("title", "?"))
             strays = [(rid, self._assigned.pop(rid))
                       for rid in list(self._assigned) if rid in self._orphaned]
@@ -240,9 +241,10 @@ class TrafficInjector:
             try:
                 self.sim.dll.AIRemoveObject(self.sim.hSimConnect, object_id,
                                             self._request_id())
-                log.info("补删了一架已经不需要的他机（对象 %d）", object_id)
+                log.info("swept up an aircraft that was no longer needed (object %d)",
+                         object_id)
             except Exception as e:
-                log.debug("补删他机出错: %s", e)
+                log.debug("the traffic sweep raised: %s", e)
 
     def _sync_one(self, callsign, entry):
         record = self.aircraft.get(callsign)
@@ -284,7 +286,7 @@ class TrafficInjector:
             self.sim.hSimConnect, title.encode("utf-8"),
             callsign.encode("utf-8")[:12], init, request_id)
         if hr != 0:
-            log.warning("创建 %s 失败（模型 %r）: HRESULT %s", callsign, title, hr)
+            log.warning("creating %s failed (model %r): HRESULT %s", callsign, title, hr)
             self.bad_titles.add(title)
             return
 
@@ -294,7 +296,7 @@ class TrafficInjector:
         self.aircraft[callsign] = {"object_id": None, "title": title,
                                    "request_id": request_id,
                                    "requested_at": time.time()}
-        log.info("请求把 %s 放进模拟器：模型 %r，请求号 %d",
+        log.info("asking the simulator to create %s: model %r, request %d",
                  callsign, title, request_id)
 
     def _move(self, object_id, entry):
@@ -324,9 +326,9 @@ class TrafficInjector:
         try:
             self.sim.dll.AIRemoveObject(self.sim.hSimConnect, object_id,
                                         self._request_id())
-            log.info("%s 已从模拟器移除", callsign)
+            log.info("removed %s from the simulator", callsign)
         except Exception as e:
-            log.debug("移除 %s 出错: %s", callsign, e)
+            log.debug("removing %s raised: %s", callsign, e)
 
     def clear(self):
         """全部清掉。断开连接和退出时都要调，否则飞机会留在天上不动。"""

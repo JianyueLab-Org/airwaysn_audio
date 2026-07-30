@@ -23,7 +23,7 @@ import os
 import subprocess
 import sys
 
-log = logging.getLogger("版本")
+log = logging.getLogger("version")
 
 # 手工维护的**回退**值。真正发出去的版本号由 CI 决定：推到 main 之后，
 # 工作流数一遍已有的 v2.0.* 标签，取最大的那个 +1，写进 buildinfo.json。
@@ -64,7 +64,7 @@ def from_git(cwd=None):
         count = _git("rev-list", "--count", "HEAD", cwd=cwd)
         short = _git("rev-parse", "--short", "HEAD", cwd=cwd)
     except Exception as e:
-        log.debug("拿不到 git 信息: %s", e)
+        log.debug("could not read the git info: %s", e)
         return None
     build = f"{count}.{short}"
     try:
@@ -83,7 +83,7 @@ def _buildinfo():
     except FileNotFoundError:
         return {}
     except Exception as e:
-        log.debug("读 %s 失败: %s", path, e)
+        log.debug("could not read %s: %s", path, e)
         return {}
 
 

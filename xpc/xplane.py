@@ -18,7 +18,7 @@ import struct
 import threading
 import time
 
-log = logging.getLogger("模拟器")
+log = logging.getLogger("sim")
 
 MCAST_GROUP = "239.255.1.1"
 MCAST_PORT = 49707
@@ -103,12 +103,12 @@ class XPlaneLink:
     def _state(self, connected, message):
         if connected != self._connected:
             self._connected = connected
-            log.info("%s: %s", "已连接" if connected else "已断开", message)
+            log.info("%s: %s", "connected" if connected else "disconnected", message)
             if self.on_state:
                 try:
                     self.on_state(connected, message)
                 except Exception as e:
-                    log.warning("状态回调出错: %s", e)
+                    log.warning("status callback raised: %s", e)
 
     @property
     def connected(self):
@@ -180,16 +180,16 @@ class XPlaneLink:
             return None
         best = min(candidates, key=lambda a: _address_rank(a[0]))
         if len(candidates) > 1:
-            log.info("信标来自 %d 个网卡 %s，选用 %s",
+            log.info("beacon arrived on %d interfaces %s, using %s",
                      len(candidates), [a[0] for a in candidates], best[0])
         else:
-            log.info("发现 X-Plane @ %s:%s", best[0], best[1])
+            log.info("found X-Plane at %s:%s", best[0], best[1])
         return best
 
     @staticmethod
     def _parse_beacon(data, addr):
         if data[:5] != b"BECN\x00":
-            log.debug("收到未知信标 %r", data[:5])
+            log.debug("unknown beacon %r", data[:5])
             return None
         try:
             # 这两个字节是**信标协议**的版本，不是 X-Plane 的版本号——早先按
@@ -209,7 +209,7 @@ class XPlaneLink:
             try:
                 sock.sendto(packet, address)
             except OSError as e:
-                log.warning("订阅 %s 失败: %s", dataref, e)
+                log.warning("could not subscribe to %s: %s", dataref, e)
 
     def _run(self):
         while self.running:
@@ -236,7 +236,8 @@ class XPlaneLink:
             self.address = address
             if address != self._known_good:
                 self._last_discovered = address
-            log.info("已向 %s:%s 订阅 %d 个 dataref", address[0], address[1], len(DATAREFS))
+            log.info("subscribed to %d datarefs at %s:%s", len(DATAREFS), address[0],
+                     address[1])
 
             got_data = False
             silent_since = time.time()

@@ -26,6 +26,7 @@ from pymumble_py3.constants import (
     PYMUMBLE_CLBK_DISCONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
     PYMUMBLE_CLBK_SOUNDRECEIVED,
+    PYMUMBLE_CONN_STATE_FAILED,
     PYMUMBLE_MSG_TYPES_REJECT,
     PYMUMBLE_MSG_TYPES_USERSTATE,
     PYMUMBLE_MSG_TYPES_VOICETARGET,
@@ -39,7 +40,7 @@ from i18n import t
 # 否则连接线程一起来就抛 AttributeError
 mumblecompat.install()
 
-log = logging.getLogger("语音")
+log = logging.getLogger("voice")
 
 # Mumble 服务器拒绝时给的类型，逐条翻译成人能看懂的原因。
 # 全都笼统说成"用户名或密码"会把人引到错误的方向——比如认证器挂了的时候，
@@ -53,6 +54,7 @@ REJECT_TYPES = ("WrongUserPW", "WrongServerPW", "InvalidUsername", "UsernameInUs
 def reject_reason(reject_type):
     """把服务器给的拒绝类型翻成人能看懂的话，不认识就返回 None。"""
     return t(f"reject.{reject_type}") if reject_type in REJECT_TYPES else None
+
 
 class RejectAwareMumble(pymumble.Mumble):
     """截下服务器的 Reject 消息，把拒绝类型留下来。
@@ -75,10 +77,10 @@ class RejectAwareMumble(pymumble.Mumble):
                 reject.ParseFromString(message)
                 self.reject_type = mumble_pb2.Reject.RejectType.Name(reject.type)
                 self.reject_reason = reject.reason or ""
-                log.warning("服务器拒绝连接: type=%s reason=%r",
+                log.warning("the server rejected the connection: type=%s reason=%r",
                             self.reject_type, self.reject_reason)
             except Exception as e:
-                log.warning("解析 Reject 消息失败: %s", e)
+                log.warning("could not parse the Reject message: %s", e)
         return super().dispatch_control_message(type, message)
 
     def run(self):
@@ -97,7 +99,8 @@ class RejectAwareMumble(pymumble.Mumble):
         try:
             super().run()
         except pymumble.errors.ConnectionRejectedError as e:
-            log.info("服务器拒绝了连接，连接线程正常退出: %s", e)
+            log.info("the server rejected the connection, the connection thread "
+                     "exited normally: %s", e)
 
     def rejection(self):
         """翻译成人能看懂的原因，没有被拒绝则返回 None。"""
@@ -126,11 +129,86 @@ CONNECT_TIMEOUT = 15.0
 # 固定 sleep 赌不起——远程服务器上 0.2 秒经常不够，表现出来就是频道"建不出来"。
 CHANNEL_TIMEOUT = 5.0
 PING_TIMEOUT = 5.0             # 超过这么久没有 ping 回复就认为断线
+# 连上过之后掉线，最多再试这么多次；都失败就整个下线，不留一条后台无限重试的
+# 僵尸连接。四个客户端同一条策略（xpc/msfs 的 voice.RECONNECT_LIMIT、
+# atis/broadcast.py 也是这个数）。
+RECONNECT_LIMIT = 3
 
 # pymumble 默认 10 秒 ping 一次、断线后 10 秒才重连，掉线要很久才能被发现。
 # 调快之后配合下面的 _connection_monitor，断线基本能在几秒内反映到界面上。
 pymumble.mumble.PYMUMBLE_PING_DELAY = 1
 pymumble.mumble.PYMUMBLE_CONNECTION_RETRY_INTERVAL = 2
+
+
+class BoundedReconnect:
+    """pymumble 的重连是无限的，这个混入给它一个上限。
+
+    默认的 `reconnect=True` 会让 `run()` 一直重试到进程结束。后果不是"多试几
+    次"这么轻：服务端 `login.py` 对认证失败**按 ASN ID 限流**，一个不停重连的
+    僵尸足以把这个账号的语音锁死，于是用户把密码改对了也连不上，直到重启客户
+    端为止。
+
+    **必须挂在 connect() 上，不能去数 DISCONNECTED 回调。** pymumble 的
+    `run()`（mumble.py:120-143）丢连接时发一次 DISCONNECTED，然后 sleep 再
+    connect()，而**失败的重连尝试是完全静默的**：连接失败那一支只
+    `sleep + continue`，一个回调都不发。所以数回调数到的是"掉了几次"而不是
+    "试了几次"——服务器一直起不来时回调只有一次，后面它安静地重试到天亮。
+
+    **"连上了"只能以 ServerSync 为准。** `connect()` 成功时返回的是
+    `AUTHENTICATING` 而不是 `CONNECTED`：它只负责建 TLS 并把 Authenticate 发出
+    去，认证结果要等服务器回话。密码错的连接同样返回那个值，然后在 `loop()` 里
+    因为 Reject 结束——把返回值当成功就等于每次都把计数清零，又变回无限重试，
+    而这一次撞的正好是上面说的按账号限流。所以计数只在 `_session_established()`
+    （由 CONNECTED 回调调用）里清零。
+
+    这一份和 xpc/msfs 的 voice.py、atis 的 broadcast.py 是同一段逻辑的副本——
+    这个仓库靠复制共享代码，改一处要把四处一起改。
+    """
+
+    reconnect_limit = RECONNECT_LIMIT
+    reconnect_attempts = 0
+    gave_up = False
+    on_reconnect = None            # 回调 (第几次, 上限)，用来更新界面
+    _established = False
+
+    def _session_established(self):
+        """真的建立过一次会话（收到 ServerSync）。计数从这里清零。"""
+        self._established = True
+        self.reconnect_attempts = 0
+
+    def connect(self):
+        # 判定放在发起连接之前：两种失败（连不上服务器、服务器拒绝认证）都被
+        # 同一处挡住，也不会多试出第四次。
+        if self._established and self.reconnect_attempts >= self.reconnect_limit:
+            self.gave_up = True
+            self.reconnect = False
+            self.connected = PYMUMBLE_CONN_STATE_FAILED
+            log.warning("%d reconnect attempts after the drop all failed, "
+                        "giving up", self.reconnect_attempts)
+            return self.connected
+
+        if self._established:
+            self.reconnect_attempts += 1
+            log.info("reconnecting to the voice server (attempt %d/%d)",
+                     self.reconnect_attempts, self.reconnect_limit)
+            if self.on_reconnect:
+                try:
+                    self.on_reconnect(self.reconnect_attempts,
+                                      self.reconnect_limit)
+                except Exception as e:
+                    log.warning("reconnect callback raised: %s", e)
+
+        return super().connect()
+
+
+def bounded_mumble(base=None):
+    """把 BoundedReconnect 套在 RejectAwareMumble 上，返回那个类。
+
+    现取现套而不是在顶层写死一个子类：测试里是替换类来放替身的，import 时钉死
+    基类会让替身进不来。`base` 是给测试直接指定假基类用的。
+    """
+    return type("BoundedRejectAwareMumble",
+                (BoundedReconnect, base or RejectAwareMumble), {})
 
 
 class VoiceClient:
@@ -143,7 +221,7 @@ class VoiceClient:
     """
 
     def __init__(self, server, cid, password, on_state=None, on_rx=None, on_tx=None,
-                 on_connection_change=None):
+                 on_connection_change=None, reconnect_limit=RECONNECT_LIMIT):
         self.server = server
         self.cid = str(cid).strip()
         self.password = password
@@ -151,6 +229,11 @@ class VoiceClient:
         self.on_rx = on_rx
         self.on_tx = on_tx
         self.on_connection_change = on_connection_change
+        # 掉线后最多重连几次，用尽就整个下线，见 BoundedReconnect
+        self.reconnect_limit = reconnect_limit
+        # 重连次数用尽、已经彻底下线。和"没在跑"是两回事：界面要知道是掉线掉
+        # 没了，而不是管制员自己点的断开。
+        self.gave_up = False
 
         self.mumble = None
         self.connected = False
@@ -206,7 +289,7 @@ class VoiceClient:
             try:
                 self.on_state(state, message)
             except Exception as e:
-                log.warning(f"状态回调出错: {e}")
+                log.warning(f"status callback raised: {e}")
 
     # ---------- 连接 ----------
     def connect(self):
@@ -217,8 +300,13 @@ class VoiceClient:
             self.RATE = self._find_best_sample_rate()
             self.CHUNK = int(self.RATE * 0.02)
 
-            self.mumble = RejectAwareMumble(self.server, self.cid,
-                                          password=self.password, reconnect=True)
+            # reconnect=True 仍然要，掉线自己连回来是对的；上限由
+            # BoundedReconnect 管，用尽了就整个下线。
+            self.mumble = bounded_mumble()(self.server, self.cid,
+                                           password=self.password,
+                                           reconnect=True)
+            self.mumble.reconnect_limit = self.reconnect_limit
+            self.mumble.on_reconnect = self._on_reconnect_attempt
             self.mumble.set_receive_sound(True)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_CONNECTED, self._on_connected)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_DISCONNECTED, self._on_disconnected)
@@ -271,11 +359,29 @@ class VoiceClient:
 
     def _on_connected(self):
         self.connected = True
+        # 计数只在这里清零：connect() 返回成功只代表 TLS 建好、Authenticate 发
+        # 出去了，密码错的连接同样是那个返回值。详见 BoundedReconnect。
+        if self.mumble is not None and hasattr(self.mumble, "_session_established"):
+            self.mumble._session_established()
+
+    def _on_reconnect_attempt(self, attempt, limit):
+        """每发起一次重连报一次，状态栏上能看到"重连中 1/3"。"""
+        self._state('reconnecting',
+                    t("voice.reconnecting", attempt=attempt, limit=limit))
 
     def _on_disconnected(self):
-        if self.running:
-            self._state('error', t("voice.dropped"))
+        """一条已经建立的连接断掉了。
+
+        **它不只在"彻底放弃"时发。** pymumble 的 run() 每次丢连接都发一次
+        （mumble.py:139/142 两个分支都发），然后才决定要不要重连——原来这里一律
+        报 error，于是一次普通抖动在管制端就是一句红字"连接已断开"，而 pymumble
+        正在后台好好地连回来，红字也没人撤。真正的终态是重连次数用尽，那条走
+        `_give_up()`。
+        """
         self.connected = False
+        if self.running and not getattr(self.mumble, "gave_up", False):
+            self._state('reconnecting',
+                        t("voice.dropped_retrying", limit=self.reconnect_limit))
         if self.on_connection_change:
             self.on_connection_change(False)
 
@@ -288,6 +394,13 @@ class VoiceClient:
         """
         while self.running:
             try:
+                # 重连次数用尽了：连接线程已经结束，这里是唯一会再跑的地方，
+                # 所以收摊只能挂在它上面。**必须先判这一条**——下面那些判据只会
+                # 说"断线了"，而断线和"再也不会连回来了"对用户是两回事。
+                if getattr(self.mumble, "gave_up", False):
+                    self._give_up()
+                    return
+
                 try:
                     last_rcv = self.mumble.ping_stats.get('last_rcv', 0)
                     if last_rcv:
@@ -298,20 +411,24 @@ class VoiceClient:
                 alive = bool(self.mumble and self.mumble.connected)
                 if alive and time.time() - self._last_ping_rcv > PING_TIMEOUT:
                     alive = False
-                    log.info(f"ping 超时 {time.time() - self._last_ping_rcv:.1f}s，判定断线")
+                    log.info(f"no ping reply for {time.time() - self._last_ping_rcv:.1f}s, "
+                             f"treating the connection as dropped")
 
                 if alive != self._last_connected:
                     reconnected = alive and not self._last_connected
                     self._last_connected = alive
                     self.connected = alive
-                    log.info(f"连接状态变化: {alive}")
+                    log.info(f"connection state changed: {alive}")
                     if self.on_connection_change:
                         self.on_connection_change(alive)
                     if reconnected:
+                        # 连回来了要说一声：否则状态栏停在"正在重连"，而语音其实
+                        # 已经好了
+                        self._state('online', t("voice.reconnected"))
                         self._resync_after_reconnect()
             except Exception as e:
                 if self.running:
-                    log.warning(f"连接监控出错: {e}")
+                    log.warning(f"the connection monitor raised: {e}")
             time.sleep(1)
 
     def _resync_after_reconnect(self):
@@ -330,7 +447,8 @@ class VoiceClient:
         - `_channel_ids` 里的频道号可能已经失效——临时频道空了就被服务器销毁，
           再建回来是个新号。
         """
-        log.info("重连成功，重新推送电台栈（频道、监听、发话目标都要重来）")
+        log.info("reconnected, pushing the radio stack again (channel, listeners "
+             "and voice targets all have to be redone)")
         self._channel_ids.clear()
         self._channel_to_khz.clear()
         self._listening = set()
@@ -362,7 +480,29 @@ class VoiceClient:
             reason = t("denied.with_note", reason=reason, note=event.reason)
         self._state('denied', reason)
 
-    def disconnect(self):
+    def _give_up(self):
+        """掉线后重连次数用尽：整个下线。
+
+        必须真的收掉，不能只报个错。留着不管的话 PyAudio 还占着麦克风、pymumble
+        还挂在那里，而管制员看到的只是一句红字——他再点一次连接会在"音频设备打不
+        开"上失败，被指向声卡。
+
+        这条跑在连接监控线程上，disconnect() 里的 join 都带
+        `is not threading.current_thread()`，不会自己等自己。
+        """
+        self.gave_up = True
+        log.warning("%d reconnect attempts after the drop all failed, going "
+                    "offline", self.reconnect_limit)
+        self.disconnect(state='offline',
+                        message=t("voice.reconnect_failed",
+                                  limit=self.reconnect_limit))
+
+    def disconnect(self, state='stopped', message=None):
+        """收掉整条连接。
+
+        `state`/`message` 只为了区分"管制员自己点的断开"和"重连次数用尽后自己
+        下线的"（`_give_up()` 传 offline）——界面对后者要弹回登录页并说明原因。
+        """
         self.running = False
         self.transmitting = False
         self.connected = False
@@ -379,15 +519,15 @@ class VoiceClient:
             try:
                 self.audio.terminate()
             except Exception as e:
-                log.warning(f"释放音频设备出错: {e}")
+                log.warning(f"releasing the audio device raised: {e}")
             self.audio = None
         if self.mumble:
             try:
                 self.mumble.stop()
             except Exception as e:
-                log.warning(f"断开连接出错: {e}")
+                log.warning(f"disconnecting raised: {e}")
             self.mumble = None
-        self._state('stopped', t("voice.stopped"))
+        self._state(state, message if message is not None else t("voice.stopped"))
 
     # ---------- 音频设备 ----------
     def _find_best_sample_rate(self):
@@ -405,7 +545,8 @@ class VoiceClient:
         for rate in SUPPORTED_SAMPLE_RATES:
             if works(rate):
                 if rate != 48000:
-                    log.warning(f"设备不支持 48kHz，退到 {rate} Hz（音调会有偏差）")
+                    log.warning(f"the device does not support 48 kHz, falling back to "
+                                f"{rate} Hz (audio will be pitch-shifted)")
                 return rate
         return 48000
 
@@ -439,7 +580,7 @@ class VoiceClient:
                     stream.stop_stream()
                     stream.close()
                 except Exception as e:
-                    log.warning(f"关闭{name}出错: {e}")
+                    log.warning(f"closing the {name} stream raised: {e}")
                 setattr(self, name, None)
 
     def set_mic_volume(self, percent):
@@ -508,15 +649,15 @@ class VoiceClient:
         if channel is None:
             self._forget_channel(khz, name)
             try:
-                log.info("频道 %s 不存在，建一个临时的", name)
+                log.info("channel %s does not exist, creating a temporary one", name)
                 self._create_channel(name)
                 channel = self._wait_for_channel(name)
             except Exception as e:
-                log.warning(f"无法创建频道 {name}: {e}")
+                log.warning(f"could not create channel {name}: {e}")
                 return None
         if channel is None:
-            log.warning("建立频道 %s 后 %.0f 秒内没有出现，这一轮先跳过",
-                        name, CHANNEL_TIMEOUT)
+            log.warning("channel %s did not appear within %.0f s of being "
+                        "created, skipping this round", name, CHANNEL_TIMEOUT)
             return None
 
         channel_id = channel["channel_id"]
@@ -525,8 +666,8 @@ class VoiceClient:
             # 同一个频率换了新号：反查表里的旧号要拆掉，否则收到的音频会被
             # 认成另一个频率
             self._channel_to_khz.pop(previous, None)
-            log.info("频道 %s 换了号：%s → %s", name, previous, channel_id)
-        log.debug("频率 %s 对应频道 %s (id %s)",
+            log.info("channel %s changed id: %s -> %s", name, previous, channel_id)
+        log.debug("frequency %s maps to channel %s (id %s)",
                   radiostack.format_frequency(khz), name, channel_id)
         self._channel_ids[khz] = channel_id
         self._channel_to_khz[channel_id] = khz
@@ -539,8 +680,8 @@ class VoiceClient:
             return
         self._channel_to_khz.pop(stale, None)
         self._listening.discard(stale)
-        log.info("频道 %s 已经不在了（临时频道一空就被销毁），旧号 %s 作废",
-                 name, stale)
+        log.info("channel %s is gone (a temporary channel dies as soon as it "
+                 "empties), discarding the stale id %s", name, stale)
 
     def sync(self, stack):
         """把电台栈的状态推到服务器：进主频道、监听其余 RX、设好 TX 目标。
@@ -588,8 +729,8 @@ class VoiceClient:
         self._xc_channels = [c for c in self._xc_channels if c is not None]
         self._set_voice_target(self._tx_channels)
         self._program_cross_couple_targets()
-        log.debug("同步电台栈: 主频率 %s，RX %s，TX %s，XC %s",
-                  radiostack.format_frequency(primary) if primary else "无",
+        log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
+                  radiostack.format_frequency(primary) if primary else "none",
                   [radiostack.format_frequency(k) for k in stack.rx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.tx_frequencies()],
                   [radiostack.format_frequency(k) for k in stack.xc_frequencies()])
@@ -606,12 +747,13 @@ class VoiceClient:
             # 命令是异步的，确认真的进去了再往下走——主频道没进去的话，服务端
             # 不支持频道监听时管制员一个频率都听不到
             if not self._wait_until_in(channel_id):
-                log.warning("发出了进入频道 %s 的请求，但 %.0f 秒内没有生效",
-                            channel_id, CHANNEL_TIMEOUT)
+                log.warning("sent the request to join channel %s but it did not "
+                            "take effect within %.0f s", channel_id,
+                            CHANNEL_TIMEOUT)
                 return False
             return True
         except Exception as e:
-            log.warning(f"进入频道失败: {e}")
+            log.warning(f"joining the channel failed: {e}")
             return False
 
     def _wait_until_in(self, channel_id):
@@ -640,11 +782,11 @@ class VoiceClient:
             for channel_id in remove:
                 state.listening_channel_remove.append(channel_id)
             self.mumble.send_message(PYMUMBLE_MSG_TYPES_USERSTATE, state)
-            log.debug("频道监听 +%s -%s，当前监听 %s",
+            log.debug("channel listeners +%s -%s, now listening to %s",
                       sorted(add), sorted(remove), sorted(channel_ids))
             self._listening = set(channel_ids)
         except Exception as e:
-            log.warning(f"设置频道监听失败: {e}")
+            log.warning(f"setting the channel listeners failed: {e}")
 
     def _program_target(self, target_id, channel_ids):
         """把一组频道编成某个编号的 VoiceTarget。"""
@@ -657,9 +799,9 @@ class VoiceClient:
                 entry = target.targets.add()
                 entry.channel_id = channel_id
             self.mumble.send_message(PYMUMBLE_MSG_TYPES_VOICETARGET, target)
-            log.debug("VoiceTarget %s 设为频道 %s", target_id, list(channel_ids))
+            log.debug("VoiceTarget %s set to channels %s", target_id, list(channel_ids))
         except Exception as e:
-            log.warning(f"设置发话目标失败: {e}")
+            log.warning(f"setting the voice target failed: {e}")
 
     def _program_cross_couple_targets(self):
         """给每个 XC 频率编一个"发给其它 XC 频率"的目标。
@@ -717,7 +859,7 @@ class VoiceClient:
             try:
                 self.on_rx(khz, True, user["name"])
             except Exception as e:
-                log.warning(f"RX 回调出错: {e}")
+                log.warning(f"the RX callback raised: {e}")
 
         try:
             audio = np.frombuffer(soundchunk.pcm, dtype=np.int16)
@@ -730,7 +872,7 @@ class VoiceClient:
                 if self.output_stream:
                     self.output_stream.write(audio.tobytes())
         except Exception as e:
-            log.warning(f"播放收到的话音出错: {e}")
+            log.warning(f"playing the received audio raised: {e}")
 
         self._forward_cross_couple(khz, soundchunk)
 
@@ -753,7 +895,7 @@ class VoiceClient:
                 self.mumble.sound_output.target = target_id
                 self.mumble.sound_output.add_sound(soundchunk.pcm)
             except Exception as e:
-                log.warning(f"交叉耦合转发失败: {e}")
+                log.warning(f"cross-couple forwarding failed: {e}")
             finally:
                 self.mumble.sound_output.target = 0
 
@@ -771,7 +913,7 @@ class VoiceClient:
                         try:
                             self.on_rx(khz, False, "")
                         except Exception as e:
-                            log.warning(f"RX 回调出错: {e}")
+                            log.warning(f"the RX callback raised: {e}")
             time.sleep(0.1)
 
     # ---------- 发 ----------
@@ -806,7 +948,7 @@ class VoiceClient:
             with self._audio_lock:
                 self.mumble.sound_output.target = PTT_TARGET_ID
         except Exception as e:
-            log.warning(f"切换发话目标失败: {e}")
+            log.warning(f"switching the voice target failed: {e}")
 
         while self.transmitting and self.running:
             try:
@@ -828,7 +970,7 @@ class VoiceClient:
                         self.mumble.sound_output.target = PTT_TARGET_ID
                         self.mumble.sound_output.add_sound(audio.tobytes())
             except Exception as e:
-                log.warning(f"录音出错: {e}")
+                log.warning(f"recording raised: {e}")
                 time.sleep(0.1)
             time.sleep(0.001)
 

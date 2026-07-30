@@ -18,7 +18,7 @@ import math
 import threading
 import time
 
-log = logging.getLogger("他机")
+log = logging.getLogger("traffic")
 
 # 超过这么久没有新位置就认为对方掉线了。FSD 正常 5 Hz，给足余量。
 STALE_AFTER = 15.0
@@ -192,7 +192,7 @@ class TrafficTable:
             if aircraft is None:
                 aircraft = Aircraft(callsign)
                 self.aircraft[callsign] = aircraft
-                log.info("发现他机 %s", callsign)
+                log.info("new aircraft %s", callsign)
             aircraft.update(Sample(now, latitude, longitude, altitude, pitch,
                                    bank, heading, on_ground, groundspeed),
                             squawk=squawk, mode=mode)
@@ -206,7 +206,7 @@ class TrafficTable:
             try:
                 self.on_request_info(callsign)
             except Exception as e:
-                log.warning("请求 %s 的机型失败: %s", callsign, e)
+                log.warning("could not ask %s for its aircraft type: %s", callsign, e)
         return aircraft
 
     def set_plane_info(self, callsign, **info):
@@ -218,7 +218,7 @@ class TrafficTable:
                 self.aircraft[callsign] = aircraft
             changed = aircraft.set_plane_info(**info)
         if changed:
-            log.info("%s 机型 %s/%s", callsign,
+            log.info("%s is a %s/%s", callsign,
                      aircraft.equipment or "?", aircraft.airline or "?")
         return aircraft
 
@@ -248,7 +248,7 @@ class TrafficTable:
     def remove(self, callsign):
         with self._lock:
             if self.aircraft.pop(callsign, None):
-                log.info("他机 %s 离线", callsign)
+                log.info("%s went offline", callsign)
                 return True
             return False
 
@@ -261,7 +261,7 @@ class TrafficTable:
             for callsign in gone:
                 del self.aircraft[callsign]
         for callsign in gone:
-            log.info("他机 %s 超时移除", callsign)
+            log.info("dropped %s, no updates for too long", callsign)
         return gone
 
     def snapshot(self, now=None, origin=None, limit=None, max_range_nm=None):

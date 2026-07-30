@@ -7,9 +7,10 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 
 import applog
 import datafeed
+import netconfig
 import weather
 
-log = logging.getLogger("设置")
+log = logging.getLogger("settings")
 
 DEFAULT_FSD_HOST = "fsd.airwaysn.org"
 DEFAULT_FSD_PORT = 6809
@@ -52,6 +53,12 @@ class Settings:
         # 这样通播和管制席位显示的等级一致；查不到就退回 OBS。
         self.rating = 0
         self.datafeed_url = datafeed.DEFAULT_DATAFEED_URL
+        # 全网通播配置的地址（can-web 的 /api/v1/atis/config），和上面那个
+        # 数据源不是一回事：数据源说的是此刻谁在播，这个给的是配置本身。
+        self.config_url = netconfig.DEFAULT_CONFIG_URL
+        # 上次并进来的那份网络配置的版本（服务端算的内容哈希）。记下来是为了
+        # 能回答"已经是最新的了"，而不是每次都让人再看一遍完整的差异。
+        self.config_version = ""
         # 自动刷新天气的间隔（秒）。METAR 半小时一发，5 分钟查一次足够及时，
         # 又不至于把气象源打太狠。夹在 1 分钟到 1 小时之间。
         self.metar_refresh = DEFAULT_METAR_REFRESH
@@ -71,8 +78,9 @@ class Settings:
                 self.metar_url = data.get("metar_url") or weather.DEFAULT_METAR_URL
                 self.fsd_host = data.get("fsd_host") or DEFAULT_FSD_HOST
                 if self.fsd_host in WRONG_FSD_HOSTS:
-                    log.warning("配置里的 FSD 地址 %s 是语音服务器，已改为 %s",
-                                self.fsd_host, DEFAULT_FSD_HOST)
+                    log.warning("the FSD host %s in the settings is the voice server, "
+                                "using %s instead", self.fsd_host,
+                                DEFAULT_FSD_HOST)
                     self.fsd_host = DEFAULT_FSD_HOST
                 self.fsd_port = int(data.get("fsd_port") or DEFAULT_FSD_PORT)
                 self.real_name = data.get("real_name", "")
@@ -80,13 +88,16 @@ class Settings:
                 self.rating = int(data.get("rating") or 0)
                 self.datafeed_url = (data.get("datafeed_url")
                                      or datafeed.DEFAULT_DATAFEED_URL)
+                self.config_url = (data.get("config_url")
+                                   or netconfig.DEFAULT_CONFIG_URL)
+                self.config_version = str(data.get("config_version") or "")
                 self.metar_refresh = clamp_refresh(
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
                 self.compact = bool(data.get("compact", False))
                 self.always_on_top = bool(data.get("always_on_top", False))
                 self.debug = bool(data.get("debug", False))
         except Exception as e:
-            log.warning(f"加载设置失败: {e}")
+            log.warning(f"could not load the settings: {e}")
 
     def save_settings(self):
         try:
@@ -100,13 +111,15 @@ class Settings:
                     "connect_fsd": self.connect_fsd,
                     "rating": self.rating,
                     "datafeed_url": self.datafeed_url,
+                    "config_url": self.config_url,
+                    "config_version": self.config_version,
                     "metar_refresh": self.metar_refresh,
                     "compact": self.compact,
                     "always_on_top": self.always_on_top,
                     "debug": self.debug,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            log.warning(f"保存设置失败: {e}")
+            log.warning(f"could not save the settings: {e}")
 
 
 class SettingsDialog(QDialog):
