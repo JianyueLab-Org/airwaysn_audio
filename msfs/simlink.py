@@ -22,7 +22,7 @@ import math
 import threading
 import time
 
-log = logging.getLogger("模拟器")
+log = logging.getLogger("sim")
 
 # _poll 的三种结果。"没进飞行"和"连接断了"要分开——前者是常态，重开连接
 # 只会在日志里刷一串 SIM OPEN。
@@ -104,12 +104,12 @@ class SimLink:
     def _state(self, connected, message):
         if connected != self._connected:
             self._connected = connected
-            log.info("%s: %s", "已连接" if connected else "已断开", message)
+            log.info("%s: %s", "connected" if connected else "disconnected", message)
             if self.on_state:
                 try:
                     self.on_state(connected, message)
                 except Exception as e:
-                    log.warning("状态回调出错: %s", e)
+                    log.warning("status callback raised: %s", e)
 
     @property
     def connected(self):
@@ -161,10 +161,10 @@ class SimLink:
                     self._open()
                 except Exception as e:
                     self._state(False, "连不上 MSFS（模拟器是否已启动？）")
-                    log.debug("SimConnect 打开失败: %s", e)
+                    log.debug("opening SimConnect failed: %s", e)
                     self._sleep(RETRY_INTERVAL)
                     continue
-                log.info("已连接 SimConnect")
+                log.info("connected to SimConnect")
 
             result = self._poll()
             if result is FAILED:
@@ -203,7 +203,7 @@ class SimLink:
                 if value is not None:
                     values[name] = value
         except Exception as e:
-            log.debug("读取 SimVar 出错: %s", e)
+            log.debug("reading a SimVar raised: %s", e)
             return FAILED
 
         # 经纬度是判断"有没有真的在飞"的最低要求

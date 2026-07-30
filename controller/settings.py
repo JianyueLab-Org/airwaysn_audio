@@ -13,7 +13,7 @@ import i18n
 import version
 from i18n import t
 
-log = logging.getLogger("设置")
+log = logging.getLogger("settings")
 
 
 class Settings:
@@ -53,7 +53,7 @@ class Settings:
                     self.language = data.get("language", "") or ""
                     self.debug = bool(data.get("debug", False))
         except Exception as e:
-            log.warning(f"加载设置失败: {e}")
+            log.warning(f"could not load the settings: {e}")
 
     def save_settings(self):
         try:
@@ -72,7 +72,7 @@ class Settings:
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
-            log.warning(f"保存设置失败: {e}")
+            log.warning(f"could not save the settings: {e}")
 
 
 class SettingsDialog(QDialog):

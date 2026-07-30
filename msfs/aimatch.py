@@ -31,7 +31,7 @@ import configparser
 import logging
 import os
 
-log = logging.getLogger("机型匹配")
+log = logging.getLogger("aimatch")
 
 # 同族机型。匹配不到精确型号时按这里找替身，都是外形接近的。
 # 和 xpc/cslmatch.py 保持一致，改一边要记得改另一边。
@@ -139,7 +139,7 @@ def parse_aircraft_cfg(path):
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             parser.read_file(f)
     except (OSError, configparser.Error) as e:
-        log.debug("读不了 %s: %s", path, e)
+        log.debug("cannot read %s: %s", path, e)
         return []
 
     icao = ""
@@ -248,7 +248,7 @@ class ModelSet:
                 continue
             for path in find_aircraft_cfgs(root):
                 models.extend(parse_aircraft_cfg(path))
-        log.info("载入 %d 个涂装", len(models))
+        log.info("loaded %d liveries", len(models))
         return cls(models)
 
     def by_title(self, title):

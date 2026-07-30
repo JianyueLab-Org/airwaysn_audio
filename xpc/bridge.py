@@ -21,7 +21,7 @@ import json
 import logging
 import socket
 
-log = logging.getLogger("桥")
+log = logging.getLogger("bridge")
 
 # 客户端 → 插件。49900 往上是 X-Plane 自己不用的区间。
 PLUGIN_PORT = 49900
@@ -101,7 +101,7 @@ class Reassembler:
         try:
             return json.loads(body)
         except ValueError as e:
-            log.debug("重组后仍解析失败: %s", e)
+            log.debug("still could not parse after reassembly: %s", e)
             return None
 
 
@@ -128,7 +128,7 @@ class BridgeSender:
                 sock.sendto(packet, self.address)
             return True
         except OSError as e:
-            log.debug("发给插件失败（插件可能没开）: %s", e)
+            log.debug("sending to the plugin failed (it may not be running): %s", e)
             return False
 
     def send_traffic(self, entries, own=None):

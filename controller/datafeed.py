@@ -19,7 +19,7 @@ import urllib.request
 
 import radiostack
 
-log = logging.getLogger("数据源")
+log = logging.getLogger("datafeed")
 
 DEFAULT_DATAFEED_URL = "https://data.airwaysn.org/v1/data.json"
 
@@ -42,7 +42,7 @@ def fetch(url=None, timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))
     except Exception as e:
-        log.warning("读取数据源失败: %s", e)
+        log.warning("could not read the datafeed: %s", e)
         return None
 
 
@@ -86,7 +86,7 @@ def frequency_khz(entry):
         # OverflowError 不是假想的：json.loads 默认认裸的 Infinity，而
         # int(round(inf * 1000)) 抛的正是它，只接 ValueError 会让它一路
         # 冒到 Qt 槽函数里去
-        log.warning("席位 %s 的频率 %r 解析不了，跳过",
+        log.warning("could not parse the frequency %r of position %s, skipping it",
                     entry.get("callsign", "?"), raw)
         return None
     if khz == NO_FREQUENCY_KHZ:

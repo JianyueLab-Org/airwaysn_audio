@@ -160,7 +160,7 @@ class PythonInterface:
         self._find_tcas_datarefs()
 
         xp.registerFlightLoopCallback(self.flight_loop, -1, 0)
-        xp.log(f"XPC 他机插件已启动（{self._version_note()}）")
+        xp.log(f"XPC traffic plugin started ({self._version_note()})")
         return self.Name, self.Sig, self.Desc
 
     @staticmethod
@@ -194,8 +194,9 @@ class PythonInterface:
         missing = [name for name, ref in self.tcas.items() if ref is None]
         self.tcas_available = bool(self.override_tcas) and not missing
         if not self.tcas_available:
-            xp.log("这个 X-Plane 版本没有 TCAS 接管（需要 11.50 以上）"
-                   f"，他机只会被画出来，不会进 TCAS。缺少: {missing or 'override_TCAS'}")
+            xp.log("this X-Plane build has no TCAS override (11.50+ required); "
+                   f"traffic will be drawn but will not reach TCAS. "
+                   f"missing: {missing or 'override_TCAS'}")
 
     def _register_animation_datarefs(self):
         """注册 libxplanemp 那套动画 dataref。
@@ -206,8 +207,9 @@ class PythonInterface:
         """
         existing = xp.findDataRef(ANIMATION_DATAREFS[0])
         if existing is not None:
-            xp.log("警告: 已有插件注册了 libxplanemp 的动画 dataref"
-                   "（LiveTraffic / XPMP2？）。两套他机系统同时开会互相干扰。")
+            xp.log("warning: another plugin already registered the libxplanemp "
+                   "animation datarefs (LiveTraffic / XPMP2?); running two "
+                   "traffic systems at once makes them fight each other")
             return
 
         for name in ANIMATION_DATAREFS:
@@ -222,7 +224,7 @@ class PythonInterface:
             self.socket.bind(("127.0.0.1", PLUGIN_PORT))
             self.socket.setblocking(False)
         except OSError as e:
-            xp.log(f"绑定 {PLUGIN_PORT} 失败: {e}")
+            xp.log(f"could not bind {PLUGIN_PORT}: {e}")
             return 0
 
         # 只有要送 TCAS 才需要抢 AI 机位。没这个能力就别抢——白占着会挡住
@@ -235,18 +237,19 @@ class PythonInterface:
         try:
             self.have_planes = bool(xp.acquirePlanes())
         except Exception as e:
-            xp.log(f"acquirePlanes 失败: {e}")
+            xp.log(f"acquirePlanes failed: {e}")
             self.have_planes = False
 
         if self.have_planes:
             xp.setDatai(self.override_tcas, 1)
-            xp.log("已取得 AI 机位控制权，TCAS 接管")
+            xp.log("acquired the AI planes, TCAS override is on")
         else:
             try:
                 _, _, who = xp.countAircraft()
             except Exception:
                 who = "?"
-            xp.log(f"取不到 AI 机位控制权（被插件 {who} 占着），他机不会进 TCAS")
+            xp.log(f"could not acquire the AI planes (plugin {who} holds them), "
+                   f"traffic will not reach TCAS")
         return 1
 
     def XPluginDisable(self):
@@ -282,7 +285,7 @@ class PythonInterface:
         try:
             self._pump()
         except Exception:
-            xp.log("他机插件出错:\n" + traceback.format_exc())
+            xp.log("traffic plugin error:\n" + traceback.format_exc())
         return -1        # 每帧都跑
 
     def _pump(self):

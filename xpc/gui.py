@@ -43,7 +43,7 @@ import voice as voice_module
 import xplane
 from settings import Settings
 
-log = logging.getLogger("界面")
+log = logging.getLogger("gui")
 
 APP_NAME = "XPC for CAN"
 # 版本号和 build 号统一在 version.py 里。build 号是打包时由 gui.spec 固化的
@@ -407,15 +407,15 @@ class XpcWindow(QMainWindow):
         if not path:
             return
         if not os.path.isdir(path):
-            log.warning("CSL 目录不存在: %s", path)
+            log.warning("the CSL directory does not exist: %s", path)
             return
         try:
             self.models = cslmatch.ModelSet.load(path)
         except Exception as e:
-            log.warning("读取 CSL 模型失败: %s", e)
+            log.warning("failed to read the CSL models: %s", e)
             return
         self._model_cache.clear()
-        log.info("载入 %d 个 CSL 模型，覆盖 %d 种机型",
+        log.info("loaded %d CSL models covering %d aircraft types",
                  len(self.models), len(self.models.types))
 
     def _push_traffic(self, snapshot):
@@ -453,7 +453,7 @@ class XpcWindow(QMainWindow):
                      entry.get("equipment") or "?", entry.get("airline") or "?",
                      model.name, why)
         else:
-            log.debug("%s 没有模型可用：%s", callsign, why)
+            log.debug("no model available for %s: %s", callsign, why)
         return path
 
     # ---------- 槽 ----------
@@ -463,23 +463,59 @@ class XpcWindow(QMainWindow):
         self.add_message(f"[X-Plane] {message}", GREEN if connected else AMBER)
 
     def on_fsd_status(self, state, message):
-        colour = {'online': GREEN, 'error': RED}.get(state, AMBER)
-        self.fsd_label.setText(f"网络：{'已上线' if state == 'online' else state}")
+        colour = {'online': GREEN, 'error': RED, 'offline': RED}.get(state, AMBER)
+        label = {'online': '已上线', 'reconnecting': '重连中',
+                 'offline': '已下线'}.get(state, state)
+        self.fsd_label.setText(f"网络：{label}")
         self.fsd_label.setStyleSheet(f"color: {colour};")
         self.add_message(f"[网络] {message}", colour)
         self.ident_button.setEnabled(state == 'online')
+
+        # 还在重连：这条连接没死，引用留着——置空的话 tick() 就不再喂位置，
+        # 连回来之后飞机在别人屏幕上停在掉线的那一点。
+        if state == 'reconnecting':
+            return
+
+        # 重连次数用尽：整个下线。FSD 自己已经收摊了，这里连语音一起收。
+        if state == 'offline':
+            self.fsd = None
+            self.disconnect_all()
+            return
+
         if state == 'error':
-            # 网络断了不该把语音一起收掉，两条链路互不依赖
+            # 首次登录失败这类不重试的错误。语音不受影响——两条链路互不依赖，
+            # 只有"重连到底也没成功"才一起下线。
             self.fsd = None
             self.connect_button.setText("断开" if self.voice else "连接")
 
     def on_voice_status(self, state, message):
-        colour = {'online': GREEN, 'error': RED}.get(state, AMBER)
-        self.voice_label.setText(f"语音：{'已连接' if state == 'online' else state}")
+        colour = {'online': GREEN, 'error': RED, 'offline': RED}.get(state, AMBER)
+        label = {'online': '已连接', 'reconnecting': '重连中',
+                 'offline': '已下线'}.get(state, state)
+        self.voice_label.setText(f"语音：{label}")
         self.voice_label.setStyleSheet(f"color: {colour};")
         self.add_message(f"[语音] {message}", colour)
-        if state == 'error':
+
+        # 掉线重连中：连接还活着，**绝对不能把 self.voice 置空**。置空的话
+        # tick() 里的 `if self.voice` 不成立，连回来之后再也不跟着 COM1 走了——
+        # 语音是通的，人却停在掉线前那个频道上。
+        if state == 'reconnecting':
+            return
+
+        # 重连次数用尽：整个下线。语音自己已经收摊了（Voice._give_up 走的是
+        # stop()），这里把引用清掉再统一走断开，FSD 也一起收。
+        if state == 'offline':
             self.voice = None
+            self.disconnect_all()
+            return
+
+        if state == 'error':
+            voice = self.voice
+            self.voice = None
+            # 也要真的收掉。只把引用置空的话，PyAudio 还占着麦克风、pymumble
+            # 还在后台重连，而服务端 login.py 对认证失败按 ASN ID 限流。
+            if voice:
+                threading.Thread(target=voice.stop, daemon=True).start()
             self.connect_button.setText("断开" if self.fsd else "连接")
 
     def on_text_message(self, sender, recipient, body):
@@ -551,7 +587,7 @@ class XpcWindow(QMainWindow):
         try:
             import keyboard
         except Exception as e:
-            log.warning("按键 PTT 不可用: %s", e)
+            log.warning("keyboard PTT is unavailable: %s", e)
             keyboard = None
 
         joystick = self._open_joystick()
@@ -567,7 +603,7 @@ class XpcWindow(QMainWindow):
                     if self.settings.joystick_ptt < joystick.get_numbuttons():
                         state = bool(joystick.get_button(self.settings.joystick_ptt))
             except Exception as e:
-                log.debug("读 PTT 出错: %s", e)
+                log.debug("reading the PTT state raised: %s", e)
 
             if state != pressed:
                 pressed = state
@@ -590,10 +626,10 @@ class XpcWindow(QMainWindow):
                 return None
             stick = pygame.joystick.Joystick(0)
             stick.init()
-            log.info("摇杆: %s", stick.get_name())
+            log.info("joystick: %s", stick.get_name())
             return stick
         except Exception as e:
-            log.warning("摇杆初始化失败: %s", e)
+            log.warning("joystick init failed: %s", e)
             return None
 
     # ---------- 对话框 ----------
@@ -780,7 +816,7 @@ class SettingsDialog(QDialog):
             import pyaudio
             audio = pyaudio.PyAudio()
         except Exception as e:
-            log.warning("列举音频设备失败: %s", e)
+            log.warning("could not enumerate the audio devices: %s", e)
             return []
         devices = []
         try:
@@ -790,7 +826,7 @@ class SettingsDialog(QDialog):
                 if info.get(key, 0) > 0:
                     devices.append((index, info.get("name", f"设备 {index}")))
         except Exception as e:
-            log.warning("读取音频设备信息失败: %s", e)
+            log.warning("could not read the audio device info: %s", e)
         finally:
             try:
                 audio.terminate()
@@ -913,7 +949,7 @@ class FlightPlanDialog(QDialog):
 
 def main():
     applog.setup(debug="--debug" in sys.argv)
-    logging.getLogger("启动").info("%s %s", APP_NAME, version.full())
+    logging.getLogger("startup").info("%s %s", APP_NAME, version.full())
     app = QApplication(sys.argv)
     window = XpcWindow()
     window.show()

@@ -29,7 +29,7 @@ import logging
 import os
 import re
 
-log = logging.getLogger("模型匹配")
+log = logging.getLogger("cslmatch")
 
 # 同族机型。匹配不到精确型号时按这里找替身，都是外形接近的。
 # 不求全，只覆盖网络上常见的；查不到就落到按类别的通用匹配。
@@ -121,7 +121,7 @@ def parse_package(directory):
         with open(manifest, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except OSError as e:
-        log.warning("读不了 %s: %s", manifest, e)
+        log.warning("cannot read %s: %s", manifest, e)
         return []
 
     for raw in lines:
@@ -152,7 +152,7 @@ def parse_package(directory):
             current.livery = parts[3].upper()
 
     usable = [m for m in models if m.path and m.icao]
-    log.info("%s: %d 个模型（共 %d 条，%d 条缺路径或机型码）",
+    log.info("%s: %d usable models (%d total, %d missing a path or type code)",
              os.path.basename(directory), len(usable), len(models),
              len(models) - len(usable))
     return usable
@@ -228,7 +228,7 @@ class ModelSet:
         models = []
         for package in find_packages(root):
             models.extend(parse_package(package))
-        log.info("从 %s 载入 %d 个模型", root, len(models))
+        log.info("loaded %d models from %s", len(models), root)
         return cls(models)
 
     def by_name(self, name):

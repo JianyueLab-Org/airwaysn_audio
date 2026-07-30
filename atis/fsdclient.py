@@ -25,7 +25,7 @@ import socket
 import threading
 import time
 
-log = logging.getLogger("FSD")
+log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
 PROTO_REVISION = 100          # ProtoRevisionClassic
@@ -33,6 +33,11 @@ FACILITY_ATIS = 7
 RATING_OBSERVER = 1           # 通播不需要管制权限，用最低等级登录一定能通过
 POSITION_INTERVAL = 15.0      # 服务端 150 秒收不到位置包就断线
 LOGIN_TIMEOUT = 10.0
+# 已经登录过之后掉线，最多再试这么多次；都失败就这个席位整个下线。和语音那边
+# 同一条策略（broadcast.RECONNECT_LIMIT），两条链路的行为要一致，不然
+# "整个下线"就没有统一的含义。
+RECONNECT_LIMIT = 3
+RECONNECT_DELAY = 3.0         # 每次重连之间等一下，别贴着服务器猛敲
 MAX_ATIS_LINES = 64           # can-fsd 每个席位最多收 64 行
 ATIS_LINE_WIDTH = 70
 # can-fsd 的 IsValidCallsign 上限（packet.go 的 MaxCallsignLength）。原来是 10，
@@ -96,7 +101,8 @@ class FSDClient:
     def __init__(self, host, callsign, cid, password, frequency,
                  real_name="ATIS", port=DEFAULT_PORT, rating=None,
                  latitude=0.0, longitude=0.0, vis_range=50,
-                 atis_lines=None, on_status=None, rating_lookup=None):
+                 atis_lines=None, on_status=None, rating_lookup=None,
+                 reconnect_limit=RECONNECT_LIMIT):
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = callsign.strip().upper()
@@ -123,6 +129,13 @@ class FSDClient:
         self.running = False
         self.stop_event = threading.Event()
         self.thread = None
+        # 掉线后最多重连几次，用尽就这个席位下线
+        self.reconnect_limit = int(reconnect_limit)
+        self.gave_up = False
+        # 登录成功过之后，失败就先当"可以重连"。这个标记让 _status 把中途的
+        # error 翻成 reconnecting——否则界面收到一次 error 就把这条连接当没了，
+        # 而我们其实马上就要再试。
+        self._retryable = False
         self._sock = None
         self._buffer = b""
         self._logged_in = False
@@ -138,6 +151,9 @@ class FSDClient:
 
     def stop(self):
         self.running = False
+        # 先把"可以重连"撤掉，否则 _close() 的 stopped 会被翻成 reconnecting，
+        # 明明是有人按了停止播出，界面上却写着重连中。
+        self._retryable = False
         self.stop_event.set()
         thread = self.thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
@@ -191,12 +207,17 @@ class FSDClient:
 
     # ---------- 内部 ----------
     def _status(self, state, message):
+        # 重连期间的失败不是终态。在这里翻一次比在每个报错点各判一次可靠：
+        # _connect 有五条报错路径、_loop 还有一条，漏掉任何一条，界面就会在
+        # 我们正准备重连的时候把这条连接当成彻底没了。
+        if self._retryable and state in ('error', 'stopped'):
+            state = 'reconnecting'
         log.info("%s %s: %s", self.callsign, state, message)
         if self.on_status:
             try:
                 self.on_status(state, message)
             except Exception as e:
-                log.warning(f"状态回调失败: {e}")
+                log.warning(f"status callback raised: {e}")
 
     def _send(self, packet):
         if not self._sock:
@@ -211,14 +232,50 @@ class FSDClient:
             return False
 
     def _run(self):
-        try:
-            if not self._connect():
+        """连接 → 收发 → 掉线重连，最多 reconnect_limit 次。
+
+        **首次连不上不重试。** 那多半是呼号被占、密码不对或者地址填错——重试三
+        次只会把同一条错误刷三遍，还可能触发服务端对认证失败的限流。只有"登录
+        成功过之后掉的线"才重连：那种是服务器重启或者网络抖动，重连是对的。
+
+        次数用尽后报 offline 并结束，界面据此把这个席位整个收掉（语音也一起），
+        而不是留一条谁也说不清状态的连接。
+        """
+        attempts = 0
+        established_once = False
+
+        while self.running and not self.stop_event.is_set():
+            try:
+                if self._connect():
+                    attempts = 0
+                    established_once = True
+                    # 从这一刻起，掉线是可以重连的
+                    self._retryable = True
+                    self._loop()
+            except Exception as e:
+                self._status('error', f"FSD 连接异常: {e}")
+            finally:
+                self._close()
+
+            if not established_once:
+                return                  # 首次就没连上，原因已经报过了
+            if not self.running or self.stop_event.is_set():
+                return                  # 有人按了停止
+
+            attempts += 1
+            if attempts > self.reconnect_limit:
+                self.gave_up = True
+                self._retryable = False
+                self._status('offline',
+                             f"与 FSD 断开后重连 {self.reconnect_limit} 次都没成功，"
+                             f"{self.callsign} 已下线")
                 return
-            self._loop()
-        except Exception as e:
-            self._status('error', f"FSD 连接异常: {e}")
-        finally:
-            self._close()
+
+            self._status('reconnecting',
+                         f"与 FSD 的连接断开，正在重连"
+                         f"（{attempts}/{self.reconnect_limit}）")
+            if self.stop_event.wait(RECONNECT_DELAY):
+                return
 
     def _connect(self):
         problem = callsign_problem(self.callsign)
@@ -232,7 +289,7 @@ class FSDClient:
                 try:
                     found = self.rating_lookup()
                 except Exception as e:
-                    log.warning("查等级失败: %s", e)
+                    log.warning("looking up the rating failed: %s", e)
             self.rating = found or RATING_OBSERVER
 
         self._status('connecting',
@@ -246,7 +303,7 @@ class FSDClient:
 
         greeting = self._read_packet(timeout=5)
         if greeting:
-            log.info(f"服务端问候: {greeting}")
+            log.info(f"server greeting: {greeting}")
 
         machine_id = sum(ord(c) for c in self.callsign) * 7919
         self._send(f"$ID{self.callsign}:SERVER:{CLIENT_ID}:{CLIENT_NAME}:"
@@ -344,7 +401,7 @@ class FSDClient:
                 return False
             # 登录之后的 $ER 多半是某次查询失败（比如没有该机场的气象），
             # 不该把整条连接拆掉
-            log.info(f"服务器返回错误（{code}）: {message}")
+            log.info(f"the server returned an error ({code}): {message}")
             self._fail_metar_waiters()
             return True
 
@@ -371,7 +428,7 @@ class FSDClient:
             return True
 
         if head.startswith("#TM"):
-            log.info(f"服务器消息: {packet}")
+            log.info(f"server message: {packet}")
             return True
 
         if head.startswith("#DL"):

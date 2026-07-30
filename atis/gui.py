@@ -33,6 +33,7 @@ import version
 import chinese
 import datafeed
 import metar as metar_module
+import netconfig
 import rules
 import script
 import template as template_module
@@ -46,7 +47,7 @@ from profile import (LANGUAGES, LANGUAGE_ENGLISH, Profile, Station,
 import settings as settings_module
 from settings import Settings, SettingsDialog
 
-log = logging.getLogger("界面")
+log = logging.getLogger("gui")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.airwaysn.org:6809）。
 SERVER = "hjdczy.top"
@@ -251,7 +252,9 @@ class AtisWindow(QMainWindow):
         self.setMinimumSize(900, 600)
 
         self.settings = Settings()
-        self.profile = Profile()
+        # **一定要带路径。** 不带 path 的 Profile 是内存里的一份，不读也不存——
+        # 界面拿它当配置用的话，打开就是空席位列表，加了席位也一个都存不下来。
+        self.profile = Profile(path=profile_module.DEFAULT_PROFILE_PATH)
         self.broadcasters = {}          # callsign -> Broadcaster（语音）
         self.fsd_clients = {}           # callsign -> FSDClient（网络在线与文字通播）
         self.metars = {}                # callsign -> Metar
@@ -367,6 +370,25 @@ class AtisWindow(QMainWindow):
             button.clicked.connect(handler)
             buttons.addWidget(button)
         buttons_layout.addLayout(buttons)
+
+        # 两个按钮看着像，取的是两样东西：上面那个取的是**配置**（席位、频率、
+        # 跑道构型预设、模板、中文用词），下面那个取的是**此刻谁在播**（只有
+        # 机场和频率）。文案上必须分得开，不然会有人按错了还以为配置没更新。
+        config_button = PushButton('从网络更新配置')
+        config_button.setIcon(FluentIcon.CLOUD_DOWNLOAD)
+        config_button.setToolTip(
+            '从 airwaysn 取全网通播配置：席位、频率、跑道构型预设、模板和中文'
+            '播报用词。本地已有的席位默认不动，可以选择用网络版覆盖。')
+        config_button.clicked.connect(self.update_from_network)
+        buttons_layout.addWidget(config_button)
+
+        network_button = PushButton('取在线席位')
+        network_button.setIcon(FluentIcon.PEOPLE)
+        network_button.setToolTip(
+            '读 can-fsd 数据源上此刻在线的通播席位，把机场和频率加进来。'
+            '这是运行状态不是配置——模板和预设要么自己填，要么用上面那个按钮。')
+        network_button.clicked.connect(self.import_from_network)
+        buttons_layout.addWidget(network_button)
 
         import_button = PushButton('导入 vATIS 配置…')
         import_button.setToolTip('读取 vATIS 的 profile JSON，把里面的席位和预设导进来')
@@ -589,6 +611,171 @@ class AtisWindow(QMainWindow):
         self.profile.save()
         self.refresh_stations()
 
+    # ---------- 网络配置 ----------
+    def update_from_network(self):
+        """从 can-web 取全网通播配置，并进本地这一份。
+
+        取的是**配置**：席位、频率、跑道构型预设、模板、中文播报用词，全套。
+        和下面 import_from_network 取的东西不是一回事——那个读的是 can-fsd
+        数据源里此刻谁在播，只有机场和频率，是运行状态。
+
+        三件事必须由用户点头，所以这里是"先看差异，再动手"，不是按一下就变：
+
+        - 只补缺是默认动作；覆盖本地已有的席位要单独问一次，因为值班时改过的
+          临时构型和 NOTAM 都在预设里，一律盖掉等于把人家的活删了。
+        - **正在播出的席位一律不动**，并在结果里说明。播出中的 Station 被
+          Broadcaster 和 FSDClient 拿着，换掉它只会让在播内容和界面对不上。
+        - 覆盖时保留本地当前的情报字母（netconfig.merge 负责），播了一半把
+          字母退回 A，飞行员报的和听到的就对不上了。
+        """
+        self.status_label.setText('正在从 airwaysn 取通播配置…')
+        QApplication.processEvents()
+        try:
+            config = netconfig.parse(netconfig.fetch(self.settings.config_url))
+        except netconfig.NetConfigError as e:
+            self.status_label.setText('未播出')
+            log.warning("could not fetch the network configuration: %s", e)
+            QMessageBox.warning(self, '取配置失败', str(e))
+            return
+        self.status_label.setText('未播出')
+
+        missing, differing, same = netconfig.compare(self.profile,
+                                                     config.stations)
+        header = [f'网络配置 {config.label}，共 {len(config)} 个席位']
+        if config.notes:
+            header.append(config.notes)
+        if (self.settings.config_version
+                and self.settings.config_version != config.version):
+            header.append(f'（上次并入的是 {self.settings.config_version}）')
+        if config.problems:
+            header.append('有 %d 项读不进来，已跳过：%s'
+                          % (len(config.problems),
+                             '；'.join(config.problems[:3])))
+        header.append('')
+
+        if not missing and not differing:
+            self.settings.config_version = config.version
+            self.settings.save_settings()
+            QMessageBox.information(
+                self, '配置已是最新',
+                '\n'.join(header + [f'本地这 {len(same)} 个席位和网络版一致，'
+                                    '不需要改动。']))
+            return
+
+        add_missing = False
+        if missing:
+            add_missing = QMessageBox.question(
+                self, '要加入缺少的席位吗',
+                '\n'.join(header + [
+                    f'本地缺少 {len(missing)} 个席位：',
+                    '　' + self._station_names(missing),
+                    '',
+                    '加进来的是完整配置——频率、跑道构型预设、模板和中文用词都有，'
+                    '不用再自己填。'])) == QMessageBox.StandardButton.Yes
+
+        overwrite = False
+        if differing:
+            overwrite = QMessageBox.question(
+                self, '要用网络版覆盖吗',
+                '\n'.join([
+                    f'本地已有、但和网络版内容不同的 {len(differing)} 个席位：',
+                    '　' + self._station_names(differing),
+                    '',
+                    '覆盖会丢掉你对这些席位做的修改——临时的跑道构型、NOTAM、'
+                    '中文附言都在预设里。',
+                    '选「否」就只保留本地那份，不影响上面的新增。'])
+            ) == QMessageBox.StandardButton.Yes
+
+        chosen = (missing if add_missing else []) + (differing if overwrite else [])
+        if not chosen:
+            self.status_label.setText('未播出')
+            QMessageBox.information(self, '没有改动', '配置保持原样。')
+            return
+
+        added, replaced, _kept, skipped = netconfig.merge(
+            self.profile, chosen, overwrite=overwrite,
+            protected=set(self.broadcasters))
+
+        self.profile.save()
+        self.refresh_stations()
+        for station in added:
+            self.refresh_metar(station)
+        # 只有整份都并进来了才算"更新到这一版"，否则下次还得让人再看一遍差异
+        if not skipped and (not differing or overwrite):
+            self.settings.config_version = config.version
+            self.settings.save_settings()
+
+        report = [f'新增 {len(added)} 个，覆盖 {len(replaced)} 个']
+        if added:
+            report.append('新增：' + self._station_names(added))
+        if replaced:
+            report.append('覆盖：' + self._station_names(replaced))
+        if skipped:
+            report.append('')
+            report.append('正在播出、这次没有动的 %d 个：%s'
+                          % (len(skipped), self._station_names(skipped)))
+            report.append('停播之后再更新一次即可。')
+        QMessageBox.information(self, '配置已更新', '\n'.join(report))
+
+    @staticmethod
+    def _station_names(stations, limit=8):
+        names = [station.label for station in stations[:limit]]
+        if len(stations) > limit:
+            names.append(f'等 {len(stations)} 个')
+        return '、'.join(names)
+
+    def import_from_network(self):
+        """把数据源上此刻在线的通播席位加进配置。
+
+        取的是 can-fsd 数据源里的 `atis[]`——**此刻谁在播**，只有机场和频率，
+        是运行状态而不是配置。配置走上面的 update_from_network（can-web 的
+        /api/v1/atis/config）。
+
+        所以这个动作省掉的只是查 ICAO 和频率：模板、预设、跑道构型它给不了。
+        对话框里会把这点说清楚，别让人以为导完就能播。
+        """
+        self.status_label.setText('正在从数据源读在线通播席位…')
+        QApplication.processEvents()
+        found = datafeed.atis_stations(self.settings.datafeed_url)
+        self.status_label.setText('未播出')
+
+        if not found:
+            QMessageBox.information(
+                self, '没有可导入的席位',
+                '数据源上此刻没有在线的通播席位。\n\n'
+                '这个功能读的是 can-fsd 数据源里正在播出的通播（atis[]），'
+                '不是配置。要取全网配置请用「从网络更新配置」。')
+            return
+
+        added, skipped = [], []
+        for icao, callsign, frequency, kind in found:
+            if self.profile.get(callsign):
+                skipped.append(f'{callsign} {frequency}')
+                continue
+            try:
+                station = self.profile.add(Station(icao, frequency=frequency,
+                                                   atis_type=kind))
+            except ValueError as e:
+                log.warning("importing %s failed: %s", callsign, e)
+                continue
+            added.append(f'{callsign} {frequency}')
+            self.refresh_metar(station)
+
+        self.profile.save()
+        self.refresh_stations()
+
+        report = [f'从数据源导入了 {len(added)} 个席位']
+        if added:
+            report.append('　' + '、'.join(added))
+        if skipped:
+            report.append(f'已存在、跳过的 {len(skipped)} 个：' + '、'.join(skipped))
+        if added:
+            report.append('')
+            report.append('导进来的只有机场和频率——数据源给不了别的。模板、预设和'
+                          '跑道构型请用「从网络更新配置」取，或者自己填；现在直接'
+                          '开播只会播出默认模板。')
+        QMessageBox.information(self, '导入完成', '\n'.join(report))
+
     def import_vatis(self):
         """从 vATIS 的 profile 里导入席位。"""
         path, _ = QFileDialog.getOpenFileName(
@@ -706,10 +893,11 @@ class AtisWindow(QMainWindow):
             except weather.WeatherError as e:
                 # 这条以前只进状态栏。打包是 console=False，用户报"取不到天气"
                 # 时手里什么都没有，只能截图状态栏——日志里必须留一份
-                log.warning("%s 取天气失败: %s", callsign, e)
+                log.warning("fetching the weather for %s failed: %s", callsign, e)
                 signals.metar.emit(callsign, None, str(e))
             except Exception as e:
-                log.warning("%s 取天气出错: %s", callsign, e, exc_info=True)
+                log.warning("fetching the weather for %s raised: %s", callsign, e,
+                            exc_info=True)
                 signals.metar.emit(callsign, None, f"取天气出错: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -720,7 +908,7 @@ class AtisWindow(QMainWindow):
             getattr(self.settings, "metar_refresh",
                     settings_module.DEFAULT_METAR_REFRESH))
         self.timer.start(seconds * 1000)
-        log.info("天气自动刷新间隔 %d 秒", seconds)
+        log.info("weather auto-refresh interval is %d s", seconds)
         return seconds
 
     def refresh_all_metars(self):
@@ -868,7 +1056,7 @@ class AtisWindow(QMainWindow):
             return
 
         if controller:
-            log.info("CID %s 正在管制 %s，允许开通播",
+            log.info("CID %s is staffing %s, letting the broadcast start",
                      cid, controller.get('callsign', '?'))
 
         self.start_broadcast(station, cid, password, rating)
@@ -913,6 +1101,8 @@ class AtisWindow(QMainWindow):
                     atis_lines=fsdclient.wrap_atis_text(rendered[0]),
                     # FSD 的错误单独标一个 state：它只是附加能力，登录失败
                     # 不该把频率上的语音通播一起停掉
+                    # FSD 的错误单独标一个 state（见上）。'offline' 是另一回事：
+                    # 那是重连三次都没成功，整条链路完了，席位该整个停播。
                     on_status=lambda state, message, _c=callsign:
                         self.signals.state.emit(
                             _c, 'fsd-error' if state == 'error' else state,
@@ -938,13 +1128,13 @@ class AtisWindow(QMainWindow):
             try:
                 broadcaster.stop()
             except Exception as e:
-                log.warning(f"停止播出出错: {e}")
+                log.warning(f"stopping the broadcast raised: {e}")
         fsd = self.fsd_clients.pop(callsign, None)
         if fsd:
             try:
                 fsd.stop()
             except Exception as e:
-                log.warning(f"断开 FSD 出错: {e}")
+                log.warning(f"disconnecting from FSD raised: {e}")
         self.status_label.setText('未播出')
         self.refresh_stations()
 
@@ -955,9 +1145,28 @@ class AtisWindow(QMainWindow):
         if station and station.callsign == callsign:
             self.status_label.setText(message)
             self.status_label.setStyleSheet(
-                f"color: {OFF_COLOR};" if state == 'error'
+                f"color: {OFF_COLOR};" if state in ('error', 'offline')
                 else f"color: {ON_COLOR};" if state == 'online'
+                else "color: #cc6600;" if state == 'reconnecting'
                 else f"color: {IDLE_COLOR};")
+
+        if state == 'reconnecting':
+            # 还在重连：什么都不收。**尤其不能 stop_broadcast**——一次网络抖动
+            # 就把值守中的席位停掉，等于把频率上的通播弄没了，而它本来几秒后
+            # 就自己好了。
+            return
+
+        if state == 'offline':
+            # 语音或 FSD 重连三次都没成功：这个席位整个停播，语音和 FSD 一起收。
+            # **只停这一个席位**，客户端上其它席位各有自己的连接，不受影响。
+            log.warning("%s could not reconnect, taking the whole station off "
+                        "air: %s", callsign, message)
+            self.stop_broadcast(callsign)
+            self.status_label.setText(message)
+            self.status_label.setStyleSheet(f"color: {OFF_COLOR};")
+            QMessageBox.warning(self, f'{callsign} 已停播', message)
+            return
+
         if state == 'fsd-error':
             # 只收掉 FSD 这一条，语音继续播——席位不在网络上总比频率上没声音好
             fsd = self.fsd_clients.pop(callsign, None)
@@ -965,10 +1174,11 @@ class AtisWindow(QMainWindow):
                 try:
                     fsd.stop()
                 except Exception as e:
-                    log.warning(f"停止 FSD 连接出错: {e}")
+                    log.warning(f"stopping the FSD connection raised: {e}")
             self.status_label.setText(f'{message}（语音仍在播出）')
             self.status_label.setStyleSheet("color: #cc6600;")
-            log.warning("%s 的 FSD 连接失败，语音继续: %s", callsign, message)
+            log.warning("the FSD link of %s failed, voice continues: %s", callsign,
+                        message)
         elif state == 'error':
             QMessageBox.critical(self, f'{callsign} 播出错误', message)
             self.stop_broadcast(callsign)
@@ -986,7 +1196,7 @@ class AtisWindow(QMainWindow):
             for callsign in set(self.broadcasters) | set(self.fsd_clients):
                 self.stop_broadcast(callsign)
         except Exception as e:
-            log.warning(f"关闭时出错: {e}")
+            log.warning(f"error while closing: {e}")
         finally:
             event.accept()
 
@@ -1078,13 +1288,13 @@ def selftest():
     try:
         pcm = synth.synthesize("ZSPD information alpha, wind calm.")
         if not pcm:
-            log.warning("自检失败: 语音合成没有产出音频")
+            log.warning("self-test failed: speech synthesis produced no audio")
             return 1
         seconds = len(pcm) / (2.0 * 48000)
-        log.info(f"自检通过: 合成了 {seconds:.1f} 秒音频")
+        log.info(f"self-test passed: synthesised {seconds:.1f} s of audio")
         return 0
     except Exception as e:
-        log.warning(f"自检失败: {e}")
+        log.warning(f"self-test failed: {e}")
         return 1
     finally:
         synth.cleanup()
@@ -1094,7 +1304,7 @@ if __name__ == '__main__':
     # --debug 会把协议细节也记进日志（FSD 收发的每个包、频道操作）。
     # 设置里的开关是给拿不到命令行的用户准备的，两者任一打开即生效。
     applog.setup(debug='--debug' in sys.argv or Settings().debug)
-    log.info("ATIS for CAN 启动 %s", version.full())
+    log.info("ATIS for CAN starting, %s", version.full())
 
     if '--selftest' in sys.argv:
         sys.exit(selftest())

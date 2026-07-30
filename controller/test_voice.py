@@ -13,6 +13,7 @@
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -655,6 +656,349 @@ class ReconnectTest(unittest.TestCase):
         while time.time() < deadline and not resynced:
             time.sleep(0.02)
         self.assertEqual(resynced, [self.stack], "作废了缓存却没有重新推一遍")
+
+
+class SyncStormTest(unittest.TestCase):
+    """一阵栈变化不能变成一场建频道风暴。
+
+    真实日志（airwaysn-controller.log，13 小时）里的样子：建频道 202 次、
+    「已经不在了」180 次、进频道请求 40 次没有生效，其中 93 次建频道和上一次
+    落在**同一秒**，最密的一分钟建了 34 次，服务器开始用 ChannelName（重名）
+    回拒——而管制员那一晚一直留在根频道，听不到也发不出，界面全是绿的。
+
+    三条成因，这一组各钉一条：
+    - `RadioStack(on_change=…)` 覆盖了加删、RX/TX/XC、音量、静音、选主频率，
+      再加上数据源那条 60 秒定时器，一阵操作排出十几轮 sync，每轮几秒；
+    - 一轮 sync 里同一个频率被解析两三遍（RX/TX/XC 各一遍），第一遍的建频道
+      没及时回来时，后面几遍会再各发一次 CreateChannel；
+    - 被服务器拒绝的建频道还要在 `_sync_lock` 里干等满 CHANNEL_TIMEOUT。
+    """
+
+    def setUp(self):
+        self._timeout = voice.CHANNEL_TIMEOUT
+        voice.CHANNEL_TIMEOUT = 0.4          # 别让每条用例真等 5 秒
+        self.client = VoiceClient("host", "1000", "pw")
+        self.server = FakeServer(latency=0.02)
+        self.client.mumble = self.server
+        self.client.connected = True
+        self.client.running = True
+
+    def tearDown(self):
+        voice.CHANNEL_TIMEOUT = self._timeout
+
+    def stack_with(self, *frequencies, tx=(), xc=()):
+        stack = radiostack.RadioStack()
+        for khz in frequencies:
+            stack.add(khz)
+        for radio in stack:
+            radio.rx = True
+            radio.tx = radio.frequency_khz in tx or radio.frequency_khz in xc
+            radio.xc = radio.frequency_khz in xc
+        stack.select(frequencies[0])
+        return stack
+
+    def fire(self, calls):
+        """同时打进来一批 sync，等它们全部返回。"""
+        threads = [threading.Thread(target=self.client.sync, args=(stack,),
+                                   daemon=True) for stack in calls]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.02)             # 模拟界面上一个个开关按过去
+        for thread in threads:
+            thread.join(timeout=voice.CHANNEL_TIMEOUT * 4 + 5)
+            self.assertFalse(thread.is_alive(), "sync 没有返回")
+
+    # ---------- 合并 ----------
+    def test_a_burst_of_changes_collapses_into_two_rounds(self):
+        """正在跑的那一轮 + 最多再排一轮，中间的全部丢掉。
+
+        丢得起：每一轮都重读栈，排在中间的那些轮做的是完全一样的事。
+        """
+        rounds = []
+
+        def slow_sync(stack):
+            rounds.append(tuple(r.frequency_khz for r in stack))
+            time.sleep(0.3)
+        self.client._sync = slow_sync
+
+        stack = self.stack_with(118000)
+        self.fire([stack] * 10)
+        self.assertLessEqual(len(rounds), 2,
+                             f"10 次栈变化推了 {len(rounds)} 轮 sync")
+        self.assertGreaterEqual(len(rounds), 1, "一轮都没推")
+
+    def test_the_queued_round_pushes_the_newest_stack(self):
+        """排队那一轮读的必须是最新的栈，不是把它排进来时的那一份。
+
+        否则合并就成了丢状态：用户最后按的那个开关不生效。
+        """
+        pushed = []
+
+        def slow_sync(stack):
+            pushed.append(tuple(r.frequency_khz for r in stack))
+            time.sleep(0.3)
+        self.client._sync = slow_sync
+
+        first = self.stack_with(118000)
+        middle = self.stack_with(118000, 121700)
+        newest = self.stack_with(118000, 121700, 125900)
+        self.fire([first, middle, newest])
+
+        self.assertEqual(pushed[0], (118000,), "第一轮应当立刻跑")
+        self.assertEqual(pushed[-1], (118000, 121700, 125900),
+                         f"最后推的不是最新的栈：{pushed}")
+
+    def test_a_reconnect_resync_is_not_swallowed(self):
+        """合并带来的唯一风险：重连要推的那一轮被"门口有人了"挡掉。
+
+        挡掉的后果最难查——重连之后服务器把人放回根频道，而界面是绿的。
+        安全的原因是排队那一轮读的是**最新**的栈和**清过**的缓存：
+        `_resync_after_reconnect` 先作废缓存再调 sync，所以它之后跑的那一轮
+        必然是一次完整重推。这条把它钉住。
+        """
+        seen = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_sync(stack):
+            seen.append(dict(self.client._channel_ids))
+            started.set()
+            release.wait(timeout=3)
+        self.client._sync = slow_sync
+        self.client._stack = self.stack_with(118000)
+        self.client._channel_ids = {118000: 7}       # 断线前的旧号
+
+        # 一轮正在跑，门口再排一轮——此刻门口已经满了
+        for _ in range(2):
+            threading.Thread(target=self.client.sync,
+                             args=(self.client._stack,), daemon=True).start()
+            self.assertTrue(started.wait(timeout=3))
+            time.sleep(0.05)
+
+        self.client._resync_after_reconnect()        # 这时候重连了
+        release.set()
+
+        deadline = time.time() + 3
+        while time.time() < deadline and not any(s == {} for s in seen[1:]):
+            time.sleep(0.05)
+        self.assertTrue(any(s == {} for s in seen[1:]),
+                        f"重连之后没有推一轮清过缓存的完整同步：{seen}")
+
+    # ---------- 一轮里只解析一次 ----------
+    def test_one_frequency_is_created_once_per_round(self):
+        """RX / TX / XC 三个集合里的同一个频率，一轮只能建一次频道。
+
+        `answers=False` 让建频道永远不出现在频道表里（远程服务器慢、或者被拒都
+        是这个形状）。修之前：RX 那遍建一次、TX 那遍再建一次、XC 那遍第三次。
+        """
+        self.server.answers = False
+        stack = self.stack_with(118000, 121700, tx=(118000,), xc=(118000, 121700))
+        self.fire([stack])
+
+        created = [name for _, name, _ in self.server.created_names()]
+        self.assertEqual(sorted(created), ["FREQ_118000", "FREQ_121700"],
+                         f"同一轮里重复建了频道：{created}")
+
+    # ---------- 被拒就别等 ----------
+    def test_a_refused_create_returns_immediately(self):
+        """服务器说了不给建，就不要在锁里干等满 CHANNEL_TIMEOUT。
+
+        那段等待是在 _sync_lock 里面的，会把后面排队的 sync 一起拖住——风暴就是
+        这么攒出来的。
+        """
+        voice.CHANNEL_TIMEOUT = 3.0
+        self.server.answers = False
+        event = types.SimpleNamespace(type=4, reason="Duplicate channel name")
+
+        def deny():
+            time.sleep(0.2)
+            self.client._on_permission_denied(event)
+        threading.Thread(target=deny, daemon=True).start()
+
+        started = time.time()
+        result = self.client._resolve_channel(118000)
+        spent = time.time() - started
+
+        self.assertIsNone(result)
+        self.assertLess(spent, 1.5,
+                        f"被拒之后还等了 {spent:.1f} 秒（上限 {voice.CHANNEL_TIMEOUT} 秒）")
+
+    def test_a_stale_denial_does_not_kill_the_next_create(self):
+        """上一次的拒绝说明不能让下一次建频道直接放弃。"""
+        self.client._denial = "上一轮被拒了"
+        channel_id = self.client._resolve_channel(118000)
+        self.assertIsNotNone(channel_id, "旧的拒绝说明把这一次也挡掉了")
+
+    # ---------- 进不去就按名字重解析再试一次 ----------
+    def test_a_move_into_a_dead_channel_is_retried_with_the_new_id(self):
+        """频率频道是 temporary 的，解析出号到 MoveCmd 被处理之间它可能已经没了。
+
+        服务器对指向不存在频道的 MoveCmd **既不照做也不报错**，所以不重试的话
+        这一轮就彻底没进去，日志里只留一行"没有生效"——实测里出现了 40 次，
+        管制员整晚留在根频道。
+        """
+        self.server.strict_moves = True
+        first = self.client._resolve_channel(118000)
+        self.assertIsNotNone(first)
+        # 服务器把这个空掉的临时频道销毁了，我们手里的号就此作废
+        self.server.remove_channel("FREQ_118000")
+
+        joined = self.client._join_frequency(118000, first)
+
+        self.assertTrue(joined, "重解析之后还是没进去")
+        self.assertNotEqual(self.server.my_channel, 0, "人还留在根频道")
+        self.assertIn(self.server.my_channel, self.server.live_ids())
+        self.assertEqual(self.server.moves()[0], first,
+                         "第一次还是应当按原来的号试")
+        self.assertGreaterEqual(len(self.server.moves()), 2, "没有重试")
+
+
+class ReconnectLimitTest(unittest.TestCase):
+    """掉线之后最多重连三次，都失败就整个下线。
+
+    以前是 `reconnect=True` 一路无限重试。后果不是"多试几次"：服务端
+    `login.py` 对认证失败**按 ASN ID 限流**，一个在后台不停重连的僵尸足以把这个
+    账号的语音锁死——管制员把密码改对了也连不上，直到重启客户端。而界面那边只
+    有一句"连接已断开"，没人能说清此刻到底还在不在连。
+    """
+
+    FAILED = voice.PYMUMBLE_CONN_STATE_FAILED
+
+    def make_class(self, results):
+        """假基类：connect() 按 results 依次返回状态码，并记下调用次数。"""
+        test = self
+
+        class FakeBase:
+            def __init__(self, *args, **kwargs):
+                self.reconnect = kwargs.get("reconnect", False)
+                self.connected = 0
+                self.calls = 0
+                self.stopped = 0
+                test.base = self
+
+            def connect(self):
+                index = self.calls
+                self.calls += 1
+                value = results[index] if index < len(results) else test.FAILED
+                self.connected = value
+                return value
+
+            def stop(self):
+                self.stopped += 1
+
+        return voice.bounded_mumble(FakeBase)
+
+    def make_mumble(self, results, limit=3):
+        mumble = self.make_class(results)("host", "1000", reconnect=True)
+        mumble.reconnect_limit = limit
+        return mumble
+
+    # ---------- 计数本身 ----------
+    def test_the_limit_stops_the_retrying(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()          # 先有过一次真会话
+
+        for expected in (1, 2, 3):
+            mumble.connect()
+            self.assertEqual(mumble.reconnect_attempts, expected)
+            self.assertFalse(mumble.gave_up)
+            self.assertTrue(mumble.reconnect, "还有次数就不该停")
+
+        # 第四次连接不再发起，直接放弃
+        self.assertEqual(mumble.connect(), self.FAILED)
+        self.assertTrue(mumble.gave_up)
+        self.assertFalse(mumble.reconnect,
+                         "reconnect 必须置假，否则 pymumble 的 run() 还会继续转")
+        self.assertEqual(self.base.calls, 3,
+                         "放弃那一次不该真的再去连一遍服务器")
+
+    def test_a_real_session_resets_the_count(self):
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble._session_established()
+        mumble.connect()
+        mumble.connect()
+        self.assertEqual(mumble.reconnect_attempts, 2)
+
+        mumble._session_established()          # 第三次连回来了
+        self.assertEqual(mumble.reconnect_attempts, 0)
+        for _ in range(3):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up, "重连成功之后没有重新给满三次")
+
+    def test_the_first_connection_is_not_a_reconnect(self):
+        """从没连上过就不进这套计数——首连失败多半是密码不对，重试没有意义。"""
+        mumble = self.make_mumble([self.FAILED] * 10)
+        for _ in range(5):
+            mumble.connect()
+        self.assertFalse(mumble.gave_up)
+        self.assertEqual(mumble.reconnect_attempts, 0)
+        self.assertTrue(mumble.reconnect)
+
+    def test_authenticating_is_not_a_successful_connect(self):
+        """`connect()` 成功返回的是 AUTHENTICATING（1），不是 CONNECTED（2）。
+
+        密码错的连接同样返回 1，随后才在 loop() 里因为 Reject 结束。要是按返回值
+        判定"连上了"就会每次清零计数，于是无限重连——而这一次撞的正好是服务端按
+        账号的认证失败限流。计数只能由 ServerSync（CONNECTED 回调）清零。
+        """
+        authenticating = 1
+        mumble = self.make_mumble([authenticating] * 10)
+        mumble._session_established()
+        for _ in range(3):
+            mumble.connect()
+        self.assertEqual(mumble.reconnect_attempts, 3)
+        mumble.connect()
+        self.assertTrue(mumble.gave_up, "被拒的重连被当成了成功")
+
+    def test_each_attempt_is_reported(self):
+        seen = []
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble.on_reconnect = lambda attempt, limit: seen.append((attempt, limit))
+        mumble._session_established()
+        for _ in range(3):
+            mumble.connect()
+        self.assertEqual(seen, [(1, 3), (2, 3), (3, 3)])
+
+    # ---------- 接到客户端上 ----------
+    def test_the_monitor_takes_the_client_offline(self):
+        """次数用尽后连接线程就结束了，只剩连接监控还在跑——收摊只能挂在它上面。"""
+        client = VoiceClient("host", "1000", "pw")
+        states = []
+        client.on_state = lambda state, message: states.append((state, message))
+        mumble = self.make_mumble([self.FAILED] * 10)
+        mumble.gave_up = True
+        client.mumble = mumble
+        client.running = True
+
+        thread = threading.Thread(target=client._connection_monitor, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "监控线程没有退出")
+
+        self.assertTrue(client.gave_up)
+        self.assertEqual(states[-1][0], 'offline', states)
+        self.assertIn("3", states[-1][1])
+        self.assertEqual(mumble.stopped, 1,
+                         "下线时必须真的 stop() 掉连接，否则麦克风和连接都还占着")
+        self.assertIsNone(client.mumble)
+        self.assertFalse(client.running)
+
+    def test_an_ordinary_drop_is_reported_as_reconnecting(self):
+        """一次抖动不能报成终态错误——原来它和"彻底断开"是同一句话。"""
+        client = VoiceClient("host", "1000", "pw")
+        states = []
+        client.on_state = lambda state, message: states.append((state, message))
+        client.mumble = self.make_mumble([self.FAILED] * 10)
+        client.running = True
+
+        client._on_disconnected()
+        self.assertEqual(states[-1][0], 'reconnecting', states)
+
+        # 已经放弃了就不该再报"正在重连"
+        client.mumble.gave_up = True
+        states.clear()
+        client._on_disconnected()
+        self.assertEqual([s for s, _ in states], [])
 
 
 if __name__ == "__main__":

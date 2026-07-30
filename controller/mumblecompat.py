@@ -21,7 +21,7 @@ pymumble 自己的线程里，调用方只看到"线程没了"，界面上就显
 import logging
 import ssl
 
-log = logging.getLogger("兼容")
+log = logging.getLogger("mumblecompat")
 
 
 def install():
@@ -44,5 +44,6 @@ def install():
         return context.wrap_socket(sock)
 
     ssl.wrap_socket = wrap_socket
-    log.info("已为 pymumble 补上 ssl.wrap_socket（Python 3.12 起该函数被移除）")
+    log.info("reinstated ssl.wrap_socket for pymumble (removed from Python "
+             "3.12 onwards)")
     return True

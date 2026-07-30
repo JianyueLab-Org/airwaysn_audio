@@ -10,7 +10,7 @@ import re
 import time
 import urllib.request
 
-log = logging.getLogger("天气")
+log = logging.getLogger("weather")
 
 DEFAULT_METAR_URL = "https://metar.vatsim.net/metar.php?id="
 _USER_AGENT = "airwaysn-atis"
@@ -74,7 +74,7 @@ def fetch_metar(icao, url=None, timeout=15, retries=None):
             last_error = e
             # 日志里留下地址：换过气象源之后，"取不到天气"到底是谁的问题，
             # 光看报错文字是分不出来的
-            log.warning("取 %s 的 METAR 失败（第 %d/%d 次，%s）: %s",
+            log.warning("fetching the METAR for %s failed (attempt %d/%d, %s): %s",
                         icao, attempt + 1, retries + 1, target, e)
             if attempt < retries:
                 time.sleep(RETRY_DELAY)

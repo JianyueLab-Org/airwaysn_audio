@@ -442,7 +442,7 @@ class VoiceChannelTest(unittest.TestCase):
         # 按了 PTT 却一帧没发，必须说出原因，否则没法查
         source = inspect.getsource(self.voice.Voice)
         self.assertIn("_skip_reason", source)
-        self.assertIn("一帧都没发出去", source)
+        self.assertIn("not a single frame was sent", source)
 
     def test_frames_are_counted(self):
         # "发了但对方听不到"和"根本没发"是两回事，只有帧数能分开
@@ -1007,6 +1007,319 @@ class VoiceParentThreadTest(unittest.TestCase):
         self.assertIsNot(v.mumble.parent_thread, starter,
                          "必须改指到一个和会话同寿的线程上")
         v.stop()
+
+
+class ReconnectLimitTest(unittest.TestCase):
+    """连上过之后掉线，最多重连三次，然后整个下线。
+
+    以前是 `reconnect=True` 一路无限重试。后果不是"多试几次"：服务端
+    `login.py` 对认证失败**按 ASN ID 限流**，一个在后台不停重连的僵尸足以把这个
+    账号的语音锁死——用户把密码改对了也连不上，直到重启客户端。界面那边同样
+    糟：最后一次状态停在"已断开"，连接其实还在挣扎，谁也说不清当前状态。
+
+    假基类照抄 pymumble `run()` 的形状（mumble.py:120-143），所以这里测的是真
+    行为，不是字符串匹配——**这一套里的每一条都依赖那个循环的两个细节**：
+    失败的重连不发任何回调，而 `connect()` 成功时返回的是 AUTHENTICATING。
+    """
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors", "numpy"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice_module = voice
+        self.rejected = type("ConnectionRejectedError", (Exception,), {})
+        voice.pymumble.errors.ConnectionRejectedError = self.rejected
+
+    def make_base(self, outcomes):
+        """按 outcomes 依次决定每次 connect() 的结果。
+
+        'sync'   连上并收到 ServerSync（真正的会话）
+        'auth'   TLS 建好、Authenticate 发出去了，但服务器随后拒绝——**真的
+                 pymumble 这一路 connect() 返回的也是 AUTHENTICATING**，把它当
+                 成功就会把计数清零，于是又变回无限重试
+        'fail'   连不上（socket 错误），connect() 返回 FAILED
+        """
+        test = self
+        rejected = self.rejected
+        # **不能写死 1/2/3。** 这个测试模块把 pymumble 整个换成了 MagicMock，
+        # 模块里的状态常量因此也是 mock 对象；写死数字的话 Voice.connected 里
+        # 那句 `mumble.connected == PYMUMBLE_CONN_STATE_CONNECTED` 永远不成立，
+        # 于是连上了也被判成"服务器拒绝"。用模块里的那几个对象本身。
+        FAILED = self.voice_module.PYMUMBLE_CONN_STATE_FAILED
+        CONNECTED = self.voice_module.PYMUMBLE_CONN_STATE_CONNECTED
+        # pymumble 的 AUTHENTICATING，voice.py 没导入，随便给个哨兵——它的意义
+        # 只是"不等于 CONNECTED"
+        AUTHENTICATING = object()
+        on_connected = self.voice_module.PYMUMBLE_CLBK_CONNECTED
+        on_disconnected = self.voice_module.PYMUMBLE_CLBK_DISCONNECTED
+
+        class FakeBase:
+            def __init__(self, *args, **kwargs):
+                self.reconnect = kwargs.get("reconnect", False)
+                self.parent_thread = threading.current_thread()
+                self.connected = 0
+                self.exit = False
+                self.connect_calls = 0
+                self.stopped = 0
+                self._callbacks = {}
+                self._drop = threading.Event()
+                self.callbacks = types.SimpleNamespace(
+                    set_callback=lambda name, fn:
+                        self._callbacks.__setitem__(name, fn))
+                test.server = self
+
+            def set_receive_sound(self, value):
+                pass
+
+            def is_ready(self):
+                pass
+
+            def stop(self):
+                self.stopped += 1
+                self.reconnect = False
+                self.exit = True
+                self._drop.set()
+
+            def drop(self):
+                """让当前这条会话断掉。"""
+                self._drop.set()
+
+            def _fire(self, name):
+                callback = self._callbacks.get(name)
+                if callback:
+                    callback()
+
+            def connect(self):
+                index = self.connect_calls
+                self.connect_calls += 1
+                outcome = outcomes[index] if index < len(outcomes) else "fail"
+                self._outcome = outcome
+                if outcome == "fail":
+                    self.connected = FAILED
+                    return FAILED
+                # 真的 pymumble 这里返回 AUTHENTICATING：TLS 建好、Authenticate
+                # 发出去了，认证结果还没回来。密码错的连接也走这一支。
+                self.connected = AUTHENTICATING
+                return AUTHENTICATING
+
+            def run(self):
+                """照抄 pymumble run() 的形状。
+
+                两处必须一样，否则这套测试就测不到真问题：
+                - 连接失败那一支只 sleep+continue，**不发回调**；
+                - 丢连接时两个分支都发 DISCONNECTED，然后才决定要不要重连。
+
+                判定用 `is FAILED` 而不是 `>= FAILED`：常量在这个模块里是 mock
+                对象，比不了大小。混入放弃时返回的正是同一个对象，所以这一支
+                同时接住"连不上"和"次数用尽"。
+                """
+                while True:
+                    if self.connect() is FAILED:
+                        if not self.reconnect:
+                            raise rejected("连接失败")
+                        continue                     # 静默重试，正是问题所在
+                    if self._outcome == "sync":
+                        self.connected = CONNECTED
+                        self._fire(on_connected)
+                        self._drop.wait()
+                        self._drop.clear()
+                    # 'auth' 就是服务器拒绝：没有 ServerSync，会话直接结束
+                    self.connected = 0
+                    if not self.reconnect:
+                        self._fire(on_disconnected)
+                        break
+                    self._fire(on_disconnected)
+
+        return FakeBase
+
+    def make_voice(self, outcomes, limit=3):
+        """建一个 Voice，连接类换成假基类，音频设备全是替身。"""
+        voice = self.voice_module
+        base = self.make_base(outcomes)
+        states = []
+        v = voice.Voice("host", "1000", "pw",
+                        settings=types.SimpleNamespace(mic_volume=100,
+                                                       speaker_volume=100),
+                        on_status=lambda state, message: states.append(
+                            (state, message)),
+                        reconnect_limit=limit)
+        v._open_audio = lambda: (
+            setattr(v, "_audio", types.SimpleNamespace(terminate=lambda: None)),
+            setattr(v, "_input", FakeStream()),
+            setattr(v, "_output", FakeStream()))
+        v._run = lambda: None
+        v._channel_loop = lambda: None
+        self._patched = voice.pymumble.Mumble
+        voice.pymumble.Mumble = base
+        self.addCleanup(setattr, voice.pymumble, "Mumble", self._patched)
+        return v, states
+
+    def wait_for(self, predicate, timeout=5):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    # ---------- 核心 ----------
+    def test_three_attempts_then_the_whole_thing_goes_offline(self):
+        v, states = self.make_voice(["sync"] + ["fail"] * 10)
+        v.start()
+        self.assertTrue(v.connected, "前提：先连上")
+
+        self.server.drop()
+        self.assertTrue(self.wait_for(lambda: v.gave_up), "没有下线")
+
+        # 一次首连 + 三次重连 = 四次 connect()，第五次是判定后的收摊，不发起连接
+        self.assertEqual(self.server.connect_calls, 4,
+                         f"重连次数不对：{self.server.connect_calls - 1} 次")
+        self.assertEqual(states[-1][0], 'offline', states)
+        self.assertIn("3", states[-1][1])
+        self.assertGreaterEqual(self.server.stopped, 1,
+                                "下线时必须真的 stop() 掉连接，不能只报个状态")
+        self.assertIsNone(v.mumble, "麦克风和连接都要放掉")
+        self.assertFalse(v.running)
+
+    def test_a_reconnect_that_works_resets_the_count(self):
+        """中途连回来了，计数必须清零，否则第二天第四次抖动就把人踢下线。"""
+        v, states = self.make_voice(["sync", "fail", "sync"] + ["fail"] * 10)
+        v.start()
+        self.server.drop()
+        self.assertTrue(self.wait_for(lambda: v.connected and
+                                      self.server.connect_calls >= 3),
+                        "没有重连回来")
+        self.assertFalse(v.gave_up, "重连成功了却还是下线了")
+        self.assertEqual(states[-1][0], 'online')
+
+        # 再掉一次，还应当有完整的三次：
+        # 首连 + 失败一次 + 重连成功 = 3，第二轮再给满 3 次 = 6
+        self.server.drop()
+        self.assertTrue(self.wait_for(lambda: v.gave_up))
+        self.assertEqual(self.server.connect_calls, 6,
+                         "第二轮没有重新给满三次")
+
+    def test_a_rejected_password_is_not_a_successful_connect(self):
+        """这条是那个坑：`connect()` 成功返回的是 AUTHENTICATING，不是 CONNECTED。
+
+        密码被拒的连接同样返回 AUTHENTICATING，只是随后在 loop() 里因为 Reject
+        结束。把返回值当成"连上了"就会每次清零计数，于是无限重连——而这一次撞
+        的正好是服务端按账号的认证失败限流。
+        """
+        v, _ = self.make_voice(["sync"] + ["auth"] * 10)
+        v.start()
+        self.server.drop()
+        self.assertTrue(self.wait_for(lambda: v.gave_up),
+                        "被拒的重连被当成了成功，会一直重试下去")
+        self.assertEqual(self.server.connect_calls, 4)
+
+    def test_an_ordinary_drop_is_not_reported_as_a_terminal_error(self):
+        """一次抖动不能报成"不再自动重连"。
+
+        原来 _on_disconnected 一律报 error，而 pymumble 的 run() 每次丢连接都发
+        这条回调、随后自己就连回来了。界面收到 error 会把 Voice 引用丢掉，于是
+        语音其实恢复了，客户端却再也不跟着 COM1 换频道。
+        """
+        v, states = self.make_voice(["sync", "sync"] + ["fail"] * 10)
+        v.start()
+        seen = len(states)
+        self.server.drop()
+        self.assertTrue(self.wait_for(lambda: len(states) > seen))
+        kinds = [state for state, _ in states[seen:]]
+        self.assertIn('reconnecting', kinds, kinds)
+        self.assertNotIn('error', kinds, "抖动被报成了终态错误")
+        v.stop()
+
+    def test_the_first_connection_is_not_a_reconnect(self):
+        """第一次就连不上不走这套计数，照旧交给 start() 报错。
+
+        首连失败多半是密码不对或者地址填错，重试三次只会把同一条错误刷三遍。
+        """
+        v, states = self.make_voice(["fail"] * 10)
+        v.start()
+        self.assertFalse(v.gave_up)
+        self.assertEqual(states[-1][0], 'error')
+        self.assertIsNone(v.mumble, "失败路径也必须放掉音频设备和连接")
+
+
+class FsdReconnectLimitTest(unittest.TestCase):
+    """FSD 链路同一条策略：掉线重连三次，用尽就整个下线。
+
+    两条链路必须一致，否则"整个下线"没有统一含义：语音给三次、FSD 一掉就放弃的
+    话，一次服务器重启会让飞机从网络上消失而语音还连着，别人看不见你却听得见。
+    """
+
+    def make_client(self, connect_results, limit=3):
+        """_connect / _loop / _close 换成替身，只测重连那一层的控制流。"""
+        client = fsdpilot.FSDPilot.__new__(fsdpilot.FSDPilot)
+        client.callsign = "CCA1501"
+        client.running = True
+        client.stop_event = threading.Event()
+        client.reconnect_limit = limit
+        client.gave_up = False
+        client._retryable = False
+        client.states = []
+        # 照抄 _status 里那次翻译：重连期间的 error/stopped 不是终态
+        client._status = lambda state, message: client.states.append(
+            ('reconnecting' if client._retryable and state in ('error', 'stopped')
+             else state, message))
+        client.connect_calls = 0
+
+        def fake_connect():
+            index = client.connect_calls
+            client.connect_calls += 1
+            return (connect_results[index] if index < len(connect_results)
+                    else False)
+
+        client._connect = fake_connect
+        client._loop = lambda: None
+        client._close = lambda: None
+        return client
+
+    def setUp(self):
+        self._delay = fsdpilot.RECONNECT_DELAY
+        fsdpilot.RECONNECT_DELAY = 0          # 别真的等 3 秒 × 3
+
+    def tearDown(self):
+        fsdpilot.RECONNECT_DELAY = self._delay
+
+    def test_three_attempts_then_offline(self):
+        client = self.make_client([True] + [False] * 10)
+        client._run()
+        self.assertTrue(client.gave_up)
+        self.assertEqual(client.connect_calls, 4, "一次首连 + 三次重连")
+        self.assertEqual(client.states[-1][0], 'offline', client.states)
+
+    def test_a_reconnect_that_works_resets_the_count(self):
+        client = self.make_client([True, False, True] + [False] * 10)
+        client._run()
+        self.assertEqual(client.connect_calls, 6,
+                         "首连 + 失败一次 + 重连成功，之后第二轮再给满三次")
+
+    def test_the_first_connection_is_not_retried(self):
+        """首连失败多半是呼号被占或密码不对，重试只会把同一条错误刷三遍。"""
+        client = self.make_client([False] * 10)
+        client._run()
+        self.assertFalse(client.gave_up)
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.states, [], "首连失败的原因由 _connect 自己报")
+
+    def test_a_drop_while_retrying_is_not_reported_as_terminal(self):
+        """重连期间 _loop / _connect 报的 error 必须翻成 reconnecting。
+
+        界面收到 error 会把整条连接当没了——而我们其实马上就要再试。
+        """
+        client = self.make_client([True, False, True] + [False] * 10)
+
+        def loop_that_drops():
+            client._status('error', "与 FSD 服务器的连接已断开")
+        client._loop = loop_that_drops
+        client._run()
+        kinds = [state for state, _ in client.states]
+        self.assertNotIn('error', kinds, kinds)
+        self.assertIn('reconnecting', kinds)
+        self.assertEqual(kinds[-1], 'offline')
 
 
 class ChannelNameTest(unittest.TestCase):

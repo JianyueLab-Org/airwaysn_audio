@@ -53,7 +53,7 @@ def setup(debug=False):
     except OSError as e:
         # 目录不可写（比如装在 Program Files 下）也不能让程序起不来
         _log_path = None
-        print(f"无法写日志文件: {e}", file=sys.stderr)
+        print(f"cannot write the log file: {e}", file=sys.stderr)
 
     # 从源码跑的时候顺便打到控制台；打包后 sys.stderr 可能是 None
     if sys.stderr is not None:
@@ -64,8 +64,9 @@ def setup(debug=False):
     logging.captureWarnings(True)
     _install_excepthook()
 
-    logging.getLogger("启动").info(
-        "日志级别 %s，文件 %s", logging.getLevelName(level), _log_path or "（无）")
+    logging.getLogger("startup").info(
+        "log level %s, file %s", logging.getLevelName(level),
+        _log_path or "(none)")
     return _log_path
 
 
@@ -77,8 +78,8 @@ def _install_excepthook():
         if issubclass(exc_type, KeyboardInterrupt):
             previous(exc_type, exc_value, traceback)
             return
-        logging.getLogger("未捕获异常").critical(
-            "程序里有异常没有被接住", exc_info=(exc_type, exc_value, traceback))
+        logging.getLogger("uncaught").critical(
+            "an exception went uncaught", exc_info=(exc_type, exc_value, traceback))
         previous(exc_type, exc_value, traceback)
 
     sys.excepthook = handler
@@ -87,8 +88,9 @@ def _install_excepthook():
     def thread_handler(args):
         if issubclass(args.exc_type, KeyboardInterrupt):
             return
-        logging.getLogger("未捕获异常").critical(
-            "线程 %s 里有异常没有被接住", args.thread.name if args.thread else "?",
+        logging.getLogger("uncaught").critical(
+            "an exception went uncaught in thread %s",
+            args.thread.name if args.thread else "?",
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
     try:
@@ -106,5 +108,5 @@ def open_log_folder():
         os.startfile(os.path.dirname(_log_path))
         return True
     except Exception as e:
-        logging.getLogger("日志").warning("打不开日志目录: %s", e)
+        logging.getLogger("applog").warning("could not open the log folder: %s", e)
         return False
