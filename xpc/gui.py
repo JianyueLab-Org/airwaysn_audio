@@ -26,8 +26,9 @@ import threading
 import time
 
 import applog
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QFont, QIcon, QTextCursor
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject
+from PyQt6.QtGui import (QAction, QDesktopServices, QFont, QIcon,
+                         QTextCursor)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -38,6 +39,7 @@ import bridge
 import cslmatch
 import fsdpilot
 import traffic as traffic_module
+import update
 import version
 import voice as voice_module
 import xplane
@@ -66,6 +68,8 @@ class Signals(QObject):
     ptt = pyqtSignal(bool)
     rx = pyqtSignal(bool)
     channel = pyqtSignal(float, str)
+    # 查更新在后台线程里做，结果要过信号回到 GUI 线程
+    update_found = pyqtSignal(object)
 
 
 class Indicator(QLabel):
@@ -121,6 +125,9 @@ class XpcWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
 
+        # 起来之后在后台问一次有没有新版。查不到就当没这回事。
+        self.check_for_update()
+
     # ---------- 界面 ----------
     def _build_ui(self):
         central = QWidget()
@@ -158,6 +165,9 @@ class XpcWindow(QMainWindow):
         log_action = QAction("打开日志目录(&L)", self)
         log_action.triggered.connect(lambda: applog.open_log_folder())
         help_menu.addAction(log_action)
+        update_action = QAction("检查更新(&U)", self)
+        update_action.triggered.connect(lambda: self.check_for_update(manual=True))
+        help_menu.addAction(update_action)
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
@@ -284,6 +294,7 @@ class XpcWindow(QMainWindow):
         self.signals.ptt.connect(self.tx_light.set_lit)
         self.signals.rx.connect(self.rx_light.set_lit)
         self.signals.channel.connect(self.on_channel)
+        self.signals.update_found.connect(self.on_update_found)
 
     # ---------- 消息区 ----------
     def add_message(self, text, colour="#dcdcdc"):
@@ -659,6 +670,61 @@ class XpcWindow(QMainWindow):
                 self.add_message("飞行计划已提交", GREEN)
         else:
             self.add_message("尚未连接到网络，飞行计划只保存在本地", AMBER)
+
+    # ---------- 更新 ----------
+    def check_for_update(self, manual=False):
+        """后台问一次有没有新版。
+
+        `manual=True` 是用户自己从菜单点的，那种情况下即使没有新版也要回一句，
+        否则点了跟没点一样。启动时的那次是静默的——没有新版就不该打扰任何人。
+        """
+        if not manual and not getattr(self.settings, "update_check", True):
+            return
+
+        def work():
+            found = update.check("xpc-for-can", version.version(),
+                                 getattr(self.settings, "update_url", None))
+            self.signals.update_found.emit(found or (manual and "none" or None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_found(self, found):
+        """已经在 GUI 线程。found 是 Update、"none"（手动查但没有新版）或 None。"""
+        if found is None:
+            return
+        if found == "none":
+            QMessageBox.information(self, "检查更新",
+                                    f"已经是最新版本（{version.version()}）。")
+            return
+        # 用户说过跳过这一版就别再问了。手动点的那次不受这条限制——他自己找来的。
+        if found.version == getattr(self.settings, "skipped_version", ""):
+            self.add_message(f"[更新] 有新版 {found.version}（已跳过）", AMBER)
+            return
+
+        size = f"（{found.size_label}）" if found.size_label else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("有新版本")
+        box.setText(f"{APP_NAME} {found.version} 已经发布{size}。\n"
+                    f"你现在用的是 {version.version()}。")
+        box.setInformativeText(
+            "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+            "下载完解压覆盖原来那个文件夹即可——设置和配置都不在里面。")
+        download = box.addButton("下载", QMessageBox.ButtonRole.AcceptRole)
+        notes = box.addButton("看更新说明", QMessageBox.ButtonRole.HelpRole)
+        skip = box.addButton("跳过这个版本", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is download and found.download:
+            QDesktopServices.openUrl(QUrl(found.download))
+            self.add_message(f"[更新] 正在浏览器里下载 {found.version}", GREEN)
+        elif clicked is notes and found.notes:
+            QDesktopServices.openUrl(QUrl(found.notes))
+        elif clicked is skip:
+            self.settings.skipped_version = found.version
+            self.settings.save()
+            self.add_message(f"[更新] 已跳过 {found.version}", AMBER)
 
     def show_about(self):
         QMessageBox.information(

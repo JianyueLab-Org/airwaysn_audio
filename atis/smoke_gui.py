@@ -46,6 +46,12 @@ def _question(*args, **kwargs):
 
 QMessageBox.question = staticmethod(_question)
 
+# 查更新会真的发网络请求，而弹出来的那个 QMessageBox 用的是 exec()——离屏模式下
+# 它照样会一直等人点，整个冒烟测试就挂死在那里。这里一律换成"没有新版"；
+# 真正的对话框逻辑另有一条用例单独测。
+import update
+update.check = lambda *args, **kwargs: None
+
 import gui
 import weather
 from profile import Station

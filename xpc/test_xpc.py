@@ -7,6 +7,7 @@
 """
 
 import inspect
+import json
 import os
 import struct
 import sys
@@ -1320,6 +1321,113 @@ class FsdReconnectLimitTest(unittest.TestCase):
         self.assertNotIn('error', kinds, kinds)
         self.assertIn('reconnecting', kinds)
         self.assertEqual(kinds[-1], 'offline')
+
+
+class UpdateCheckTest(unittest.TestCase):
+    """查有没有新版。查到了也只是告诉用户，更不更新是他的事。
+
+    走的是 airwaysn 而不是 GitHub：大陆连 github.com 很不稳，60 MB 的包经常
+    下到一半就断，而 airwaysn.org 是成员本来就连得上的。
+    """
+
+    def setUp(self):
+        import update
+        self.update = update
+
+    def answer(self, payload, status=200):
+        """把 urlopen 换成一个吐固定 JSON 的替身。"""
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            payload).encode("utf-8")
+        return mock.patch("urllib.request.urlopen", return_value=response)
+
+    def payload(self, version="2.0.2", available=True):
+        return {
+            "status": 200,
+            "version": version,
+            "notes": "https://example/releases/tag/v" + version,
+            "update_available": available,
+            "client": {
+                "name": "xpc-for-can",
+                "version": version,
+                "size": 59057038,
+                "download": "https://airwaysn.org/api/v1/clients/download/"
+                            "xpc-for-can?v=v" + version,
+            },
+        }
+
+    # ---------- 版本比较 ----------
+    def test_numeric_comparison(self):
+        """**不能按字符串比。** `2.0.10` 按字符串排在 `2.0.9` 前面，那样要么
+        永远催更新，要么有了新版也不提示。"""
+        newer = self.update.is_newer
+        self.assertTrue(newer("2.0.2", "2.0.1"))
+        self.assertTrue(newer("2.0.10", "2.0.9"))
+        self.assertFalse(newer("2.0.9", "2.0.10"))
+        self.assertTrue(newer("2.1.0", "2.0.99"))
+        self.assertFalse(newer("2.0.1", "2.0.1"))
+        self.assertFalse(newer("1.9.9", "2.0.0"))
+
+    def test_tolerates_the_shapes_the_clients_actually_report(self):
+        """客户端报 `2.0.1`，tag 是 `v2.0.1`，从源码跑还可能带后缀。"""
+        newer = self.update.is_newer
+        self.assertFalse(newer("v2.0.1", "2.0.1"))
+        self.assertTrue(newer("v2.0.2", "2.0.1"))
+        self.assertTrue(newer("2.1.0-rc1", "2.0.9"))
+        self.assertFalse(newer("", "2.0.1"))
+
+    # ---------- 查询 ----------
+    def test_reports_a_newer_version(self):
+        with self.answer(self.payload("2.0.2")):
+            found = self.update.check("xpc-for-can", "2.0.1")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.version, "2.0.2")
+        self.assertIn("airwaysn.org", found.download,
+                      "下载必须走自己的服务器，不能把用户丢给 GitHub")
+        self.assertEqual(found.size_label, "56.3 MB")
+
+    def test_no_update_returns_none(self):
+        with self.answer(self.payload("2.0.1", available=False)):
+            self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
+
+    def test_a_server_that_offers_the_same_version_is_ignored(self):
+        """服务端说有新版但版本号和自己一样——本地这道闸挡住，别天天催。"""
+        with self.answer(self.payload("2.0.1", available=True)):
+            self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
+
+    def test_an_older_version_is_ignored(self):
+        with self.answer(self.payload("1.9.0", available=True)):
+            self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
+
+    # ---------- 失败一律安静 ----------
+    def test_failures_never_raise(self):
+        """**查更新绝不能影响启动。** 网络不通、服务器 500、返回垃圾，
+        统统当作"没有新版"，而不是让异常穿到界面上。"""
+        import urllib.error
+        cases = [
+            urllib.error.URLError("名字解析失败"),
+            urllib.error.HTTPError("u", 500, "boom", None, None),
+            urllib.error.HTTPError("u", 429, "slow down", None, None),
+            OSError("socket 挂了"),
+        ]
+        for error in cases:
+            with mock.patch("urllib.request.urlopen", side_effect=error):
+                self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
+
+    def test_garbage_body_is_not_an_update(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"<html>nope</html>"
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            self.assertIsNone(self.update.check("xpc-for-can", "2.0.1"))
+
+    def test_a_payload_without_a_client_block_still_works(self):
+        """服务端只回了总版本、没回单个包，也不该崩。"""
+        payload = {"update_available": True, "version": "2.0.2", "notes": "n"}
+        with self.answer(payload):
+            found = self.update.check("xpc-for-can", "2.0.1")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.version, "2.0.2")
+        self.assertEqual(found.download, "")     # 没有下载地址，界面会去开说明页
 
 
 class ChannelNameTest(unittest.TestCase):

@@ -676,7 +676,7 @@ class SharedCopyTest(unittest.TestCase):
     `fsdpilot.py` 和 `applog.py` 的分叉是有意的，不在这里管。
     """
 
-    SHARED = ("voice.py", "traffic.py", "mumblecompat.py")
+    SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "update.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))

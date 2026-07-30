@@ -37,6 +37,17 @@ def _question(*args, **kwargs):
 
 QMessageBox.question = staticmethod(_question)
 
+# 查更新会真的发网络请求，而弹出来的那个 QMessageBox 用的是 exec()——离屏模式下
+# 它照样会一直等人点，整个冒烟测试就挂死在那里。这里一律换成"没有新版"；
+# 真正的对话框逻辑另有一条用例单独测。
+import update
+update.check = lambda *args, **kwargs: None
+
+# 弹窗那条路单独测：把 exec() 换成"什么都不点"，clickedButton 换成 None。
+_shown = []
+QMessageBox.exec = lambda self: _shown.append(self.text()) or 0
+QMessageBox.clickedButton = lambda self: None
+
 import gui
 import xplane
 
@@ -221,6 +232,36 @@ def main():
     check("飞行计划字段齐全", plan_has_every_field)
 
     print("关闭：")
+    print("更新提示：")
+
+    def a_new_version_is_offered():
+        """查到新版要弹一次，而且文案里得有版本号和体积——不然用户不知道要下多大。"""
+        _shown.clear()
+        window.on_update_found(update.Update(
+            version="2.9.9", notes="https://example/notes",
+            download="https://airwaysn.org/api/v1/clients/download/xpc-for-can",
+            size=59057038))
+        assert _shown, "有新版却没有弹提示"
+        assert "2.9.9" in _shown[0], _shown[0]
+        assert "56.3 MB" in _shown[0], _shown[0]
+    check("有新版会提示", a_new_version_is_offered)
+
+    def a_skipped_version_is_not_offered_again():
+        """用户说过"跳过这一版"就别每次启动再问一遍——那和自动更新一样烦人。"""
+        window.settings.skipped_version = "2.9.9"
+        _shown.clear()
+        window.on_update_found(update.Update(version="2.9.9"))
+        assert not _shown, "跳过的版本又弹了一次"
+        window.settings.skipped_version = ""
+    check("跳过的版本不再提示", a_skipped_version_is_not_offered_again)
+
+    def no_update_is_silent_at_startup():
+        """启动时那次是静默的：没有新版就不该打扰任何人。"""
+        _shown.clear()
+        window.on_update_found(None)
+        assert not _shown, "没有新版却弹了框"
+    check("没有新版时不出声", no_update_is_silent_at_startup)
+
     check("关窗", lambda: window.close())
 
     print()
