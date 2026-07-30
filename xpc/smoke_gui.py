@@ -11,6 +11,9 @@ import sys
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 界面语言钉死，断言才有确定的结果。不钉的话，第一次启动是跟系统走的，在英文
+# 系统上跑这个脚本，所有比中文字面量的断言都会失败。
+os.environ.setdefault("AIRWAYSN_LANG", "zh")
 
 # pymumble 要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
 try:
@@ -38,7 +41,9 @@ def _question(*args, **kwargs):
 QMessageBox.question = staticmethod(_question)
 
 import gui
+import i18n
 import xplane
+from i18n import t
 
 SNAPSHOT = {
     "latitude": 31.1434, "longitude": 121.805, "altitude": 35000, "agl": 34000,
@@ -119,7 +124,7 @@ def main():
     def refuses_to_send_offline():
         window.message_input.setText("hello")
         window.send_message()
-        assert "尚未连接" in window.messages.toPlainText()
+        assert t("msg.not_connected") in window.messages.toPlainText()
     check("未连接时不发消息", refuses_to_send_offline)
 
     print("管制列表：")
@@ -145,10 +150,19 @@ def main():
     def fsd_error_keeps_voice():
         # 两条链路互不依赖，网络断了不该把语音一起收掉
         window.voice = object()
+        try:
+            _fsd_error_keeps_voice()
+        finally:
+            # 断言挂了也要把替身收回去：留着它，关窗时 closeEvent 会去
+            # stop() 一个 object()，一个失败就变成整个脚本崩掉
+            window.voice = None
+
+    def _fsd_error_keeps_voice():
         window.on_fsd_status("error", "连接被拒绝")
         assert window.voice is not None, "语音不该被清掉"
         assert window.fsd is None, "网络那条应当收掉"
-        assert window.connect_button.text() == "断开", window.connect_button.text()
+        assert window.connect_button.text() == t("connect.disconnect"), \
+            window.connect_button.text()
         window.voice = None
     check("网络失败时语音继续", fsd_error_keeps_voice)
 
@@ -219,6 +233,99 @@ def main():
         for key in ("rules", "aircraft", "departure", "arrival", "route"):
             assert key in plan, key
     check("飞行计划字段齐全", plan_has_every_field)
+
+    print("PTT 绑定：")
+    import ptt
+
+    def a_binding_can_be_added_and_removed():
+        """录制那条路要真的走一遍：它是唯一能加绑定的入口。"""
+        editor = settings_dialog.ptt_list
+        added = ptt.Binding(ptt.MOUSE, button="x2")
+        before = len(editor.bindings)
+        editor.on_captured(added)          # 模拟录到了鼠标侧键
+        assert editor.bindings[-1] == added, "绑定没加进去"
+        editor.on_captured(added)          # 重复的一条不该再加一遍
+        assert len(editor.bindings) == before + 1, "重复绑定被加了两次"
+        editor.remove(added)
+        assert added not in editor.bindings, "绑定没移除掉"
+    check("加/删一条 PTT 绑定", a_binding_can_be_added_and_removed)
+
+    def an_empty_binding_list_still_builds():
+        """一条绑定都没有时也得能画出来——这时界面上是一句"PTT 用不了"。"""
+        editor = settings_dialog.ptt_list
+        keep = list(editor.bindings)
+        editor.bindings = []
+        editor.rebuild()
+        editor.bindings = keep
+        editor.rebuild()
+    check("绑定清空后仍能重画", an_empty_binding_list_still_builds)
+
+    print("他机插件：")
+
+    def the_plugin_can_be_installed_from_the_dialog():
+        """整条安装路径走一遍，目标是临时目录里一棵假的 X-Plane 树。
+
+        探测、按钮文案、真的写文件、写完再探测——这几步都在设置对话框里，
+        单元测试够不到。
+        """
+        import shutil
+        import tempfile
+        import xpinstall
+        from i18n import t
+        root = os.path.join(tempfile.mkdtemp(), "X-Plane 12")
+        os.makedirs(os.path.join(root, xpinstall.PLUGINS_DIR))
+        try:
+            dialog = gui.SettingsDialog(window.settings, window)
+            dialog.settings.xplane_path = root
+            dialog._refresh_plugin_status()
+            assert dialog._plugin.state == xpinstall.MISSING, dialog._plugin.state
+            assert dialog.plugin_button.text() == t("plugin.install")
+            assert dialog.plugin_button.isEnabled()
+            # 没装 XPPython3 时要明说，否则装了插件也不会被加载
+            assert t("plugin.no_xppython3") == dialog.plugin_hint.text()
+
+            dialog._install_plugin()
+            assert os.path.isfile(xpinstall.plugin_path(root)), "插件没写进去"
+            assert dialog._plugin.state == xpinstall.CURRENT, dialog._plugin.state
+            assert dialog.plugin_button.text() == t("plugin.reinstall")
+        finally:
+            shutil.rmtree(os.path.dirname(root), ignore_errors=True)
+            window.settings.xplane_path = ""
+    check("从对话框装插件", the_plugin_can_be_installed_from_the_dialog)
+
+    def a_bad_folder_is_reported_not_crashed():
+        import tempfile
+        import xpinstall
+        dialog = gui.SettingsDialog(window.settings, window)
+        dialog.settings.xplane_path = tempfile.gettempdir()
+        try:
+            dialog._refresh_plugin_status()
+            assert dialog._plugin.state == xpinstall.NOT_XPLANE
+            assert not dialog.plugin_button.isEnabled(), "不是 X-Plane 目录时不该能点"
+        finally:
+            window.settings.xplane_path = ""
+    check("选错目录只报错不崩", a_bad_folder_is_reported_not_crashed)
+
+    print("多语言：")
+
+    def english_builds_every_window():
+        """整套界面用英文再建一遍。
+
+        漏翻的键会原样显示成 "settings.tab_audio" 这种，扫一遍就能抓住——
+        单看中文界面是永远发现不了的。
+        """
+        i18n.set_language("en")
+        try:
+            english = gui.SettingsDialog(window.settings, window)
+            plan = gui.FlightPlanDialog(window.settings, window)
+            texts = [english.windowTitle(), plan.windowTitle(),
+                     english.ptt_list.add_button.text()]
+            for text in texts:
+                assert "." not in text or " " in text, f"看着像没翻的键: {text!r}"
+            assert english.windowTitle() == t("settings.title")
+        finally:
+            i18n.set_language("zh")
+    check("英文界面能建起来", english_builds_every_window)
 
     print("关闭：")
     check("关窗", lambda: window.close())

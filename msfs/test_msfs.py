@@ -673,10 +673,14 @@ class SharedCopyTest(unittest.TestCase):
     xpc/test_xpc.py 里——只有这两份完全一样，那些测试才代表这一份也是对的。
     掉线重连之后不回频率频道的 bug 就同时存在于两边。
 
-    `fsdpilot.py` 和 `applog.py` 的分叉是有意的，不在这里管。
+    `fsdpilot.py` 和 `applog.py` 的分叉是有意的，不在这里管——前者要报不同的
+    模拟器编号，后者写不同的日志文件名。`i18n.py` 也是有意分开的：键名一样，
+    文案里提到模拟器的那几条不一样。
+
+    `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。
     """
 
-    SHARED = ("voice.py", "traffic.py", "mumblecompat.py")
+    SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py", "theme.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))

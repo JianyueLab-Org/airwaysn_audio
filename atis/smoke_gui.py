@@ -11,6 +11,9 @@ import tempfile
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 界面语言钉死，断言才有确定的结果。不钉的话，第一次启动是跟系统走的，在英文
+# 系统上跑这个脚本，所有比中文字面量的断言都会失败。
+os.environ.setdefault("AIRWAYSN_LANG", "zh")
 
 # 挪到临时目录再跑。Profile / Settings 的路径都是相对当前目录的裸文件名，直接在
 # atis 目录下跑的话，这个测试会**读到并写坏使用者真实的 atis_profile.json**——
@@ -531,6 +534,31 @@ def main():
     print("播出状态回调：")
     check("状态回报", lambda: window.on_broadcast_state("ZSPD_ATIS", "online", "测试"))
     check("未播出时删除席位", lambda: window.remove_station())
+
+    print("多语言：")
+
+    def english_builds_every_window():
+        """整套界面用英文再建一遍。
+
+        漏翻的键会原样显示成 "settings.title" 这种，扫一遍就能抓住——单看中文
+        界面是永远发现不了的。
+        """
+        import i18n
+        from i18n import t
+        i18n.set_language("en")
+        try:
+            english = gui.SettingsDialog(window.settings, window)
+            assert english.windowTitle() == t("settings.title"), english.windowTitle()
+            station_dialog = gui.StationDialog(parent=window)
+            assert station_dialog.windowTitle() == t("station.title")
+            # 通播稿的语言下拉不能跟着界面语言变内容，只有说法跟着变
+            labels = [station_dialog.language.itemText(i)
+                      for i in range(station_dialog.language.count())]
+            assert len(labels) == 3, labels
+            assert all("." not in text for text in labels), labels
+        finally:
+            i18n.set_language("zh")
+    check("英文界面能建起来", english_builds_every_window)
 
     window.timer.stop()
 

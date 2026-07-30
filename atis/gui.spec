@@ -12,7 +12,9 @@ import version
 version.freeze(os.path.dirname(os.path.abspath(SPEC)))
 
 # scipy 只被用来重采样，已经换成 numpy 的线性插值了；排除掉能省一半体积
-excludes = ['torch', 'transformers', 'scipy']
+# 不要用 collect_submodules('qfluentwidgets')：它会把 scipy / pillow / colorthief
+# 那几个可选依赖一起拖进来，包会涨出上百兆。这里显式排掉。
+excludes = ['torch', 'transformers', 'scipy', 'PIL', 'colorthief']
 
 
 def find_opus():
@@ -62,6 +64,8 @@ a = Analysis(
         'pyttsx3.drivers',
         'pyttsx3.drivers.sapi5',
         'comtypes',
+        'qfluentwidgets',
+        'qframelesswindow',
     ],
     hookspath=[],
     hooksconfig={},

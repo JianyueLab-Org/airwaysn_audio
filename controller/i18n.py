@@ -194,6 +194,30 @@ TEXT = {
     "settings.ptt_key":     {"zh": "PTT 按键:", "en": "PTT key:"},
     "settings.ptt_reset":   {"zh": "重设", "en": "Change"},
     "settings.ptt_press":   {"zh": "请按下按键...", "en": "Press a key..."},
+
+    # ---------- PTT 绑定 ----------
+    # 三种输入源共用一份列表，任意一个按住就发话。文案要说清"还能再加一个"，
+    # 否则用户会以为设了摇杆就没有键盘了。
+    "settings.ptt_title":   {"zh": "PTT 绑定", "en": "PTT bindings"},
+    "settings.ptt_hint":    {"zh": "键盘、鼠标侧键、摇杆按钮都行，按住其中任意一个即发话",
+                             "en": "A key, a mouse side button or a joystick button — "
+                                   "hold any one of them to transmit"},
+    "settings.ptt_none":    {"zh": "还没有绑定，PTT 用不了",
+                             "en": "No bindings yet — PTT will not work"},
+    "settings.ptt_add":     {"zh": "添加绑定", "en": "Add a binding"},
+    "settings.ptt_capturing": {"zh": "请按下按键、鼠标侧键或摇杆按钮…（点此取消）",
+                               "en": "Press a key, a mouse side button or a joystick "
+                                     "button… (click to cancel)"},
+    "settings.ptt_remove":  {"zh": "移除这条绑定", "en": "Remove this binding"},
+    "settings.ptt_duplicate": {"zh": "这条绑定已经有了", "en": "That binding is already there"},
+
+    # 一条绑定在界面上怎么念。ptt.py 只给出键名（"V" / "X1" / "3"），说法在这里拼——
+    # 那个模块是三个客户端逐字节共享的，不产生界面文字。
+    "ptt.keyboard":         {"zh": "键盘 {key}", "en": "Key {key}"},
+    "ptt.mouse":            {"zh": "鼠标侧键 {button}", "en": "Mouse {button}"},
+    "ptt.joystick":         {"zh": "摇杆 {device} 的按钮 {button}",
+                             "en": "Button {button} on {device}"},
+    "ptt.joystick_plain":   {"zh": "摇杆按钮 {button}", "en": "Joystick button {button}"},
     "settings.input":       {"zh": "输入设备:", "en": "Input device:"},
     "settings.output":      {"zh": "输出设备:", "en": "Output device:"},
     "settings.system_default": {"zh": "系统默认", "en": "System default"},
@@ -257,11 +281,15 @@ def system_language():
     return DEFAULT
 
 
-def t(key, **kwargs):
+def t(key, /, **kwargs):
     """取一条界面文字。
 
     找不到键就返回键本身——在界面上很扎眼，正好当成"这里漏翻了"的提示，比默默
     显示一个空字符串强得多。某个语言缺这一条时退回默认语言，用户至少看得懂。
+
+    第一个参数是**位置限定**的（那个 `/`）。不加的话，文案里只要有一个叫
+    `{key}` 的占位符，`t("ptt.keyboard", key="V")` 就会撞上形参名，报的还是
+    "got multiple values for argument 'key'" 这种和 i18n 毫无关系的错。
     """
     entry = TEXT.get(key)
     if entry is None:
@@ -275,3 +303,19 @@ def t(key, **kwargs):
             log.warning("the placeholders of string %s do not match: %s", key, e)
             return text
     return text
+
+
+def binding_label(binding):
+    """一条 PTT 绑定在界面上怎么念。
+
+    放在这里而不是 ptt.py 里：那个模块在三个客户端之间逐字节共享，一旦让它产生
+    界面文字，同一套中文就会躺在三份副本里，翻译时必然漏掉其中两份。它只给键名，
+    说法在这里拼。
+    """
+    if binding.kind == "keyboard":
+        return t("ptt.keyboard", key=binding.token())
+    if binding.kind == "mouse":
+        return t("ptt.mouse", button=binding.token())
+    if binding.device_name:
+        return t("ptt.joystick", device=binding.device_name, button=binding.token())
+    return t("ptt.joystick_plain", button=binding.token())

@@ -11,7 +11,15 @@ import version
 
 version.freeze(os.path.dirname(os.path.abspath(SPEC)))
 
-excludes = ['torch', 'transformers', 'scipy', 'pyttsx3', 'matplotlib']
+# qfluentwidgets 的 QSS、SVG 图标和内置字体是编进 Qt resource 模块（*_rc.py）的，
+# 跟着普通 import 就一起打进去了，不用 collect_data_files——实测收出来是 0 个文件。
+#
+# 但**不要**用 collect_submodules('qfluentwidgets')：它会把整个包里的模块都列成
+# 隐式导入，其中几个引用了 scipy / pillow / colorthief（那是它 `full` 附加功能的
+# 可选依赖，做亚克力模糊和取图片主色用的，这里一个都没用到），于是 PyInstaller
+# 把 scipy 一整套打了进来，包会涨出上百兆。
+excludes = ['torch', 'transformers', 'scipy', 'pyttsx3', 'matplotlib',
+            'PIL', 'colorthief']
 
 
 def find_opus():
@@ -81,6 +89,14 @@ a = Analysis(
     hiddenimports=[
         'pymumble_py3',
         'google.protobuf',
+        # Fluent 外观
+        'qfluentwidgets',
+        'qframelesswindow',
+        # pynput 的平台后端是运行时按名字 import 的（pynput/_util/__init__.py 的
+        # backend()），静态分析看不见。少了它们，打包后的程序照常启动，只是键盘和
+        # 鼠标侧键 PTT 一按没反应——而摇杆那条路还是好的，看起来像"就这个键坏了"。
+        'pynput.keyboard._win32',
+        'pynput.mouse._win32',
         # SimConnect 的子模块是运行时按名字取的，静态分析看不全
         'SimConnect',
         'SimConnect.Enum',

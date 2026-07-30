@@ -1,6 +1,6 @@
 """多语言的测试。
 
-    python -m unittest test_i18n -v      （在 controller 目录下运行）
+    python -m unittest test_i18n -v      （在 atis 目录下运行）
 
 最要紧的一条是**每个键两种语言都得有**：只翻一半的话，用户看到的是中英混排，
 而这种缺失单看代码是发现不了的——界面上那句话照样显示，只是显示的是另一种
@@ -52,12 +52,32 @@ class CoverageTest(unittest.TestCase):
                                f"{i18n.DEFAULT}={sorted(reference)}")
         self.assertEqual(bad, [], f"占位符对不上: {bad}")
 
+    # 英文条目里**故意**留着中文的几条。
+    #
+    # 这两个提示举的例子是"要填进中文稿的那个词本身"——中文稿里念的机场名和跑道，
+    # 最后是交给 TTS 念出来的。把 "上海浦东" 翻成 "Shanghai Pudong" 会让英文界面的
+    # 操作者照着填进去，然后中文通播里冒出一句英文。例子必须是中文，界面语言无关。
+    CHINESE_BY_DESIGN = {"station.chinese_name_hint", "station.chinese_runway_hint"}
+
     def test_translations_are_not_just_copies_of_chinese(self):
         """英文条目里不该还留着中文——那是漏翻却看着像翻过了。"""
         chinese = re.compile(r"[一-鿿]")
         untranslated = [key for key, entry in i18n.TEXT.items()
-                        if chinese.search(entry.get("en", ""))]
+                        if key not in self.CHINESE_BY_DESIGN
+                        and chinese.search(entry.get("en", ""))]
         self.assertEqual(untranslated, [], f"这些英文条目里还有中文: {untranslated}")
+
+    def test_the_exemptions_are_still_needed(self):
+        """豁免名单不能烂在这儿。
+
+        哪条被翻掉了、或者键名改了，这里就该把它从名单里删掉——否则名单会慢慢
+        变成一块谁也不敢动的免检区。
+        """
+        chinese = re.compile(r"[一-鿿]")
+        stale = [key for key in self.CHINESE_BY_DESIGN
+                 if key not in i18n.TEXT
+                 or not chinese.search(i18n.TEXT[key].get("en", ""))]
+        self.assertEqual(stale, [], f"这些豁免已经不需要了，从名单里删掉: {stale}")
 
 
 class NoHardcodedUiStringTest(unittest.TestCase):
@@ -108,18 +128,23 @@ class NoHardcodedUiStringTest(unittest.TestCase):
         return bad
 
     def test_gui_has_no_hardcoded_chinese(self):
+        """主窗口、席位对话框和预设对话框都在 gui.py 里。"""
         self.assertEqual(self.offenders("gui.py"), [])
 
     def test_settings_dialog_has_no_hardcoded_chinese(self):
         self.assertEqual(self.offenders("settings.py"), [])
 
-    def test_voice_status_messages_are_translated(self):
-        """voice.py 的 _state 会直接进状态栏和登录页。"""
-        self.assertEqual(self.offenders("voice.py"), [])
+    def test_broadcast_status_messages_are_translated(self):
+        """broadcast.py 的 _state 消息会直接进状态栏。"""
+        self.assertEqual(self.offenders("broadcast.py"), [])
 
-    def test_radiostack_errors_are_translated(self):
-        """这些 ValueError 会原样显示在 InfoBar 里。"""
-        self.assertEqual(self.offenders("radiostack.py"), [])
+    def test_fsd_status_messages_are_translated(self):
+        """fsdclient.py 同理，还包括本地先查一遍的呼号错误。"""
+        self.assertEqual(self.offenders("fsdclient.py"), [])
+
+    def test_profile_errors_are_translated(self):
+        """profile.py 抛的 ValueError 会原样进 QMessageBox。"""
+        self.assertEqual(self.offenders("profile.py"), [])
 
 
 class LookupTest(unittest.TestCase):
@@ -141,9 +166,9 @@ class LookupTest(unittest.TestCase):
 
     def test_placeholders_are_filled(self):
         i18n.set_language("zh")
-        text = i18n.t("radio.last_rx", who="CES2345", stamp="12:00:00")
-        self.assertIn("CES2345", text)
-        self.assertIn("12:00:00", text)
+        text = i18n.t("weather.updated", callsign="ZSPD_ATIS", letter="J")
+        self.assertIn("ZSPD_ATIS", text)
+        self.assertIn("J", text)
         self.assertNotIn("{", text)
 
     def test_an_unknown_key_returns_the_key(self):
@@ -152,7 +177,7 @@ class LookupTest(unittest.TestCase):
 
     def test_a_missing_placeholder_does_not_crash(self):
         # 调用方漏传参数时，宁可显示带 {} 的原文，也不能让界面炸掉
-        text = i18n.t("radio.last_rx", who="CES2345")
+        text = i18n.t("weather.updated", callsign="ZSPD_ATIS")
         self.assertIsInstance(text, str)
 
     def test_an_unknown_language_falls_back(self):
@@ -200,6 +225,48 @@ class SystemLanguageTest(unittest.TestCase):
 
     def test_it_always_returns_something_supported(self):
         self.assertIn(i18n.system_language(), i18n.LANGUAGES)
+
+
+class VoiceLanguageTest(unittest.TestCase):
+    """通播稿的语言和界面语言是两回事。
+
+    界面语言是操作者看什么，voice_language 是播出去给飞行员听什么。一个英文界面的
+    操作者照样可能在管一份中文通播——把两者搅在一起，切个界面语言就会把在播的
+    通播稿也换掉。
+    """
+
+    def setUp(self):
+        self._saved = i18n.current()
+
+    def tearDown(self):
+        i18n.set_language(self._saved)
+
+    def test_the_interface_language_does_not_touch_the_script(self):
+        import profile as profile_module
+        station = profile_module.Station(
+            "ZSPD", frequency="127.850",
+            voice_language=profile_module.LANGUAGE_CHINESE)
+        i18n.set_language("en")
+        self.assertEqual(station.voice_language, profile_module.LANGUAGE_CHINESE,
+                         "切界面语言把通播稿的语言也改了")
+
+    def test_the_language_names_follow_the_interface_language(self):
+        import profile as profile_module
+        i18n.set_language("zh")
+        chinese = profile_module.language_label(profile_module.LANGUAGE_BOTH)
+        i18n.set_language("en")
+        english = profile_module.language_label(profile_module.LANGUAGE_BOTH)
+        # 名字本身要跟着界面走：中文界面里写"中英双语"，英文界面里写英文
+        self.assertNotEqual(chinese, english)
+
+    def test_station_types_are_translated_lazily(self):
+        """类型名不能在导入时定死，否则切语言之后还是旧的那一套。"""
+        import profile as profile_module
+        i18n.set_language("zh")
+        chinese = profile_module.type_label(profile_module.TYPE_DEPARTURE)
+        i18n.set_language("en")
+        english = profile_module.type_label(profile_module.TYPE_DEPARTURE)
+        self.assertNotEqual(chinese, english)
 
 
 if __name__ == "__main__":

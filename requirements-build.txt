@@ -9,7 +9,7 @@
 
 # ---- 界面 ----
 PyQt6
-PyQt6-Fluent-Widgets            # controller / atis 的 Fluent 深色外观
+PyQt6-Fluent-Widgets            # 四个客户端共用的 Fluent 深色外观（theme.py）
 
 # ---- 语音 ----
 # PyPI 上的包名是 pymumble，导入名是 pymumble_py3
@@ -23,9 +23,13 @@ numpy
 pyogg
 
 # ---- 输入设备 ----
-pynput                          # 管制端的 PTT 监听
-keyboard                        # 飞行员端的 PTT
+# PTT 的三个来源都在 ptt.py 里（controller / xpc / msfs 各一份逐字节相同的副本）：
+# 键盘和鼠标侧键走 pynput 的全局监听，摇杆走 pygame 轮询。
+pynput                          # 键盘 + 鼠标侧键 PTT
 pygame                          # 摇杆 PTT（SDL 的视频/音频驱动会被置成 dummy）
+# 只有 client/ 和 xplane_client/ 这两个不再出包的老客户端还在用它。留着是因为
+# CI 仍然跑它们的测试——那两个共享 FREQ_* 频道约定，坏了得有人知道。
+keyboard
 
 # ---- 模拟器 ----
 # SimConnect.dll 就在这个 wheel 里，msfs/gui.spec 从包目录把它捞出来打进

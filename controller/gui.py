@@ -21,22 +21,25 @@ from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLayout, QPushButton,
                              QStackedWidget, QMessageBox)
-from pynput import keyboard
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
                             InfoBar, InfoBarPosition, LineEdit, PasswordLineEdit,
                             PrimaryPushButton, PushButton, ScrollArea, Slider,
-                            StrongBodyLabel, SubtitleLabel, Theme,
+                            StrongBodyLabel, SubtitleLabel,
                             PillPushButton, TogglePushButton,
-                            TransparentToolButton, setTheme, setThemeColor)
+                            TransparentToolButton)
 
 import applog
 import datafeed
 import i18n
+import ptt
 from i18n import t
 import radiostack
 import version
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
+from theme import (ACTIVE_COLOR, IDLE_COLOR, MONO_FONT, MUTED_COLOR, OFFLINE_COLOR,
+                   OFF_COLOR, ONLINE_COLOR, ON_COLOR, SURFACE_BG, TEXT_COLOR,
+                   THEME_COLOR, WINDOW_BG, apply_theme)
 from voice import VoiceClient
 
 log = logging.getLogger("gui")
@@ -49,29 +52,6 @@ DATAFEED_INTERVAL = 60
 # 顶部输入框的最大宽度。频率卡片是流式排布的，屏幕越宽一行放得越多（这点照
 # TrackAudio，不限宽），但输入框没必要跟着拉到一米长。
 INPUT_WIDTH = 340
-
-# ---------- 配色 ----------
-# 取自 TrackAudio（src/renderer/src/style/variables.scss）。管制员多半两边都开着，
-# 配色一致能省掉一次心智切换。
-#
-# 关键是**三态用同一套语义色**，而不是每个开关一个颜色：
-#     关 = 蓝灰      开 = 绿      正在响 = 琥珀
-# RX / TX / XC 都是这三态，学一次就够。而且"正在响"是**色相**变化，不是把绿色调亮
-# ——管制员盯着别处时，余光对色相远比对亮度敏感。
-OFF_COLOR = "#436384"       # $primary：开关关着
-ON_COLOR = "#28a745"        # $success：开着
-ACTIVE_COLOR = "#c7861d"    # $warning：此刻正在收/发
-MUTED_COLOR = "#dc3545"     # $danger：静音
-THEME_COLOR = "#5eb1bf"     # $alias：强调色（选中的主频率、主按钮）
-ONLINE_COLOR = ON_COLOR
-OFFLINE_COLOR = MUTED_COLOR
-IDLE_COLOR = "#8b90a4"      # 次要文字
-WINDOW_BG = "#2c2f45"       # $bg-color：偏蓝紫的深底，不是中性灰
-SURFACE_BG = "#252839"      # 卡片底
-
-# 频率用等宽字体：一屏十几个频率时数字能对齐，扫视快得多。TrackAudio 整个界面
-# 都是 Ubuntu Mono，这里只给频率用——中文用等宽会很难看。
-MONO_FONT = "Consolas"
 
 # 卡片尺寸。TrackAudio 是 205×90 的网格，这里稍宽一点放中文和"最后通话"。
 CARD_WIDTH = 232
@@ -296,7 +276,7 @@ class RadioRow(CardWidget):
         left.setSpacing(0)
         self.freq_label = QLabel()
         self.freq_label.setFont(QFont(MONO_FONT, 17, QFont.Weight.DemiBold))
-        self.freq_label.setStyleSheet("color: #e6e8f0;")
+        self.freq_label.setStyleSheet(f"color: {TEXT_COLOR};")
         left.addWidget(self.freq_label)
 
         self.callsign_label = QLabel()
@@ -1156,36 +1136,43 @@ class ControllerWindow(QMainWindow):
 
     # ---------- PTT ----------
     def setup_ptt(self):
-        self.ptt_listener = keyboard.Listener(
-            on_press=self.on_key_press, on_release=self.on_key_release)
-        self.ptt_listener.start()
+        """键盘、摇杆按钮、鼠标侧键都从 ptt.PttWatcher 来，任意一个按住就发话。"""
+        self.ptt_watcher = ptt.PttWatcher(self.settings.ptt_bindings,
+                                          on_change=self.on_ptt_change)
+        self.ptt_watcher.start()
 
-    @staticmethod
-    def _key_name(key):
-        return key.char if hasattr(key, 'char') and key.char else getattr(key, 'name', str(key))
+    def on_ptt_change(self, down):
+        """在监听线程上跑（pynput 的线程或摇杆轮询线程）。
 
-    def on_key_press(self, key):
+        **故意不经 pyqtSignal**。这里一个控件都不碰——发话灯是 voice 的 on_tx 回调
+        经 signals.tx 点亮的——而绕一趟 Qt 事件循环会让 PTT 的响应跟着界面忙不忙
+        走：重画电台栈的那一帧里按下 PTT，话头就被切掉了。
+        """
+        voice = self.voice
+        if not voice:
+            return
         try:
-            if self._key_name(key) == self.settings.ptt_key and self.voice:
-                self.voice.start_transmit()
-        except Exception:
-            pass
-
-    def on_key_release(self, key):
-        try:
-            if self._key_name(key) == self.settings.ptt_key and self.voice:
-                self.voice.stop_transmit()
-        except Exception:
-            pass
+            if down:
+                voice.start_transmit()
+            else:
+                voice.stop_transmit()
+        except Exception as e:
+            log.warning("could not switch the transmitter: %s", e)
 
     # ---------- 设置 ----------
     def open_settings(self):
+        # 开设置期间把监听整个停掉。录绑定时 PttCapture 要独占 SDL 的事件队列
+        # （两个线程一起 pump 不是线程安全的），而且用户为了录绑定按的那一下
+        # 不该真的发出去一段语音。
+        if hasattr(self, 'ptt_watcher'):
+            self.ptt_watcher.stop()
         dialog = SettingsDialog(self.settings, self)
-        if dialog.exec():
+        accepted = dialog.exec()
+        if hasattr(self, 'ptt_watcher'):
+            self.ptt_watcher.set_bindings(self.settings.ptt_bindings)
+            self.ptt_watcher.start()
+        if accepted:
             self.retranslate()
-            if hasattr(self, 'ptt_listener'):
-                self.ptt_listener.stop()
-            self.setup_ptt()
             if self.voice:
                 self.voice.set_mic_volume(self.settings.mic_volume)
                 self.voice.set_speaker_volume(self.settings.speaker_volume)
@@ -1197,20 +1184,14 @@ class ControllerWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if hasattr(self, 'ptt_listener'):
-                self.ptt_listener.stop()
+            if hasattr(self, 'ptt_watcher'):
+                self.ptt_watcher.stop()
             if self.voice:
                 self.voice.disconnect()
         except Exception as e:
             log.warning(f"error while closing: {e}")
         finally:
             event.accept()
-
-
-def apply_theme():
-    """深色 Fluent。放在建窗口之前调用。"""
-    setTheme(Theme.DARK)
-    setThemeColor(THEME_COLOR)
 
 
 if __name__ == '__main__':

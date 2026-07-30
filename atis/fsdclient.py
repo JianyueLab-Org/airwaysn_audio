@@ -25,6 +25,10 @@ import socket
 import threading
 import time
 
+# _status() 的消息会直接进界面，是界面文字，所以要过 i18n。日志那一半仍然是英文
+# ——分界线在"这句话最后到哪儿去"，不在它写在哪个模块里。
+from i18n import t
+
 log = logging.getLogger("fsd")
 
 DEFAULT_PORT = 6809
@@ -86,12 +90,12 @@ def callsign_problem(callsign):
     """
     callsign = (callsign or "").strip().upper()
     if not 2 <= len(callsign) <= MAX_CALLSIGN_LENGTH:
-        return (f"呼号 {callsign} 有 {len(callsign)} 个字符，"
-                f"服务端只接受 2-{MAX_CALLSIGN_LENGTH} 个")
+        return t("callsign.length", callsign=callsign, count=len(callsign),
+                 limit=MAX_CALLSIGN_LENGTH)
     if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in callsign):
-        return f"呼号 {callsign} 含有服务端不接受的字符"
+        return t("callsign.charset", callsign=callsign)
     if not callsign.endswith("_ATIS"):
-        return f"呼号 {callsign} 不是以 _ATIS 结尾，服务端不会把它算作通播席位"
+        return t("callsign.not_atis", callsign=callsign)
     return None
 
 
@@ -228,7 +232,7 @@ class FSDClient:
             log.debug("→ %s", self._redact(packet))
             return True
         except Exception as e:
-            self._status('error', f"发送失败: {e}")
+            self._status('error', t("fsd.send_failed", error=e))
             return False
 
     def _run(self):
@@ -253,7 +257,7 @@ class FSDClient:
                     self._retryable = True
                     self._loop()
             except Exception as e:
-                self._status('error', f"FSD 连接异常: {e}")
+                self._status('error', t("fsd.exception", error=e))
             finally:
                 self._close()
 
@@ -267,13 +271,13 @@ class FSDClient:
                 self.gave_up = True
                 self._retryable = False
                 self._status('offline',
-                             f"与 FSD 断开后重连 {self.reconnect_limit} 次都没成功，"
-                             f"{self.callsign} 已下线")
+                             t("fsd.give_up", limit=self.reconnect_limit,
+                               callsign=self.callsign))
                 return
 
             self._status('reconnecting',
-                         f"与 FSD 的连接断开，正在重连"
-                         f"（{attempts}/{self.reconnect_limit}）")
+                         t("fsd.reconnecting", attempt=attempts,
+                           limit=self.reconnect_limit))
             if self.stop_event.wait(RECONNECT_DELAY):
                 return
 
@@ -293,12 +297,13 @@ class FSDClient:
             self.rating = found or RATING_OBSERVER
 
         self._status('connecting',
-                     f"正在以 {self.callsign} 登录 FSD（等级 {self.rating}）…")
+                     t("fsd.connecting", callsign=self.callsign, rating=self.rating))
         try:
             self._sock = socket.create_connection((self.host, self.port), timeout=10)
             self._sock.settimeout(1.0)
         except Exception as e:
-            self._status('error', f"无法连接 FSD 服务器 {self.host}:{self.port}（{e}）")
+            self._status('error', t("fsd.connect_failed", host=self.host,
+                                            port=self.port, error=e))
             return False
 
         greeting = self._read_packet(timeout=5)
@@ -321,16 +326,16 @@ class FSDClient:
             if packet is None:
                 continue
             if packet == "":
-                self._status('error', "FSD 服务器关闭了连接")
+                self._status('error', t("fsd.closed"))
                 return False
             if self._handle_packet(packet) is False:
                 return False
             if self._logged_in:
                 self._send_position()
-                self._status('online', f"已作为 {self.callsign} 登录 FSD")
+                self._status('online', t("fsd.online", callsign=self.callsign))
                 return True
 
-        self._status('error', "FSD 登录超时，未收到服务器回应")
+        self._status('error', t("fsd.login_timeout"))
         return False
 
     def _loop(self):
@@ -338,7 +343,7 @@ class FSDClient:
         while self.running and not self.stop_event.is_set():
             packet = self._read_packet(timeout=1)
             if packet == "":
-                self._status('error', "与 FSD 服务器的连接已断开")
+                self._status('error', t("fsd.dropped"))
                 return
             if packet and self._handle_packet(packet) is False:
                 return
@@ -371,7 +376,7 @@ class FSDClient:
         try:
             frequency = encode_frequency(self.frequency)
         except (TypeError, ValueError):
-            self._status('error', f"频率 {self.frequency} 无法编码")
+            self._status('error', t("fsd.bad_frequency", frequency=self.frequency))
             return False
         return self._send(
             f"%{self.callsign}:{frequency}:{FACILITY_ATIS}:{self.vis_range}:"
@@ -397,7 +402,7 @@ class FSDClient:
             code = fields[2] if len(fields) > 2 else "?"
             message = fields[4] if len(fields) > 4 else packet
             if not self._logged_in:
-                self._status('error', f"FSD 拒绝登录（{code}）: {message}")
+                self._status('error', t("fsd.rejected", code=code, message=message))
                 return False
             # 登录之后的 $ER 多半是某次查询失败（比如没有该机场的气象），
             # 不该把整条连接拆掉
@@ -479,4 +484,4 @@ class FSDClient:
                 pass
             self._sock = None
         self._logged_in = False
-        self._status('stopped', "已从 FSD 下线")
+        self._status('stopped', t("fsd.stopped"))

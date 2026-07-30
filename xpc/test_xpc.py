@@ -8,8 +8,10 @@
 
 import inspect
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -24,9 +26,11 @@ except Exception:
                   "opuslib.api.encoder", "opuslib.api.info", "opuslib.exceptions"):
         sys.modules.setdefault(_name, mock.MagicMock())
 
+import bridge
 import cslmatch
 import fsdpilot
 import traffic as traffic_module
+import xpinstall
 import xplane
 
 
@@ -2230,6 +2234,151 @@ class AnimationValuesTest(unittest.TestCase):
         # 没这个能力还去抢 AI 机位，会挡住 LiveTraffic 之类真正用得上的插件
         source = inspect.getsource(self.module.PythonInterface.XPluginEnable)
         self.assertIn("tcas_available", source)
+
+
+class PluginInstallTest(unittest.TestCase):
+    """把他机插件装进 X-Plane。
+
+    全程在临时目录里搭一棵假的 X-Plane 目录树，不碰真的模拟器，也不读本机上
+    那份安装记录（`inspect()` 明确传 root，就不会去自动探测）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "X-Plane 12")
+        os.makedirs(os.path.join(self.root, xpinstall.PLUGINS_DIR))
+
+    def _install_xppython3(self):
+        os.makedirs(os.path.join(self.root, xpinstall.XPPYTHON3_DIR))
+
+    def _write_plugin(self, text):
+        target = xpinstall.plugin_path(self.root)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(text)
+        return target
+
+    # ---------- 目录识别 ----------
+    def test_a_folder_with_resources_plugins_is_xplane(self):
+        self.assertTrue(xpinstall.is_xplane_root(self.root))
+
+    def test_some_other_folder_is_not(self):
+        self.assertFalse(xpinstall.is_xplane_root(self.tmp))
+        self.assertFalse(xpinstall.is_xplane_root(""))
+
+    def test_the_check_does_not_require_pythonplugins(self):
+        """没装 XPPython3 的机器上 PythonPlugins 是不存在的。
+
+        拿它当判据会把一个完好的 X-Plane 目录判成"不是 X-Plane"，而那恰恰是
+        最需要装插件的那批人。
+        """
+        self.assertFalse(os.path.isdir(
+            os.path.join(self.root, xpinstall.PYTHON_PLUGINS_DIR)))
+        self.assertTrue(xpinstall.is_xplane_root(self.root))
+
+    # ---------- 状态 ----------
+    def test_a_fresh_install_reports_missing(self):
+        status = xpinstall.inspect(self.root)
+        self.assertEqual(status.state, xpinstall.MISSING)
+        self.assertTrue(status.can_install)
+
+    def test_a_folder_that_is_not_xplane_reports_so(self):
+        status = xpinstall.inspect(self.tmp)
+        self.assertEqual(status.state, xpinstall.NOT_XPLANE)
+        self.assertFalse(status.can_install)
+
+    def test_xppython3_is_detected(self):
+        self.assertFalse(xpinstall.inspect(self.root).xppython3)
+        self._install_xppython3()
+        self.assertTrue(xpinstall.inspect(self.root).xppython3)
+
+    def test_installing_then_inspecting_reports_current(self):
+        xpinstall.install(self.root)
+        status = xpinstall.inspect(self.root)
+        self.assertEqual(status.state, xpinstall.CURRENT)
+        self.assertEqual(status.installed_protocol, bridge.PROTOCOL_VERSION)
+        self.assertFalse(status.protocol_mismatch)
+
+    def test_a_different_file_reports_outdated(self):
+        self._write_plugin("PROTOCOL_VERSION = %d\n# 老版本\n"
+                           % bridge.PROTOCOL_VERSION)
+        self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
+
+    def test_installing_over_an_old_copy_brings_it_current(self):
+        self._write_plugin("# 很旧的一份\n")
+        self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
+        xpinstall.install(self.root)
+        self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.CURRENT)
+
+    def test_install_creates_pythonplugins_if_it_is_missing(self):
+        # 装了 XPPython3 也不一定已经有这个目录，它是第一次用时才建的
+        target = xpinstall.install(self.root)
+        self.assertTrue(os.path.isfile(target))
+        self.assertEqual(os.path.basename(target), xpinstall.PLUGIN_NAME)
+
+    # ---------- 协议号 ----------
+    def test_a_protocol_mismatch_is_reported_on_its_own(self):
+        """协议对不上时插件是**静默**丢帧的。
+
+        `PI_XpcTraffic.py` 收到 v 不一样的包直接 return，不记日志；用户看到的
+        只有"他机一架都不出现"。所以这条必须能单独报出来，不能混在"版本旧"里
+        ——两者的后果差得远。
+        """
+        self._write_plugin("PROTOCOL_VERSION = %d\n" % (bridge.PROTOCOL_VERSION + 1))
+        status = xpinstall.inspect(self.root)
+        self.assertEqual(status.state, xpinstall.OUTDATED)
+        self.assertTrue(status.protocol_mismatch)
+        self.assertEqual(status.installed_protocol, bridge.PROTOCOL_VERSION + 1)
+
+    def test_an_unreadable_protocol_is_not_a_mismatch(self):
+        # 抠不出版本号（用户改坏了）时别谎报成"协议不一致"——那会把人引到
+        # 一个不存在的原因上
+        self._write_plugin("# 什么都没有\n")
+        status = xpinstall.inspect(self.root)
+        self.assertIsNone(status.installed_protocol)
+        self.assertFalse(status.protocol_mismatch)
+
+    def test_the_bundled_plugin_and_the_bridge_agree(self):
+        """随包这份插件和客户端必须说同一版协议。
+
+        两边各存一份常量，改了一边忘了另一边的话，打出来的包一装上去就是
+        "他机一架都不出现"，而且不报错。
+        """
+        self.assertEqual(xpinstall.protocol_version(xpinstall.bundled_plugin()),
+                         bridge.PROTOCOL_VERSION)
+
+    # ---------- 出错 ----------
+    def test_a_missing_source_does_not_report_current(self):
+        """打包漏了 datas 时，绝不能说"已是最新"。
+
+        那会让用户以为装好了，然后去查 X-Plane 那边为什么不出飞机。
+        """
+        self._write_plugin("# 随便什么\n")
+        with mock.patch.object(xpinstall, "bundled_plugin",
+                               return_value=os.path.join(self.tmp, "没有这个文件")):
+            self.assertEqual(xpinstall.inspect(self.root).state, xpinstall.OUTDATED)
+
+    def test_install_raises_when_the_source_is_missing(self):
+        with mock.patch.object(xpinstall, "bundled_plugin",
+                               return_value=os.path.join(self.tmp, "没有这个文件")):
+            with self.assertRaises(OSError):
+                xpinstall.install(self.root)
+
+    # ---------- 自动探测 ----------
+    def test_install_records_are_read_and_filtered(self):
+        record = os.path.join(self.tmp, "x-plane_install_12.txt")
+        with open(record, "w", encoding="utf-8") as f:
+            # 第二行指向一个已经不在的目录：搬过或者删过的安装很常见
+            f.write(self.root + "\n" + os.path.join(self.tmp, "搬走了") + "\n")
+        with mock.patch.object(xpinstall, "_install_records", return_value=[record]):
+            self.assertEqual(xpinstall.find_installs(), [self.root])
+
+    def test_a_missing_record_is_not_an_error(self):
+        with mock.patch.object(xpinstall, "_install_records",
+                               return_value=[os.path.join(self.tmp, "没有")]):
+            self.assertEqual(xpinstall.find_installs(), [])
+            self.assertEqual(xpinstall.inspect().state, xpinstall.NO_ROOT)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ import json
 import logging
 import os
 
+import ptt
+
 log = logging.getLogger("settings")
 
 SETTINGS_FILE = "msfs_settings.json"
@@ -26,8 +28,14 @@ DEFAULTS = {
     "mumble_host": MUMBLE_HOST,
     "fsd_host": FSD_HOST,
     "fsd_port": FSD_PORT,
+    # PTT 现在是一串绑定（键盘 / 鼠标侧键 / 摇杆），任意一个按住即发话。
+    # 老配置里的 ptt_key + joystick_ptt 两个字段读得进来，见 load()。
+    "ptt_bindings": None,
     "ptt_key": "`",
     "joystick_ptt": None,
+    # 界面语言。空字符串表示"还没选过"，第一次启动跟系统走
+    "language": "",
+    "debug": False,
     "input_device_index": None,
     "output_device_index": None,
     "mic_volume": 100,
@@ -48,6 +56,10 @@ class Settings:
         for key, value in DEFAULTS.items():
             setattr(self, key, value)
         self.load()
+        if self.ptt_bindings is None:
+            # 全新安装，连配置文件都还没有：用默认的 PTT 键起一条绑定
+            self.ptt_bindings = ptt.load(None, legacy_key=self.ptt_key,
+                                         legacy_joystick=self.joystick_ptt)
 
     def load(self):
         if not os.path.exists(self.path):
@@ -66,10 +78,21 @@ class Settings:
         self.speaker_volume = max(0, min(200, int(self.speaker_volume or 100)))
         if not isinstance(self.package_roots, list):
             self.package_roots = []
+        # 绑定表从 JSON 变成 ptt.Binding。老配置里没有 ptt_bindings，就拿
+        # ptt_key + joystick_ptt 升上来——升不上来的话，用户原来设的 PTT 会在
+        # 升级之后悄悄失效，而界面上一切正常，只是没人听得见。
+        self.ptt_bindings = ptt.load(data.get("ptt_bindings"),
+                                     legacy_key=self.ptt_key,
+                                     legacy_joystick=self.joystick_ptt)
         log.info("read the settings from %s", os.path.abspath(self.path))
 
     def save(self):
         data = {key: getattr(self, key, DEFAULTS[key]) for key in DEFAULTS}
+        data["ptt_bindings"] = ptt.dump(self.ptt_bindings)
+        # ptt_key / joystick_ptt 不再写回去：留着就有两个说了算的地方，而且它们
+        # 加起来也表达不了鼠标侧键这一种。
+        data.pop("ptt_key", None)
+        data.pop("joystick_ptt", None)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)

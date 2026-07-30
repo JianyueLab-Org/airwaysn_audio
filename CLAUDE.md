@@ -60,21 +60,29 @@ cd controller
 python -m unittest test_radiostack -v    # radio stack model + RX/TX/XC coupling rules
 python -m unittest test_radiostack.CouplingRulesTest.test_tx_forces_rx_on   # one test
 python -m unittest test_applog           # logging, including uncaught-exception capture
+python -m unittest test_i18n             # both languages present, no hardcoded UI strings
+python -m unittest test_ptt              # keyboard / joystick / mouse PTT, with fake devices
 python smoke_gui.py                      # builds every window/dialog offscreen
 
 cd atis
 python -m unittest test_atis -v          # METAR, templates, stations, vATIS import, network config, FSD
 python -m unittest test_applog
+python -m unittest test_i18n             # 两种语言都齐，且源码里没有写死的界面文字
 python smoke_gui.py
 
 cd xpc
 python -m unittest test_xpc -v           # PBH, position packets, RREF, traffic, model matching
+python -m unittest test_i18n             # 两种语言都齐；ptt.py 里不能有界面文字
+python -m unittest test_ptt
 python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
 python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
+python -m unittest test_xpc.PluginInstallTest   # 插件安装：目录识别、新旧判定、协议号
 python smoke_gui.py
 
 cd msfs
 python -m unittest test_msfs -v          # BCD squawk, SimVar units, aircraft.cfg
+python -m unittest test_i18n
+python -m unittest test_ptt
 python -m unittest test_msfs.RealWorldLayoutTest   # the ones a live install found
 python smoke_gui.py
 
@@ -99,7 +107,7 @@ python -m unittest test_mumble -v        # 通播的建频道 / 进频道，含�
 16:39:37 WARNING voice        3 reconnect attempts after the drop all failed, giving up
 ```
 
-The dividing line is **where the string ends up**, not which module it lives in: anything that can reach a widget, a `QMessageBox`, a status label or an `i18n` key stays Chinese, including the `message` argument of the `_status()`/`_state()` callbacks — those are UI strings that happen to be echoed into the log, and that echo is deliberate (it puts what the user saw next to what the code was doing). A string that only ever goes to the log is English. So `broadcast.py`'s `REJECT_REASONS` table and `controller/i18n.py` are still Chinese while every `log.*` call around them is not.
+The dividing line is **where the string ends up**, not which module it lives in: anything that can reach a widget, a `QMessageBox`, a status label or an `i18n` key stays Chinese, including the `message` argument of the `_status()`/`_state()` callbacks — those are UI strings that happen to be echoed into the log, and that echo is deliberate (it puts what the user saw next to what the code was doing). A string that only ever goes to the log is English. So the `reject.*` / `denied.*` entries in each `i18n.py` are still Chinese (in the `zh` half) while every `log.*` call around the code that reads them is not — and `voice.py`'s `_skip()` reasons, which only ever reach the log, are English despite sitting between two translated `_status()` calls.
 
 `controller/`, `atis/`, `xpc/` and `msfs/` are converted. **`client/` and `xplane_client/` are not** — they are legacy and unshipped, so their log text is still Chinese; the exception is `version.py`, which `test_version.CopiesAgreeTest` requires to be byte-identical across all six components, so that one file was synced everywhere. New code follows the English rule regardless of which directory it lands in.
 
@@ -128,9 +136,43 @@ python xplane.py --probe    # try every candidate dataref and print raw + MHz
 python xplane.py --data     # DATA output row 3 (must be enabled in X-Plane settings)
 ```
 
-Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6`, `pymumble`, `pyaudio`, `numpy`, `pygame`, `keyboard` (pilot clients), `pynput` (controller), `SimConnect` (client only), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`).
+Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6` + `PyQt6-Fluent-Widgets` (all four shipped clients), `pymumble`, `pyaudio`, `numpy`, `pynput` (keyboard and mouse PTT), `pygame` (joystick PTT), `keyboard` (only the two legacy pilot clients), `SimConnect` (`msfs/`), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`). `requirements-build.txt` is the authoritative list for the four packaged clients.
 
 ## Cross-cutting conventions
+
+**All four shipped clients use qfluentwidgets on PyQt6, and the palette lives in `theme.py`.** `controller/` and `atis/` were already Fluent; `xpc/` and `msfs/` were plain Qt widgets until they were converted. The colours used to sit at the top of each `gui.py`, which meant the same "green" had three different values across the repo (`#28a745` in controller/atis, `#2ecc71` in xpc/msfs) and — more practically — that `settings.py` could not reach them at all, because it cannot import `gui.py` without a cycle. `theme.py` is another byte-identical copy across all four components (like `voice.py` and `ptt.py`); **no `gui.py` may contain a literal `#rrggbb` any more.**
+
+Two things Fluent does *not* cover, both of which look like "the theme only got applied halfway":
+
+- `QMenuBar` / `QStatusBar` / `QDialog` are Qt's own widgets, not qfluentwidgets', so they stay light on a dark window. `theme.window_qss()` and `theme.dialog_qss()` exist for exactly those; a new `QDialog` that does not apply `dialog_qss()` pops up as a white box.
+- `QGroupBox` and `QTabWidget` have no Fluent styling either. Use `HeaderCardWidget` instead of the first and `SegmentedWidget` + `QStackedWidget` instead of the second (`xpc/gui.py` is the reference for both).
+
+`qfluentwidgets`'s `ComboBox` has **no `findData()`** — every component carries a three-line `_find_data()` helper, and `addItem()` needs `userData=` as a keyword rather than a positional second argument.
+
+**UI text goes through `i18n.t()`; there are no interface string literals in the source.** All four components now carry an `i18n.py` (a per-component copy, like `applog.py` — the *keys* are shared conventions, the *strings* are not). Rules that the tests enforce, in `test_i18n.py`:
+
+- Every key must have both `zh` and `en`. Half a translation is worse than none: the sentence still renders, just in the other language, and only someone actually running the English UI would notice.
+- **Source is scanned for hardcoded Chinese** in anything that reaches a widget (`NoHardcodedUiStringTest`). The scan covers `gui.py`, `settings.py` and the modules whose `_status()`/`_state()` messages land in the UI (`voice.py`, `fsdpilot.py`, `fsdclient.py`, `broadcast.py`, `profile.py`, `radiostack.py`). It skips comments and docstrings — several docstrings describe a `_status(state, message)` signature and would otherwise be reported as untranslated.
+- Placeholders must match across languages, and they are **named** (`{who}`), never positional — the two languages order their clauses differently.
+
+Four traps, each of which produced a real bug during the conversion:
+
+- **`def t(key, /, **kwargs)` — the `/` is load-bearing.** Without it, any string containing a `{key}` placeholder blows up with `t() got multiple values for argument 'key'`, an error that says nothing about i18n.
+- **A `kind → 文案` dict is evaluated at import time**, so it freezes whatever language was current when the module loaded and never follows a language switch. `broadcast.py`'s `REJECT_REASONS`, `voice.py`'s denial table, and `profile.py`'s `TYPE_LABELS`/`LANGUAGES` were all this shape; they are now tuples of *known keys* plus a `t("prefix." + kind)` lookup at call time.
+- **Default arguments have the same problem.** `Voice.stop(message="语音已断开")` freezes the string at import; it is now `message=None` with the default filled in inside the function.
+- **Log text stays English.** The dividing line is where the string ends up, not which module it lives in — `voice.py`'s `_skip()` reasons only ever reach the log and are deliberately not translated, while the `_status()` messages three lines away are.
+
+ATIS has a second, unrelated notion of "language": `station.voice_language` picks what gets **broadcast** (英文 / 中文 / 中英双语). That is aimed at the crews listening, not at the operator, and an English-interface operator can perfectly well be running a Chinese ATIS. `chinese.py`, `template.py` and `metar.py` therefore stay out of the string table entirely, and `VoiceLanguageTest` pins that switching the interface language does not touch a station's script language.
+
+**PTT comes from `ptt.py`: keyboard, joystick button, or mouse side button — any one held transmits.** Another byte-identical copy across `controller/`, `xpc/` and `msfs/`. It replaces two older shapes: controller had keyboard only (a `pynput` listener compared against `settings.ptt_key`), while xpc/msfs polled `keyboard.is_pressed()` plus `pygame` in a hand-rolled loop with the button index typed into a bare `QSpinBox`. Settings now store `ptt_bindings`, a list; `ptt.load()` upgrades an old `ptt_key` + `joystick_ptt` pair into it, because silently losing someone's PTT key on upgrade looks exactly like a broken microphone.
+
+- **Mouse: side buttons X1/X2 only.** The listener is global, so binding the left button means transmitting every time the user clicks anything in any window — with the TX light hidden behind whatever they clicked on. `mouse_name()` returns `""` for left/right/middle, and it matches on the button's *name* because X11 calls the same physical keys `button8`/`button9` while Windows and macOS call them `x1`/`x2`.
+- **Never `suppress=True`.** Swallowing the event means the PTT key stops working in every other program, and it usually has another job inside the simulator.
+- **Keyboard and mouse are event-driven (`pynput`), the joystick is polled (`pygame`, 20 ms).** SDL has no global hook — its event queue has to be pumped from a thread you own — so the two halves cannot be unified.
+- **Only bound sources are started.** On macOS, creating a global keyboard listener triggers the accessibility-permission prompt; asking for it when the user only bound a joystick reads as malware.
+- **`PttCapture` (the "press the key you want" picker) needs the watcher stopped first.** Two threads pumping SDL's event queue is not thread-safe, and the keypress being recorded would otherwise go out over the air. Every `open_settings()` stops the watcher, and `is_running()` exists so it is only restarted if it had been running.
+- **`pygame` is imported lazily**, inside the function that needs it, because it does not build on every Python version and a missing joystick must not take keyboard PTT down with it. `SDL_VIDEODRIVER`/`SDL_AUDIODRIVER` are set to `dummy` right before that import as well as in `gui.py`.
+- `ptt.py` produces **no UI text** — `Binding.token()` returns `"V"` / `"X1"` / `"3"` and `i18n.binding_label()` does the wording. A shared file that carried Chinese would put the same strings in three places, two of which would be missed at translation time. `test_i18n.py` walks its AST to enforce this.
 
 **Frequency → channel name.** The one contract every component shares:
 
@@ -176,11 +218,11 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 
 **Audio path.** Mono `paInt16`, 20 ms frames (`CHUNK = int(RATE * 0.02)`). Each client runs `_find_best_sample_rate()`, probing `[48000, 44100, 32000, 24000, 16000]` against the selected devices at startup and again on every device change. Note that pymumble's `sound_output.add_sound()` expects 48 kHz PCM and no resampling is done — a fallback rate produces pitch-shifted audio, so 48 kHz is the intended path and lower rates are a last resort.
 
-**PTT and indicators.** Pilot clients poll `keyboard.is_pressed()` plus a pygame joystick button in a background thread; the controller uses a `pynput` listener plus an on-screen button. RX indicators are lit from the `PYMUMBLE_CLBK_SOUNDRECEIVED` callback and cleared by a 0.5 s timeout loop.
+**PTT and indicators.** The three shipped clients that transmit share `ptt.py` (see above); the two legacy pilot clients still poll `keyboard.is_pressed()` plus a pygame joystick button in a background thread. RX indicators are lit from the `PYMUMBLE_CLBK_SOUNDRECEIVED` callback and cleared by a 0.5 s timeout loop.
 
 **pygame on Windows.** `os.environ['SDL_VIDEODRIVER'] = 'dummy'` and `SDL_AUDIODRIVER = 'dummy'` must be set *before* `import pygame` — that is why these lines sit above the imports in `gui.py`, `radio.py`, and `client/settings.py`. pygame is only used for joystick input; SDL video/audio must stay disabled so it does not fight PyQt6 and PyAudio.
 
-**Diagnosing a refused connection.** pymumble raises `ConnectionRejectedError(mess.reason)` on a server `Reject` — dropping the `type` field, which is the one that actually says *why*, and which Murmur often fills in while leaving `reason` empty. Both clients therefore connect through a `RejectAwareMumble` subclass that parses the `Reject` message in `dispatch_control_message` before handing it on, keeping `reject_type` for the UI. `REJECT_REASONS` maps those types to Chinese; the distinction that matters most is `WrongUserPW` ("密码错误") versus `AuthenticatorFail` ("服务端认证器故障"), because the second one means `server/login.py` is down and no amount of password fiddling will help.
+**Diagnosing a refused connection.** pymumble raises `ConnectionRejectedError(mess.reason)` on a server `Reject` — dropping the `type` field, which is the one that actually says *why*, and which Murmur often fills in while leaving `reason` empty. Both clients therefore connect through a `RejectAwareMumble` subclass that parses the `Reject` message in `dispatch_control_message` before handing it on, keeping `reject_type` for the UI. The types are used directly as i18n keys (`reject.WrongUserPW` and friends, with a `REJECT_TYPES` tuple listing the ones that have wording); the distinction that matters most is `WrongUserPW` ("密码错误") versus `AuthenticatorFail` ("服务端认证器故障"), because the second one means `server/login.py` is down and no amount of password fiddling will help.
 
 **Qt threading.** pymumble callbacks fire on the library thread, so every GUI marshals them into the Qt thread through `pyqtSignal` wrappers: `ErrorSignal`/`ConnectSignal` in `client/gui.py` and `xplane_client/gui.py`, `VoiceSignals` in `controller/gui.py`. Follow that pattern for anything that touches widgets from a Mumble or audio callback.
 
@@ -324,6 +366,18 @@ Everything hard lives client-side where it has unit tests; the plugin is deliber
 
 **Model matching must always return something.** `ModelSet.match()` degrades type+airline → type → same family → generic-by-category → first model in the package, and returns the reason so a "that aircraft looks wrong" report is diagnosable from the log. An aircraft you cannot see is far more dangerous than one with the wrong livery.
 
+**The plugin installs itself from the settings dialog** (`xpinstall.py`, XPC only — MSFS needs no plugin at all). X-Plane's install directory cannot come from the UDP link: the BECN beacon carries an address and a port, nothing else. So `find_installs()` reads the record X-Plane's own installer writes (`x-plane_install_12.txt`, one directory per line; `%LOCALAPPDATA%` on Windows, `~/Library/Preferences/` on macOS, `~/.x-plane/` on Linux), and the traffic tab always keeps a **choose-the-folder** button as well — those paths are best-effort, and anyone running a portable copy or who moved the install has no such record. A folder counts as X-Plane if it has `Resources/plugins`; deliberately not `PythonPlugins`, which does not exist until XPPython3 has run once, so testing for it would reject exactly the installs that most need the plugin.
+
+Three deliberate limits:
+
+- **XPPython3 is detected, never installed.** It is a compiled binary whose version is tied to the simulator (v4.x for X-Plane 12, v3.1.5 for 11.52), and downloading and unpacking someone else's binary is a different risk category. `has_xppython3()` just checks for `Resources/plugins/XPPython3/` so the dialog can say what is missing.
+- **New vs. old is decided by file content, not a version string.** The plugin is a flat source file running inside X-Plane's own Python; it cannot import `version.py`, so a version constant would have to be maintained by hand and would eventually be forgotten. Same bytes → current.
+- **`inspect()` reports a protocol mismatch separately from "outdated".** `bridge.py` and the plugin each hold a `PROTOCOL_VERSION`, and when they disagree the plugin **silently drops every frame** (`header.get("v") != PROTOCOL_VERSION` → return, no log line). The symptom is "no traffic at all" with clean logs on both sides, so the UI says so in as many words rather than filing it under a generic version warning. `test_the_bundled_plugin_and_the_bridge_agree` fails if the two constants ever drift.
+
+Installing requires restarting X-Plane — the plugin is loaded at simulator startup — and the dialog says so after a successful copy. `install()` lets `OSError` out so the UI can tell an X-Plane-in-Program-Files permission failure apart from anything else.
+
+**The release zip carries the plugin twice, on purpose.** `_internal/plugin/PI_XpcTraffic.py` comes from the spec's `datas` and is the file the in-app installer actually copies (`bundled_plugin()` resolves it through `sys._MEIPASS`); the release workflow additionally drops a copy at `plugin/PI_XpcTraffic.py`, next to the exe, for anyone the automatic install cannot serve — X-Plane in a location needing administrator rights, a portable copy the detection misses, or a simulator on another machine. The build verifies **both** paths for the same reason `opus.dll` is verified: losing either one still produces a package that starts up fine and simply cannot render traffic.
+
 **Two X-Plane facts that shape the plugin**, both confirmed against `Resources/plugins/DataRefs.txt`:
 
 - **`XPLMInstance`-drawn aircraft do not appear on TCAS.** The panel reads `sim/cockpit2/tcas/targets/*` (64 slots, index 0 is the user), which is a separate system that has to be filled by hand. Those datarefs are "writeable only when `override_TCAS` is set", and `override_TCAS` itself is "only writeable by the plugin that has the AI planes acquired" — hence `xp.acquirePlanes()` first. The arrays carry `flight_id` and `icao_type`, so callsign and type show correctly on the ND. Traffic is capped at 63 and sorted by range client-side, because when there are more aircraft than slots the far ones are the right ones to drop.
@@ -342,7 +396,7 @@ The bridge is UDP with one JSON object per datagram, fragmented over `seq`/`part
 
 ## MSFS for CAN (`msfs/`)
 
-The same client as `xpc/`, for Microsoft Flight Simulator. `fsdpilot.py`, `voice.py`, `traffic.py`, `applog.py` and `mumblecompat.py` are **byte-identical copies** of the `xpc/` versions — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
+The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.py`, `mumblecompat.py`, `ptt.py` and `theme.py` are **byte-identical copies** of the `xpc/` versions (`SharedCopyTest` fails if they drift); `fsdpilot.py`, `applog.py` and `i18n.py` are deliberate forks — different simulator id, different log file name, and the handful of strings that name the simulator — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
 
 | Module | Replaces | Role |
 |---|---|---|

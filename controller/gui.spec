@@ -66,6 +66,10 @@ a = Analysis(
         'google.protobuf',
         'qfluentwidgets',
         'qframelesswindow',
+        # pynput 的平台后端是运行时按名字 import 的，静态分析看不见。少了它们，
+        # 打包后的程序照常启动，只是键盘和鼠标侧键 PTT 一按没反应。
+        'pynput.keyboard._win32',
+        'pynput.mouse._win32',
     ],
     hookspath=[],
     hooksconfig={},
