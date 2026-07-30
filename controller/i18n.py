@@ -118,6 +118,27 @@ TEXT = {
     "stack.duplicate":      {"zh": "{frequency} 已经在电台栈里了",
                              "en": "{frequency} is already in the stack"},
 
+    # ---------- 更新 ----------
+    # 查到新版只是弹一句，装不装是用户的事。措辞要说清下载走的是自己的服务器
+    # ——大陆连 GitHub 很不稳，这正是这个功能存在的理由。
+    "update.title":         {"zh": "有新版本", "en": "A new version is available"},
+    "update.body":          {"zh": "Audio for CAN {version} 已经发布{size}。\n"
+                                   "你现在用的是 {current}。",
+                             "en": "Audio for CAN {version} is out{size}.\n"
+                                   "You are running {current}."},
+    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+                                   "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
+                             "en": "The download comes from airwaysn's own server, not "
+                                   "from GitHub.\nUnzip it over the old folder — your "
+                                   "settings are not in there."},
+    "update.download":      {"zh": "下载", "en": "Download"},
+    "update.notes":         {"zh": "看更新说明", "en": "Release notes"},
+    "update.skip":          {"zh": "跳过这个版本", "en": "Skip this version"},
+    "update.later":         {"zh": "以后再说", "en": "Later"},
+    "update.check":         {"zh": "检查更新", "en": "Check for updates"},
+    "update.current":       {"zh": "已经是最新版本（{version}）。",
+                             "en": "You are on the latest version ({version})."},
+
     # ---------- 语音连接状态 ----------
     # voice.py 经 on_state 送到状态栏和登录页的文字
     "voice.connecting":     {"zh": "正在以 {cid} 连接 {server} …",

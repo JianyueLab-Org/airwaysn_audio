@@ -16,8 +16,10 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
+from PyQt6.QtCore import (QPoint, QRect, QSize, Qt, QObject, QTimer, QUrl,
+                          pyqtSignal)
+from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QPainter,
+                         QPen)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLayout, QPushButton,
                              QStackedWidget, QMessageBox)
@@ -34,6 +36,7 @@ import datafeed
 import i18n
 from i18n import t
 import radiostack
+import update
 import version
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
@@ -93,6 +96,8 @@ class VoiceSignals(QObject):
     connection = pyqtSignal(bool)
     # 数据源也是在后台线程取的，同样要过信号
     datafeed = pyqtSignal(object)
+    # 查更新同理
+    update_found = pyqtSignal(object)
 
 
 def resource_path(name):
@@ -448,6 +453,7 @@ class ControllerWindow(QMainWindow):
         self.signals.tx.connect(self.on_voice_tx)
         self.signals.connection.connect(self.on_connection_change)
         self.signals.datafeed.connect(self.on_datafeed)
+        self.signals.update_found.connect(self.on_update_found)
 
         self.datafeed_timer = QTimer(self)
         self.datafeed_timer.timeout.connect(self.refresh_datafeed)
@@ -458,6 +464,9 @@ class ControllerWindow(QMainWindow):
         self.apply_always_on_top()
         if self.settings.compact:
             self.toggle_compact(True)
+
+        # 起来之后在后台问一次有没有新版。查不到就当没这回事。
+        self.check_for_update()
 
         # 电台栈**不做持久化**：每次启动都是空的。频率该从数据源来——上了席位
         # 的自动加，别人的席位在"在线频率"里点。留着上一场的频率反而危险：
@@ -1179,6 +1188,67 @@ class ControllerWindow(QMainWindow):
             pass
 
     # ---------- 设置 ----------
+    # ---------- 更新 ----------
+    def check_for_update(self, manual=False):
+        """后台问一次有没有新版。
+
+        `manual=True` 是用户自己点的，那种情况下没有新版也要回一句。启动时那次
+        是静默的——管制员开着这个窗口是为了值班，不是为了看更新提示。
+        """
+        if not manual and not getattr(self.settings, "update_check", True):
+            return
+
+        def work():
+            found = update.check("audio-for-can", version.version(),
+                                 getattr(self.settings, "update_url", None))
+            self.signals.update_found.emit(found or (manual and "none" or None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_found(self, found):
+        """已经在界面线程。found 是 Update、"none"（手动查但没有新版）或 None。"""
+        if found is None:
+            return
+        if found == "none":
+            QMessageBox.information(self, t("update.check"),
+                                    t("update.current", version=version.version()))
+            return
+        if found.version == getattr(self.settings, "skipped_version", ""):
+            log.info("update %s was skipped by the user", found.version)
+            return
+
+        # **连着的时候不打断。** 管制员正在席位上，一个模态框会盖住电台栈，
+        # 而 PTT 是全局热键——他可能正对着频率讲话。等断开之后再说。
+        if self.voice:
+            log.info("update %s available, not prompting while connected",
+                     found.version)
+            self.status_label.setStyleSheet(f"color: {ACTIVE_COLOR};")
+            self.status_label.setText(t("update.title") + f" {found.version}")
+            return
+
+        size = f"（{found.size_label}）" if found.size_label else ""
+        box = QMessageBox(self)
+        box.setWindowTitle(t("update.title"))
+        box.setText(t("update.body", version=found.version, size=size,
+                      current=version.version()))
+        box.setInformativeText(t("update.detail"))
+        download = box.addButton(t("update.download"),
+                                 QMessageBox.ButtonRole.AcceptRole)
+        notes = box.addButton(t("update.notes"), QMessageBox.ButtonRole.HelpRole)
+        skip = box.addButton(t("update.skip"),
+                             QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(t("update.later"), QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is download and found.download:
+            QDesktopServices.openUrl(QUrl(found.download))
+        elif clicked is notes and found.notes:
+            QDesktopServices.openUrl(QUrl(found.notes))
+        elif clicked is skip:
+            self.settings.skipped_version = found.version
+            self.settings.save_settings()
+
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():

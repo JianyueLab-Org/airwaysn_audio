@@ -33,6 +33,12 @@ except Exception:
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+# 查更新会真的发网络请求，而弹出来的那个 QMessageBox 用的是 exec()——离屏模式下
+# 它照样会一直等人点，整个冒烟测试就挂死在那里。这里一律换成"没有新版"；
+# 真正的对话框逻辑另有一条用例单独测。
+import update
+update.check = lambda *args, **kwargs: None
+
 import gui
 
 # 弹出的提示框是模态的，离屏也一样会一直等人点。测试里把它们换成记录调用。

@@ -40,6 +40,12 @@ DEFAULTS = {
     "render_traffic": True,
     "csl_path": "",
     "traffic_range_nm": 60,
+    # 更新检查。启动时问一次 airwaysn 有没有新版；查到了也只是弹一句，
+    # 装不装由用户决定。skipped_version 记住"这一版我不要"，免得每次
+    # 启动再问一遍——那和自动更新一样烦人，只是烦得更频繁。
+    "update_check": True,
+    "skipped_version": "",
+    "update_url": "",
 }
 
 

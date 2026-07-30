@@ -66,6 +66,11 @@ class Settings:
         self.compact = False
         # 窗口置顶。和精简是一对，同样要记住
         self.always_on_top = False
+        # 更新检查：启动时问一次 airwaysn 有没有新版，装不装由用户决定。
+        # skipped_version 记住"这一版我不要"，免得每次启动再问一遍。
+        self.update_check = True
+        self.skipped_version = ""
+        self.update_url = ""
         self.debug = False
         self.load_settings()
 
@@ -95,6 +100,9 @@ class Settings:
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
                 self.compact = bool(data.get("compact", False))
                 self.always_on_top = bool(data.get("always_on_top", False))
+                self.update_check = bool(data.get("update_check", True))
+                self.skipped_version = str(data.get("skipped_version") or "")
+                self.update_url = str(data.get("update_url") or "")
                 self.debug = bool(data.get("debug", False))
         except Exception as e:
             log.warning(f"could not load the settings: {e}")
@@ -116,6 +124,9 @@ class Settings:
                     "metar_refresh": self.metar_refresh,
                     "compact": self.compact,
                     "always_on_top": self.always_on_top,
+                    "update_check": self.update_check,
+                    "skipped_version": self.skipped_version,
+                    "update_url": self.update_url,
                     "debug": self.debug,
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:

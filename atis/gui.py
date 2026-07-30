@@ -15,8 +15,8 @@ import os
 import sys
 import threading
 
-from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, QObject, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidgetItem,
                              QMessageBox, QDialog, QSplitter, QFileDialog,
@@ -29,6 +29,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, ComboBox, FluentIcon,
 
 import airports
 import applog
+import update
 import version
 import chinese
 import datafeed
@@ -89,6 +90,8 @@ class AtisSignals(QObject):
     metar = pyqtSignal(str, object, str)   # callsign, Metar 或 None, 错误
     # 开播前的核对结果：callsign, cid, password, 数据源是否可达, 管制席位, 等级
     precheck = pyqtSignal(str, str, str, bool, object, int)
+    # 查更新在后台线程里做，结果要过信号回到界面线程
+    update_found = pyqtSignal(object)
 
 
 class StationDialog(QDialog):
@@ -265,6 +268,7 @@ class AtisWindow(QMainWindow):
         self.signals.state.connect(self.on_broadcast_state)
         self.signals.metar.connect(self.on_metar)
         self.signals.precheck.connect(self.on_precheck)
+        self.signals.update_found.connect(self.on_update_found)
 
         self.setup_ui()
         self.refresh_stations()
@@ -278,6 +282,9 @@ class AtisWindow(QMainWindow):
             self.toggle_always_on_top(True)
         if self.settings.compact:
             self.toggle_compact(True)
+
+        # 起来之后在后台问一次有没有新版。查不到就当没这回事。
+        self.check_for_update()
 
     # ---------- 界面 ----------
     def setup_ui(self):
@@ -314,6 +321,12 @@ class AtisWindow(QMainWindow):
         top.addWidget(self.cid_input)
         top.addWidget(self.password_input)
         top.addStretch()
+        update_button = PushButton('检查更新')
+        update_button.setIcon(FluentIcon.UPDATE)
+        update_button.setToolTip('看看有没有新版本。下载走 airwaysn 自己的服务器，'
+                                 '不直接连 GitHub')
+        update_button.clicked.connect(lambda: self.check_for_update(manual=True))
+        top.addWidget(update_button)
         settings_button = PushButton('设置')
         settings_button.setIcon(FluentIcon.SETTING)
         settings_button.clicked.connect(self.open_settings)
@@ -1184,6 +1197,68 @@ class AtisWindow(QMainWindow):
             self.stop_broadcast(callsign)
 
     # ---------- 其它 ----------
+    # ---------- 更新 ----------
+    def check_for_update(self, manual=False):
+        """后台问一次有没有新版。
+
+        `manual=True` 是用户自己点的按钮，那种情况下没有新版也要回一句，否则点了
+        跟没点一样。启动时那次是静默的——值班的人不需要被"你已经是最新版"打断。
+        """
+        if not manual and not getattr(self.settings, 'update_check', True):
+            return
+
+        def work():
+            found = update.check('atis-for-can', version.version(),
+                                 getattr(self.settings, 'update_url', None))
+            self.signals.update_found.emit(found or (manual and 'none' or None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_found(self, found):
+        """已经在界面线程。found 是 Update、'none'（手动查但没有新版）或 None。"""
+        if found is None:
+            return
+        if found == 'none':
+            QMessageBox.information(self, '检查更新',
+                                    f'已经是最新版本（{version.version()}）。')
+            return
+        if found.version == getattr(self.settings, 'skipped_version', ''):
+            log.info("update %s was skipped by the user", found.version)
+            return
+
+        # **播出中不打断。** 弹一个模态框会挡住正在值班的席位列表，而通播是循环
+        # 播出的，用户可能几个小时都不看这个窗口。有席位在播就只记一行日志，
+        # 等他停播之后自己点「检查更新」。
+        if self.broadcasters:
+            log.info("update %s available, not prompting while %d station(s) "
+                     "are on air", found.version, len(self.broadcasters))
+            self.status_label.setText(f'有新版本 {found.version}，停播后可在'
+                                      f'「检查更新」里下载')
+            return
+
+        size = f'（{found.size_label}）' if found.size_label else ''
+        box = QMessageBox(self)
+        box.setWindowTitle('有新版本')
+        box.setText(f'ATIS for CAN {found.version} 已经发布{size}。\n'
+                    f'你现在用的是 {version.version()}。')
+        box.setInformativeText(
+            '下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n'
+            '下载完解压覆盖原来那个文件夹即可——席位配置和设置都不在里面。')
+        download = box.addButton('下载', QMessageBox.ButtonRole.AcceptRole)
+        notes = box.addButton('看更新说明', QMessageBox.ButtonRole.HelpRole)
+        skip = box.addButton('跳过这个版本', QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton('以后再说', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is download and found.download:
+            QDesktopServices.openUrl(QUrl(found.download))
+        elif clicked is notes and found.notes:
+            QDesktopServices.openUrl(QUrl(found.notes))
+        elif clicked is skip:
+            self.settings.skipped_version = found.version
+            self.settings.save_settings()
+
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         dialog.exec()
