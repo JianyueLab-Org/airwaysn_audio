@@ -680,7 +680,8 @@ class SharedCopyTest(unittest.TestCase):
     `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。
     """
 
-    SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py", "theme.py")
+    SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
+              "theme.py", "update.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))
