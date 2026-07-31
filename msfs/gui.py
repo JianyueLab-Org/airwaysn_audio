@@ -65,7 +65,12 @@ log = logging.getLogger("gui")
 APP_NAME = "MSFS for CAN"
 # 版本号和 build 号统一在 version.py 里。build 号是打包时由 gui.spec 固化的
 # ——打包之后程序里没有 .git，运行时问不出来。
-VERSION = version.VERSION
+# **要函数不要常量。** `version.VERSION` 是源码里那个手写的回退值，
+# 正式发布的版本号是 CI 打包时固化进 buildinfo.json 的，只有
+# `version.version()` 会去读它。用常量的后果是标题栏永远显示回退值：
+# 实测 v2.0.3 的包，日志首行是 v2.0.3，标题栏却写着 v2.0.0，
+# 用户拿标题栏对版本就会以为自己没更新成功。
+VERSION = version.version()
 
 # 多个包目录在输入框里的分隔符。用中文分号而不是英文的：Windows 的路径里出现
 # 英文分号的概率虽小，但环境变量 PATH 就是用它分隔的，用户很容易照那个习惯粘一串

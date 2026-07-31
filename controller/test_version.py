@@ -95,6 +95,39 @@ class VersionStringTest(unittest.TestCase):
             version._cached = saved
 
 
+class DisplayedVersionTest(unittest.TestCase):
+    """界面上显示的版本号必须来自函数，不能是那个手写的常量。
+
+    `VERSION` 是源码里的**回退值**；真正发出去的版本号是 CI 打包时固化进
+    buildinfo.json 的，只有 `version.version()` 会去读。用错的后果在实测里
+    出现过：v2.0.3 的包，日志首行写着 v2.0.3，标题栏却是 v2.0.0——用户拿标题栏
+    对版本，会以为自己根本没更新成功。
+
+    源码匹配当然弱，但这条差别没有别的测法：真要跑起来得有打好的包和 Qt。
+    """
+
+    def test_no_client_shows_the_fallback_constant(self):
+        import re
+        offenders = []
+        for component in COMPONENTS:
+            path = os.path.join(repo_root(), component, "gui.py")
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+            # 注释里提它是可以的，赋值给界面用的名字不行
+            for line in source.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if re.search(r"=\s*version\.VERSION\b", stripped):
+                    offenders.append(f"{component}/gui.py: {stripped}")
+        self.assertEqual(
+            offenders, [],
+            "这些地方把回退常量当成版本号显示了，打包之后会一直显示旧版本号："
+            + "；".join(offenders))
+
+
 class CopiesAgreeTest(unittest.TestCase):
     """六份 version.py 必须完全一致。"""
 
