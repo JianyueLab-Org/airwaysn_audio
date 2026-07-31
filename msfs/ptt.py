@@ -1,4 +1,4 @@
-"""PTT 的输入源：键盘、摇杆按钮、鼠标侧键。
+"""PTT 的输入源：键盘、摇杆按钮、摇杆帽键、鼠标侧键。
 
 controller / xpc / msfs 各存一份**逐字节相同**的副本，和 voice.py、applog.py、
 mumblecompat.py 一样——这个仓库每个组件都从自己目录平铺导入，共享父模块要在
@@ -17,6 +17,14 @@ mumblecompat.py 一样——这个仓库每个组件都从自己目录平铺导�
 键盘和鼠标用 pynput 的全局监听器：事件驱动，按下就回调，没有轮询延迟。摇杆只能
 轮询——SDL 要在自己的线程里 pump 事件队列，pygame 没有全局钩子可挂。所以键盘和
 鼠标是即时的，摇杆是 POLL_INTERVAL 的粒度（20 ms，和一帧音频同长，听不出来）。
+
+帽键（POV）为什么要单算一种
+--------------------------
+飞行摇杆和轭上的 PTT 十有八九在帽键上（Saitek/Logitech 的 Pro Flight Yoke、
+Honeycomb Alpha 都是），而 SDL 把帽键报成 hat 而不是按钮——`get_button()` 一辈子
+也看不见它。少了这一种，用户在"添加绑定"里按自己的 PTT 什么都不会发生，对话框
+就一直停在"请按下…"，看起来像是这个界面坏了。帽键要 `get_hat()` 读，给出的是
+一对 (x, y)，所以它是 HAT 这个 kind，不是 JOYSTICK 的一个按钮号。
 
 两条硬规则
 ----------
@@ -42,14 +50,78 @@ log = logging.getLogger("ptt")
 POLL_INTERVAL = 0.02
 # 摇杆打不开或者中途拔了，隔多久试一次。热插拔在飞行摇杆上很常见。
 JOYSTICK_RETRY = 3.0
+# 一直打不开时，每试这么多次再抱怨一遍。3 秒试一次、20 次一说，就是一分钟一行；
+# 每次都说的话，真实日志里是四十多条一模一样的 WARNING，把别的线索全挤出去了。
+OPEN_COMPLAIN_EVERY = 20
 
 KEYBOARD = "keyboard"
 MOUSE = "mouse"
 JOYSTICK = "joystick"
-KINDS = (KEYBOARD, MOUSE, JOYSTICK)
+HAT = "hat"
+KINDS = (KEYBOARD, MOUSE, JOYSTICK, HAT)
 
 # 能绑的鼠标键。左/中/右不在这里，理由见模块开头。
 MOUSE_BUTTONS = ("x1", "x2")
+
+# 帽键方向 → pygame get_hat() 给的 (x, y)。八个方向都收：八向帽键能稳稳停在
+# 斜角上，只认四个正方向的话，那种位置根本录不进来。
+HAT_DIRECTIONS = {
+    "up": (0, 1),
+    "down": (0, -1),
+    "left": (-1, 0),
+    "right": (1, 0),
+    "up_left": (-1, 1),
+    "up_right": (1, 1),
+    "down_left": (-1, -1),
+    "down_right": (1, -1),
+}
+
+# 界面上帽键方向怎么显示。用箭头而不是词：这个模块不产生界面文字（见 token()），
+# 而箭头在两种语言里是同一个箭头，不用翻译。
+HAT_ARROWS = {
+    "up": "↑",
+    "down": "↓",
+    "left": "←",
+    "right": "→",
+    "up_left": "↖",
+    "up_right": "↗",
+    "down_left": "↙",
+    "down_right": "↘",
+}
+
+
+def hat_direction(value):
+    """pygame 的 (x, y) → 方向名。回中或读不懂就返回空字符串。"""
+    try:
+        pair = (int(value[0]), int(value[1]))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return ""
+    for name, vector in HAT_DIRECTIONS.items():
+        if vector == pair:
+            return name
+    return ""
+
+
+def hat_pressed(value, direction):
+    """帽键现在的位置算不算按住了 direction。
+
+    正方向只比对应的那个分量：绑了"上"的人把帽键推到右上，想说的还是话——正好
+    卡在斜角上就哑掉是最难自查的一种故障，界面上一切正常。斜方向则要两个分量
+    都对，否则"右上"会被"上"和"右"同时盖住，等于把一条斜向绑定拆成了两条。
+    """
+    vector = HAT_DIRECTIONS.get(direction)
+    if vector is None:
+        return False
+    try:
+        x, y = int(value[0]), int(value[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return False
+    dx, dy = vector
+    if dx and dy:
+        return (x, y) == (dx, dy)
+    if dx:
+        return x == dx
+    return y == dy
 
 
 def key_name(key):
@@ -94,23 +166,29 @@ class Binding:
     让所有老配置里的绑定静默失效（程序照常起来，PTT 不响，用户以为是麦克风坏了）。
     """
 
-    def __init__(self, kind, key="", button=None, device=0, device_name=""):
+    def __init__(self, kind, key="", button=None, device=0, device_name="",
+                 hat=None, direction=""):
         self.kind = kind
         self.key = key or ""            # 键盘：规范化后的键名
         self.button = button            # 鼠标："x1"/"x2"；摇杆：按钮序号（int）
-        self.device = int(device or 0)  # 摇杆：设备序号
+        self.device = int(device or 0)  # 摇杆/帽键：设备序号
         self.device_name = device_name or ""   # 摇杆：设备名，只用来在界面上认人
+        self.hat = int(hat) if hat is not None else None   # 帽键：序号
+        self.direction = direction or ""       # 帽键：方向，见 HAT_DIRECTIONS
 
     def __eq__(self, other):
         if not isinstance(other, Binding):
             return NotImplemented
         # device_name 不参与比较：同一个手柄换个 USB 口，SDL 给的名字可能带上
         # 不同的后缀，但绑定还是那一条。
-        return (self.kind, self.key, self.button, self.device) == \
-               (other.kind, other.key, other.button, other.device)
+        return self._identity() == other._identity()
 
     def __hash__(self):
-        return hash((self.kind, self.key, self.button, self.device))
+        return hash(self._identity())
+
+    def _identity(self):
+        return (self.kind, self.key, self.button, self.device,
+                self.hat, self.direction)
 
     def __repr__(self):
         return "<Binding %s %s>" % (self.kind, self.token())
@@ -125,6 +203,10 @@ class Binding:
             return self.key.upper() if len(self.key) == 1 else self.key
         if self.kind == MOUSE:
             return str(self.button).upper()
+        if self.kind == HAT:
+            # "0↑"：帽键序号加一个箭头。箭头是符号不是词，两种语言通用。
+            return "%s%s" % (self.hat if self.hat is not None else 0,
+                             HAT_ARROWS.get(self.direction, ""))
         return str(self.button)
 
     def to_dict(self):
@@ -132,6 +214,9 @@ class Binding:
             return {"kind": KEYBOARD, "key": self.key}
         if self.kind == MOUSE:
             return {"kind": MOUSE, "button": self.button}
+        if self.kind == HAT:
+            return {"kind": HAT, "hat": self.hat, "direction": self.direction,
+                    "device": self.device, "device_name": self.device_name}
         return {"kind": JOYSTICK, "button": self.button,
                 "device": self.device, "device_name": self.device_name}
 
@@ -157,6 +242,14 @@ class Binding:
                 if button < 0:
                     return None
                 return cls(JOYSTICK, button=button,
+                           device=int(data.get("device", 0)),
+                           device_name=str(data.get("device_name") or ""))
+            if kind == HAT:
+                hat = int(data["hat"])
+                direction = str(data.get("direction") or "").lower()
+                if hat < 0 or direction not in HAT_DIRECTIONS:
+                    return None
+                return cls(HAT, hat=hat, direction=direction,
                            device=int(data.get("device", 0)),
                            device_name=str(data.get("device_name") or ""))
         except (TypeError, ValueError, KeyError) as e:
@@ -205,24 +298,93 @@ def dump(bindings):
     return [b.to_dict() for b in bindings]
 
 
-def available_joysticks():
+def describe(bindings):
+    """一串绑定在**日志**里的样子，英文。
+
+    和 i18n.binding_label() 是两件事，故意分开：那个给界面，是中文；这个给日志，
+    是英文（仓库的规矩是看字符串最后落到哪里，不是看它写在哪个模块）。
+
+    有它是因为 "PTT watcher started with 1 binding(s)" 这句话等于什么都没说——
+    真实日志里正是这一句，看不出那一条绑的是键盘还是摇杆、哪个设备、哪个按钮，
+    而"PTT 不响"的排查第一步恰好就是这个。
+    """
+    if not bindings:
+        return "none"
+    out = []
+    for b in bindings:
+        where = ""
+        if b.kind in (JOYSTICK, HAT):
+            where = " on device %d%s" % (
+                b.device, " (%s)" % b.device_name if b.device_name else "")
+        if b.kind == KEYBOARD:
+            out.append("key %s" % b.token())
+        elif b.kind == MOUSE:
+            out.append("mouse %s" % b.token())
+        elif b.kind == HAT:
+            out.append("hat %s%s" % (b.token(), where))
+        else:
+            out.append("button %s%s" % (b.token(), where))
+    return ", ".join(out)
+
+
+def describe_devices(pygame=None):
+    """现在接着哪些摇杆，写成一行日志。
+
+    绑定指着一个打不开的序号时，这是唯一能分清"设备换了序号"和"根本没插"的
+    东西——两者的解法完全不同，而报错本身长得一模一样。
+
+    **只在出错的路径上调。** 读名字要真的把每个设备开一下再关掉（pygame 没有
+    "不打开就取名字"的接口），正常情况下没必要去碰用户正在飞的摇杆。顺利的时候
+    _start_joystick() 只报一个数量。
+    """
+    if pygame is None:
+        pygame = _import_pygame()
+    if pygame is None:
+        return "pygame is unavailable"
+    try:
+        count = pygame.joystick.get_count()
+    except Exception as e:
+        return "could not be counted (%s)" % e
+    sticks = available_joysticks(pygame)
+    if not sticks:
+        if not count:
+            return "none"
+        return "%d connected, but none of them could be opened to read a name" % count
+    return "%d connected: %s" % (
+        count, ", ".join("#%d %s" % (index, name) for index, name in sticks))
+
+
+def available_joysticks(pygame=None):
     """接着的摇杆：[(序号, 名字)]。摇杆不可用时返回空表，不抛异常。
 
-    设置界面拿它填设备下拉框。**调用前必须先把 PttWatcher 停掉**，理由见
-    PttCapture 的注释。
+    设置界面拿它填设备下拉框，日志那边经 describe_devices() 用它报设备清单。
+    **调用前必须先把 PttWatcher 停掉**，理由见 PttCapture 的注释。
+
+    `pygame` 传得进来是给轮询线程用的：那两个线程手里已经有初始化好的模块了，
+    不能再自己去调 _import_pygame()（理由见那个函数）。
     """
     try:
-        pygame = _import_pygame()
+        if pygame is None:
+            pygame = _import_pygame()
         if pygame is None:
             return []
         if not pygame.joystick.get_init():
             pygame.joystick.init()
         out = []
         for index in range(pygame.joystick.get_count()):
-            stick = pygame.joystick.Joystick(index)
+            # 一个设备打不开不该让整张表作废——正要排查的往往就是"有一个开不了"，
+            # 这时候更需要看见另外几个是什么
+            try:
+                stick = pygame.joystick.Joystick(index)
+            except Exception as e:
+                log.debug("joystick %d could not be opened to read its name: %s",
+                          index, e)
+                continue
             try:
                 stick.init()
                 out.append((index, stick.get_name()))
+            except Exception as e:
+                log.debug("joystick %d could not be read: %s", index, e)
             finally:
                 # 只是列一下，别占着设备
                 try:
@@ -237,6 +399,23 @@ def available_joysticks():
 
 def _import_pygame():
     """惰性导入 pygame，失败返回 None。
+
+    **必须从主线程（界面线程）调用，绝不能在轮询线程里调。** 这不是讲究，是
+    Windows 上摇杆 PTT 会不会用的问题：SDL 的 DirectInput 后端要一个 HWND 才能
+    调 SetCooperativeLevel，那个隐藏窗口是 `SDL_InitSubSystem(JOYSTICK)` 建的，
+    按 Windows 的规矩归**建它的那个线程**所有；线程一结束，系统就把它名下的窗口
+    全销毁，而 SDL 把句柄记在全局里，既不知道也不会重建。于是"在轮询线程里 init"
+    的写法是这样一条曲线：第一次好用，等那个线程退出——用户打开一次设置就会——
+    之后每一次打开摇杆都是
+
+        could not open joystick 0: IDirectInputDevice8::SetCooperativeLevel()
+        DirectX error 0x80070006
+
+    （0x80070006 就是 E_HANDLE，句柄无效），一直到重启客户端为止。真实日志里的
+    样子最能说明问题：用户在设置里录下自己摇杆上的 PTT，那一下是成功的，回头
+    watcher 一起来就再也打不开了，试到最后只好改绑鼠标侧键。所以初始化放在
+    PttWatcher._start_joystick() / PttCapture.start() 里做，两个都在界面线程上，
+    活得和进程一样久；两个轮询线程只拿现成的模块用。
 
     惰性有两个理由。一是没插摇杆的用户占绝大多数，为他们初始化一遍 SDL 没意思；
     二是 pygame 在有些平台上装不上（比如新版本的 Python 还没有轮子），而没有摇杆
@@ -293,8 +472,10 @@ class PttWatcher:
         self.on_change = on_change
         self._lock = threading.Lock()
         self._bindings = list(bindings or [])
-        # 各源当前按下的东西：键盘是键名，鼠标是 "x1"/"x2"，摇杆是 (设备, 按钮)
-        self._down = {KEYBOARD: set(), MOUSE: set(), JOYSTICK: set()}
+        # 各源当前按下的东西：键盘是键名，鼠标是 "x1"/"x2"，摇杆是 (设备, 按钮)，
+        # 帽键是 (设备, 帽键号, 方向)
+        self._down = {KEYBOARD: set(), MOUSE: set(),
+                      JOYSTICK: set(), HAT: set()}
         self._state = False
         self._running = False
         self._keyboard_listener = None
@@ -307,7 +488,8 @@ class PttWatcher:
             return
         self._running = True
         self._sync_sources()
-        log.info("PTT watcher started with %d binding(s)", len(self._bindings))
+        log.info("PTT watcher started with %d binding(s): %s",
+                 len(self._bindings), describe(self._bindings))
 
     def stop(self):
         """停掉所有源，并且把 PTT 落下。
@@ -368,6 +550,9 @@ class PttWatcher:
                     state = True
                 elif b.kind == JOYSTICK and (b.device, b.button) in self._down[JOYSTICK]:
                     state = True
+                elif b.kind == HAT and \
+                        (b.device, b.hat, b.direction) in self._down[HAT]:
+                    state = True
                 if state:
                     break
             if state == self._state:
@@ -416,7 +601,8 @@ class PttWatcher:
             self._start_mouse()
         else:
             self._stop_mouse()
-        if JOYSTICK in kinds:
+        # 按钮和帽键是同一个设备、同一个轮询线程，任意一种绑到了就得开着
+        if JOYSTICK in kinds or HAT in kinds:
             self._start_joystick()
         else:
             self._stop_joystick()
@@ -484,7 +670,23 @@ class PttWatcher:
     def _start_joystick(self):
         if self._joystick_thread is not None:
             return
-        thread = threading.Thread(target=self._joystick_loop,
+        # **pygame 一定要在这里初始化，不能挪进轮询线程。** 见 _import_pygame()
+        # 开头那段——SDL 的那个隐藏窗口归建它的线程所有，轮询线程一退出，之后
+        # 就再也打不开摇杆了。start() 是从界面线程调的，它和进程一样久。
+        pygame = _import_pygame()
+        if pygame is None:
+            log.info("joystick PTT is off because pygame is unavailable")
+            return
+        # 顺利时只报个数量——读名字得把每个设备开一下，没必要去碰用户正在飞的
+        # 摇杆。名字在打不开的时候才报（那条路上本来也开不了），见 describe_devices()
+        try:
+            count = pygame.joystick.get_count()
+        except Exception as e:
+            count = "an unknown number of (%s)" % e
+        log.info("joystick PTT starting, %s device(s) connected; bound to %s",
+                 count, describe([b for b in self.bindings()
+                                  if b.kind in (JOYSTICK, HAT)]))
+        thread = threading.Thread(target=self._joystick_loop, args=(pygame,),
                                   name="ptt-joystick", daemon=True)
         self._joystick_thread = thread
         thread.start()
@@ -496,23 +698,38 @@ class PttWatcher:
             # 最多再转一个 POLL_INTERVAL，而 join 会把界面线程卡住。
             pass
 
-    def _joystick_loop(self):
-        """轮询摇杆按钮。
+    def _clear_stick_state(self):
+        """把摇杆这边按下的东西全部抹掉，并且重算一次。
+
+        按钮和帽键要一起抹：设备没了以后留下任何一个"还按着"，麦克风就一直
+        开着，而界面上已经没有任何东西显示是谁按住的。
+        """
+        with self._lock:
+            self._down[JOYSTICK].clear()
+            self._down[HAT].clear()
+        self._recompute()
+
+    def _joystick_loop(self, pygame):
+        """轮询摇杆的按钮和帽键。
+
+        pygame 是 _start_joystick() 在界面线程上初始化好之后传进来的，这个线程
+        自己不碰初始化——理由见 _import_pygame()。
 
         掉线要能自己回来：飞行摇杆热插拔很常见，一次读失败就永远不再读的话，
         用户得重启客户端才有 PTT。读失败就关掉设备，隔 JOYSTICK_RETRY 再开。
+
+        报错怎么记：**第一次说全，之后只在原因变了或者过了很久才再说一次。**
+        每 JOYSTICK_RETRY 秒一条一模一样的 WARNING，在真实日志里就是四十多行
+        同样的话，既没多说什么，又把别的线索挤出了滚动窗口。
         """
         me = threading.current_thread()
-        # pygame 只取一次。放进循环的话，每 20 ms 就要走一遍 import 和 get_init()
-        # 的检查；而且它要么一开始就没有，要么一直都在，没有中途出现的情况。
-        pygame = _import_pygame()
-        if pygame is None:
-            log.info("joystick PTT is off because pygame is unavailable")
-            return
         sticks = {}
         last_open = 0.0
+        failures = {}        # 设备序号 → (试了几次, 上一次的原因)
+        complained = set()   # 已经报过"这条绑定超出设备范围"的，别每 20 ms 再报
         while self._running and self._joystick_thread is me:
-            wanted = {b.device for b in self.bindings() if b.kind == JOYSTICK}
+            wanted = {b.device for b in self.bindings()
+                      if b.kind in (JOYSTICK, HAT)}
             for index in list(sticks):
                 if index not in wanted:
                     self._close_stick(sticks.pop(index))
@@ -521,56 +738,115 @@ class PttWatcher:
             if missing and now - last_open >= JOYSTICK_RETRY:
                 last_open = now
                 for index in sorted(missing):
-                    stick = self._open_stick(pygame, index)
+                    stick, error = self._open_stick(pygame, index)
                     if stick is not None:
+                        attempts = failures.pop(index, (0, ""))[0]
+                        if attempts:
+                            # 自己好了这件事必须说：不然日志里只剩一串失败，
+                            # 看不出后来到底恢复没有
+                            log.info("joystick %d is back after %d failed "
+                                     "attempt(s)", index, attempts)
                         sticks[index] = stick
+                        complained = {c for c in complained if c[0] != index}
+                    else:
+                        attempts, previous = failures.get(index, (0, None))
+                        attempts += 1
+                        failures[index] = (attempts, error)
+                        if attempts == 1 or error != previous:
+                            log.warning("could not open joystick %d: %s; PTT is "
+                                        "bound to %s, connected devices: %s",
+                                        index, error, describe(self.bindings()),
+                                        describe_devices(pygame))
+                        elif attempts % OPEN_COMPLAIN_EVERY == 0:
+                            log.warning("still cannot open joystick %d after %d "
+                                        "attempts (%.0f s): %s",
+                                        index, attempts,
+                                        attempts * JOYSTICK_RETRY, error)
+                        else:
+                            log.debug("could not open joystick %d: %s", index, error)
             if sticks:
                 try:
                     pygame.event.pump()
                     for index, stick in list(sticks.items()):
                         count = stick.get_numbuttons()
+                        hats = stick.get_numhats()
                         for b in self.bindings():
-                            if b.kind != JOYSTICK or b.device != index:
+                            if b.device != index:
                                 continue
-                            token = (index, b.button)
-                            if b.button >= count:
-                                # 按钮号超出这个设备的范围——多半是换了个按钮更少的
-                                # 手柄。要的是"不响"，而不是让轮询线程带着 IndexError
-                                # 死掉，那样连别的摇杆绑定也一起没了。
-                                self._release(JOYSTICK, token)
-                                continue
-                            if stick.get_button(b.button):
-                                self._press(JOYSTICK, token)
-                            else:
-                                self._release(JOYSTICK, token)
+                            # 按钮号／帽键号超出这个设备的范围——多半是换了个规格
+                            # 小一点的手柄。要的是"不响"，而不是让轮询线程带着
+                            # IndexError 死掉，那样连别的绑定也一起没了。以前这里
+                            # 是完全静默的：设备开得好好的、日志一个字没有、PTT
+                            # 就是不响，从日志上根本看不出来。所以报一次，只报一次。
+                            if b.kind == JOYSTICK:
+                                token = (index, b.button)
+                                if b.button >= count:
+                                    if token not in complained:
+                                        complained.add(token)
+                                        log.warning(
+                                            "PTT is bound to button %d but "
+                                            "joystick %d (%s) only has %d "
+                                            "button(s); this binding can never "
+                                            "fire", b.button, index,
+                                            stick.get_name(), count)
+                                    self._release(JOYSTICK, token)
+                                elif stick.get_button(b.button):
+                                    self._press(JOYSTICK, token)
+                                else:
+                                    self._release(JOYSTICK, token)
+                            elif b.kind == HAT:
+                                token = (index, b.hat, b.direction)
+                                if b.hat is None or b.hat >= hats:
+                                    if token not in complained:
+                                        complained.add(token)
+                                        log.warning(
+                                            "PTT is bound to hat %s but joystick "
+                                            "%d (%s) only has %d hat(s); this "
+                                            "binding can never fire", b.hat,
+                                            index, stick.get_name(), hats)
+                                    self._release(HAT, token)
+                                elif hat_pressed(stick.get_hat(b.hat), b.direction):
+                                    self._press(HAT, token)
+                                else:
+                                    self._release(HAT, token)
                 except Exception as e:
-                    log.warning("reading the joystick failed, will reopen: %s", e)
+                    log.warning("reading joystick %s failed (%s: %s), closing and "
+                                "reopening in %.0f s",
+                                ", ".join(str(i) for i in sorted(sticks)),
+                                e.__class__.__name__, e, JOYSTICK_RETRY)
                     for stick in sticks.values():
                         self._close_stick(stick)
                     sticks.clear()
-                    with self._lock:
-                        self._down[JOYSTICK].clear()
-                    self._recompute()
+                    self._clear_stick_state()
             time.sleep(POLL_INTERVAL)
         for stick in sticks.values():
             self._close_stick(stick)
-        with self._lock:
-            self._down[JOYSTICK].clear()
-        self._recompute()
+        self._clear_stick_state()
 
     @staticmethod
     def _open_stick(pygame, index):
+        """打开一个设备，返回 (设备, 失败原因)。成功时原因是空串。
+
+        原因由调用方去记，因为它才知道这是第几次失败——这里每次都记的话，就是
+        每 JOYSTICK_RETRY 秒一条重复的话。"序号不存在"这条以前是静默 return
+        None：绑定指着一个没插的设备时，日志里一个字都没有。
+        """
         try:
-            if index >= pygame.joystick.get_count():
-                return None
+            count = pygame.joystick.get_count()
+            if index >= count:
+                # 日志文字保持 ASCII：控制台在中文 Windows 上是 GBK，破折号之类
+                # 的字符会变成乱码，甚至让 logging 自己报错
+                return None, ("the system reports %d joystick(s), so there is "
+                              "no #%d - was it unplugged, or did the devices "
+                              "get renumbered?" % (count, index))
             stick = pygame.joystick.Joystick(index)
             stick.init()
-            log.info("joystick %d opened: %s (%d buttons)",
-                     index, stick.get_name(), stick.get_numbuttons())
-            return stick
+            log.info("joystick %d opened: %s (%d buttons, %d hats)",
+                     index, stick.get_name(), stick.get_numbuttons(),
+                     stick.get_numhats())
+            return stick, ""
         except Exception as e:
-            log.warning("could not open joystick %d: %s", index, e)
-            return None
+            return None, "%s: %s" % (e.__class__.__name__, e)
 
     @staticmethod
     def _close_stick(stick):
@@ -626,7 +902,14 @@ class PttCapture:
             except Exception as e:
                 log.warning("could not listen for a PTT mouse button: %s", e)
         if self._joystick:
+            # 和 PttWatcher._start_joystick() 同一个理由：pygame 只能在这条界面
+            # 线程上初始化，不能等到录制线程里去做。录制线程录完就退出，SDL 的
+            # 那个隐藏窗口要是归它所有，一退出摇杆就再也打不开了。
+            pygame = _import_pygame()
+            if pygame is None:
+                return
             self._thread = threading.Thread(target=self._joystick_loop,
+                                            args=(pygame,),
                                             name="ptt-capture", daemon=True)
             self._thread.start()
 
@@ -654,16 +937,31 @@ class PttCapture:
         # 自己停掉自己的监听器。放在回调之后，免得回调里又去开新的监听。
         self.stop()
 
-    def _joystick_loop(self):
-        """所有接着的摇杆一起听，第一个按下的按钮就是答案。
+    @staticmethod
+    def _pressed_now(sticks):
+        """录制这一刻已经按着／推着的东西，按钮和帽键都算。"""
+        held = set()
+        for index, stick in sticks:
+            for button in range(stick.get_numbuttons()):
+                if stick.get_button(button):
+                    held.add((JOYSTICK, index, button))
+            for hat in range(stick.get_numhats()):
+                if hat_direction(stick.get_hat(hat)):
+                    held.add((HAT, index, hat))
+        return held
+
+    def _joystick_loop(self, pygame):
+        """所有接着的摇杆一起听，第一个动的按钮或帽键就是答案。
 
         和 watcher 那边不同，这里要先把每个设备的初始状态读一遍：录制开始时就
-        按着的按钮不该算数（用户可能一直压着油门上的某个开关），只有"从没按到
-        按"才算。
+        按着的按钮、已经推在某个角上的帽键都不该算数（用户可能一直压着油门上的
+        某个开关），只有"从没按到按"才算。帽键记的是"这个帽键动过没有"而不是
+        某一个方向，所以一直推着上、不回中就直接改推右，也不会被录进来——回中
+        再推一次就是了，比把常年压着的位置录成 PTT 好。
+
+        pygame 是 start() 在界面线程上初始化好之后传进来的，理由见
+        _import_pygame()。
         """
-        pygame = _import_pygame()
-        if pygame is None:
-            return
         sticks = []
         try:
             for index in range(pygame.joystick.get_count()):
@@ -671,16 +969,24 @@ class PttCapture:
                 stick.init()
                 sticks.append((index, stick))
         except Exception as e:
-            log.warning("could not open the joysticks for capture: %s", e)
+            log.warning("could not open the joysticks for capture (%s: %s); "
+                        "connected devices: %s", e.__class__.__name__, e,
+                        describe_devices(pygame))
         if not sticks:
+            # 录不到摇杆时界面上只会一直停在"请按下…"，日志得说清是"没有设备"
+            # 还是"有设备但打不开"——两件事的下一步完全不同
+            log.info("no joystick is available for capture, only the keyboard "
+                     "and the mouse can be recorded right now")
             return
+        log.debug("listening for a PTT binding on %d joystick(s): %s",
+                  len(sticks), ", ".join("#%d %s (%d buttons, %d hats)"
+                                         % (i, s.get_name(), s.get_numbuttons(),
+                                            s.get_numhats())
+                                         for i, s in sticks))
         held = set()
         try:
             pygame.event.pump()
-            for index, stick in sticks:
-                for button in range(stick.get_numbuttons()):
-                    if stick.get_button(button):
-                        held.add((index, button))
+            held = self._pressed_now(sticks)
         except Exception as e:
             log.debug("reading the initial joystick state raised: %s", e)
         try:
@@ -688,13 +994,23 @@ class PttCapture:
                 pygame.event.pump()
                 for index, stick in sticks:
                     for button in range(stick.get_numbuttons()):
-                        pressed = bool(stick.get_button(button))
-                        if pressed and (index, button) not in held:
+                        token = (JOYSTICK, index, button)
+                        if not stick.get_button(button):
+                            held.discard(token)
+                        elif token not in held:
                             self._fire(Binding(JOYSTICK, button=button, device=index,
                                                device_name=stick.get_name()))
                             return
-                        if not pressed:
-                            held.discard((index, button))
+                    for hat in range(stick.get_numhats()):
+                        token = (HAT, index, hat)
+                        direction = hat_direction(stick.get_hat(hat))
+                        if not direction:
+                            held.discard(token)
+                        elif token not in held:
+                            self._fire(Binding(HAT, hat=hat, direction=direction,
+                                               device=index,
+                                               device_name=stick.get_name()))
+                            return
                 time.sleep(POLL_INTERVAL)
         except Exception as e:
             log.warning("the joystick capture loop failed: %s", e)

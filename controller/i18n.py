@@ -223,15 +223,15 @@ TEXT = {
     # 三种输入源共用一份列表，任意一个按住就发话。文案要说清"还能再加一个"，
     # 否则用户会以为设了摇杆就没有键盘了。
     "settings.ptt_title":   {"zh": "PTT 绑定", "en": "PTT bindings"},
-    "settings.ptt_hint":    {"zh": "键盘、鼠标侧键、摇杆按钮都行，按住其中任意一个即发话",
-                             "en": "A key, a mouse side button or a joystick button — "
-                                   "hold any one of them to transmit"},
+    "settings.ptt_hint":    {"zh": "键盘、鼠标侧键、摇杆按钮或帽键都行，按住其中任意一个即发话",
+                             "en": "A key, a mouse side button, a joystick button or a "
+                                   "hat — hold any one of them to transmit"},
     "settings.ptt_none":    {"zh": "还没有绑定，PTT 用不了",
                              "en": "No bindings yet — PTT will not work"},
     "settings.ptt_add":     {"zh": "添加绑定", "en": "Add a binding"},
-    "settings.ptt_capturing": {"zh": "请按下按键、鼠标侧键或摇杆按钮…（点此取消）",
-                               "en": "Press a key, a mouse side button or a joystick "
-                                     "button… (click to cancel)"},
+    "settings.ptt_capturing": {"zh": "请按下按键、鼠标侧键、摇杆按钮或推一下帽键…（点此取消）",
+                               "en": "Press a key, a mouse side button, a joystick "
+                                     "button or a hat… (click to cancel)"},
     "settings.ptt_remove":  {"zh": "移除这条绑定", "en": "Remove this binding"},
     "settings.ptt_duplicate": {"zh": "这条绑定已经有了", "en": "That binding is already there"},
 
@@ -242,6 +242,11 @@ TEXT = {
     "ptt.joystick":         {"zh": "摇杆 {device} 的按钮 {button}",
                              "en": "Button {button} on {device}"},
     "ptt.joystick_plain":   {"zh": "摇杆按钮 {button}", "en": "Joystick button {button}"},
+    # 帽键（POV）。{hat} 是 ptt.py 给的 "0↑" 这种帽键号加箭头，箭头是符号不是词，
+    # 两种语言共用一个，不用把上下左右再翻一遍。
+    "ptt.hat":              {"zh": "摇杆 {device} 的帽键 {hat}",
+                             "en": "Joystick {device} hat {hat}"},
+    "ptt.hat_plain":        {"zh": "摇杆帽键 {hat}", "en": "Joystick hat {hat}"},
     "settings.input":       {"zh": "输入设备:", "en": "Input device:"},
     "settings.output":      {"zh": "输出设备:", "en": "Output device:"},
     "settings.system_default": {"zh": "系统默认", "en": "System default"},
@@ -340,6 +345,10 @@ def binding_label(binding):
         return t("ptt.keyboard", key=binding.token())
     if binding.kind == "mouse":
         return t("ptt.mouse", button=binding.token())
+    if binding.kind == "hat":
+        if binding.device_name:
+            return t("ptt.hat", device=binding.device_name, hat=binding.token())
+        return t("ptt.hat_plain", hat=binding.token())
     if binding.device_name:
         return t("ptt.joystick", device=binding.device_name, button=binding.token())
     return t("ptt.joystick_plain", button=binding.token())
