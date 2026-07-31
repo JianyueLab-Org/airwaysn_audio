@@ -157,6 +157,42 @@ TEXT = {
                                    "over FSD, flight data over SimConnect.\n\nLog: {log}"},
     "dialog.no_log":        {"zh": "（未写入文件）", "en": "(not written to a file)"},
 
+    "menu.update":          {"zh": "检查更新(&U)", "en": "Check for &updates"},
+
+    # ---------- 更新 ----------
+    # 查到新版只是弹一句，装不装是用户的事。措辞要说清下载走的是自己的服务器
+    # ——大陆连 GitHub 很不稳，这正是这个功能存在的理由。
+    "update.title":         {"zh": "有新版本", "en": "A new version is available"},
+    "update.body":          {"zh": "MSFS for CAN {version} 已经发布{size}。\n"
+                                   "你现在用的是 {current}。",
+                             "en": "MSFS for CAN {version} is out{size}.\n"
+                                   "You are running {current}."},
+    # 包大小是可有可无的一段，所以单独成键——括号的写法两种语言不一样，
+    # 写死在 body 的参数里会让英文界面出现一对中文全角括号。
+    "update.size":          {"zh": "（{size}）", "en": " ({size})"},
+    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+                                   "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
+                             "en": "The download comes from airwaysn's own server, not "
+                                   "from GitHub.\nUnzip it over the old folder — your "
+                                   "settings are not in there."},
+    "update.download":      {"zh": "下载", "en": "Download"},
+    "update.notes":         {"zh": "看更新说明", "en": "Release notes"},
+    "update.skip":          {"zh": "跳过这个版本", "en": "Skip this version"},
+    "update.later":         {"zh": "以后再说", "en": "Later"},
+    "update.check":         {"zh": "检查更新", "en": "Check for updates"},
+    "update.check_tip":     {"zh": "看看有没有新版本。下载走 airwaysn 自己的服务器，"
+                                   "不直接连 GitHub",
+                             "en": "See whether a newer version is out. The download "
+                                   "comes from airwaysn's own server, not from GitHub"},
+    "update.current":       {"zh": "已经是最新版本（{version}）。",
+                             "en": "You are on the latest version ({version})."},
+    "msg.update_available": {"zh": "[更新] 有新版 {version}（已跳过）",
+                             "en": "[Update] {version} is available (skipped)"},
+    "msg.update_downloading": {"zh": "[更新] 正在浏览器里下载 {version}",
+                               "en": "[Update] downloading {version} in your browser"},
+    "msg.update_skipped":   {"zh": "[更新] 已跳过 {version}",
+                             "en": "[Update] skipped {version}"},
+
     # ---------- 设置 ----------
     "settings.title":       {"zh": "设置", "en": "Settings"},
     "settings.tab_audio":   {"zh": "音频", "en": "Audio"},

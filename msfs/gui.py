@@ -33,8 +33,9 @@ import threading
 import time
 
 import applog
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QFont, QIcon, QTextCursor
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal, QObject
+from PyQt6.QtGui import (QAction, QDesktopServices, QFont, QIcon,
+                         QTextCursor)
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFormLayout, QGridLayout,
     QHBoxLayout, QLabel, QListWidgetItem, QMainWindow, QMessageBox,
@@ -51,6 +52,7 @@ import i18n
 import ptt
 import theme
 import traffic as traffic_module
+import update
 import version
 import inject
 import simlink
@@ -81,6 +83,8 @@ class Signals(QObject):
     ptt = pyqtSignal(bool)
     rx = pyqtSignal(bool)
     channel = pyqtSignal(float, str)
+    # 查更新在后台线程里做，结果要过信号回到 GUI 线程
+    update_found = pyqtSignal(object)
 
 
 class Indicator(QLabel):
@@ -156,6 +160,9 @@ class MsfsWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
 
+        # 起来之后在后台问一次有没有新版。查不到就当没这回事。
+        self.check_for_update()
+
     # ---------- 界面 ----------
     def _build_ui(self):
         central = QWidget()
@@ -193,6 +200,9 @@ class MsfsWindow(QMainWindow):
         log_action = QAction(t("menu.open_log"), self)
         log_action.triggered.connect(lambda: applog.open_log_folder())
         help_menu.addAction(log_action)
+        update_action = QAction(t("menu.update"), self)
+        update_action.triggered.connect(lambda: self.check_for_update(manual=True))
+        help_menu.addAction(update_action)
         about_action = QAction(t("menu.about"), self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
@@ -324,6 +334,7 @@ class MsfsWindow(QMainWindow):
         self.signals.ptt.connect(self.tx_light.set_lit)
         self.signals.rx.connect(self.rx_light.set_lit)
         self.signals.channel.connect(self.on_channel)
+        self.signals.update_found.connect(self.on_update_found)
 
     # ---------- 消息区 ----------
     def add_message(self, text, colour=None):
@@ -711,6 +722,65 @@ class MsfsWindow(QMainWindow):
                 self.add_message(t("msg.plan_filed"), theme.ON_COLOR)
         else:
             self.add_message(t("msg.plan_local"), theme.ACTIVE_COLOR)
+
+    # ---------- 更新 ----------
+    def check_for_update(self, manual=False):
+        """后台问一次有没有新版。
+
+        `manual=True` 是用户自己从菜单点的，那种情况下即使没有新版也要回一句，
+        否则点了跟没点一样。启动时的那次是静默的——没有新版就不该打扰任何人。
+        """
+        if not manual and not getattr(self.settings, "update_check", True):
+            return
+
+        def work():
+            found = update.check("msfs-for-can", version.version(),
+                                 getattr(self.settings, "update_url", None))
+            self.signals.update_found.emit(found or (manual and "none" or None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_found(self, found):
+        """已经在 GUI 线程。found 是 Update、"none"（手动查但没有新版）或 None。"""
+        if found is None:
+            return
+        if found == "none":
+            QMessageBox.information(
+                self, t("update.check"),
+                t("update.current", version=version.version()))
+            return
+        # 用户说过跳过这一版就别再问了。手动点的那次不受这条限制——他自己找来的。
+        if found.version == getattr(self.settings, "skipped_version", ""):
+            self.add_message(t("msg.update_available", version=found.version),
+                             theme.ACTIVE_COLOR)
+            return
+
+        size = t("update.size", size=found.size_label) if found.size_label else ""
+        box = QMessageBox(self)
+        box.setWindowTitle(t("update.title"))
+        box.setText(t("update.body", version=found.version, size=size,
+                      current=version.version()))
+        box.setInformativeText(t("update.detail"))
+        download = box.addButton(t("update.download"),
+                                 QMessageBox.ButtonRole.AcceptRole)
+        notes = box.addButton(t("update.notes"), QMessageBox.ButtonRole.HelpRole)
+        skip = box.addButton(t("update.skip"),
+                             QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(t("update.later"), QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is download and found.download:
+            QDesktopServices.openUrl(QUrl(found.download))
+            self.add_message(t("msg.update_downloading", version=found.version),
+                             theme.ON_COLOR)
+        elif clicked is notes and found.notes:
+            QDesktopServices.openUrl(QUrl(found.notes))
+        elif clicked is skip:
+            self.settings.skipped_version = found.version
+            self.settings.save()
+            self.add_message(t("msg.update_skipped", version=found.version),
+                             theme.ACTIVE_COLOR)
 
     def show_about(self):
         QMessageBox.information(

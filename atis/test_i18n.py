@@ -269,5 +269,40 @@ class VoiceLanguageTest(unittest.TestCase):
         self.assertNotEqual(chinese, english)
 
 
+class EveryUsedKeyExistsTest(unittest.TestCase):
+    """源码里 t("…") 引用的键，翻译表里必须真有。
+
+    这条是 CoverageTest 补不上的那一半：那边查的是"表里已有的条目翻全了没有"，
+    查不出"代码要用的条目根本不在表里"。少一条的结果是界面上明晃晃地显示
+    `plugin.install` 这种生键名——两种语言下都一样难看，而 t() 只在日志里留一行
+    warning，跑测试的人不会注意到。
+
+    **这不是假想的故障。** 一次给翻译表做整段替换的改动，正好把插进那两条中间
+    的一整块键切掉了，四个组件的测试全绿、冒烟全过，直到有人打开那个设置页。
+
+    只认字面量：`t(key)` 这种由变量拼出来的键（状态 → 键名的映射表）扫不到，
+    那部分靠 smoke_gui.py 真的把窗口建出来兜底。
+    """
+
+    # \bt\( 的词边界不能省：没有它，FSDPilot("example.invalid") 里的那个 t
+    # 会被当成一次 t() 调用，把机器名报成缺失的键
+    CALL = re.compile(r'\bt\(\s*["\']([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)["\']')
+
+    def test_no_source_file_uses_a_key_that_does_not_exist(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        missing = []
+        for name in sorted(os.listdir(here)):
+            if not name.endswith(".py") or name == "i18n.py":
+                continue
+            with open(os.path.join(here, name), encoding="utf-8") as f:
+                text = f.read()
+            for match in self.CALL.finditer(text):
+                key = match.group(1)
+                if key not in i18n.TEXT:
+                    missing.append(f"{name}: {key}")
+        self.assertEqual(sorted(set(missing)), [],
+                         f"这些键代码在用，翻译表里却没有: {sorted(set(missing))}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

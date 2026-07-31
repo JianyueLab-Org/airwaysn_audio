@@ -154,6 +154,92 @@ TEXT = {
                                    "flight data over X-Plane's UDP link.\n\nLog: {log}"},
     "dialog.no_log":        {"zh": "（未写入文件）", "en": "(not written to a file)"},
 
+    "menu.update":          {"zh": "检查更新(&U)", "en": "Check for &updates"},
+
+    # ---------- 他机插件的安装 ----------
+    # X-Plane 的安装目录 UDP 那条链路给不出来，所以这里既要报探测结果，也要能
+    # 让用户自己指。文案的重点是把"下一步该干什么"说清楚。
+    "plugin.title":         {"zh": "他机插件", "en": "Traffic plugin"},
+    "plugin.install":       {"zh": "安装插件", "en": "Install the plugin"},
+    "plugin.update":        {"zh": "更新插件", "en": "Update the plugin"},
+    "plugin.reinstall":     {"zh": "重新安装", "en": "Reinstall"},
+    "plugin.pick_root":     {"zh": "选择 X-Plane 目录…", "en": "Choose the X-Plane folder…"},
+    "plugin.pick_title":    {"zh": "选择 X-Plane 安装目录",
+                             "en": "Choose the X-Plane installation folder"},
+    "plugin.no_root":       {"zh": "没有自动找到 X-Plane 的安装目录，请手工指定",
+                             "en": "Could not find the X-Plane folder — please choose it"},
+    "plugin.not_xplane":    {"zh": "{path} 里没有 Resources/plugins，不像是 X-Plane 的安装目录",
+                             "en": "{path} has no Resources/plugins — that does not look "
+                                   "like an X-Plane installation"},
+    "plugin.missing":       {"zh": "X-Plane：{path}\n还没有装他机插件",
+                             "en": "X-Plane: {path}\nThe traffic plugin is not installed"},
+    "plugin.outdated":      {"zh": "X-Plane：{path}\n装着的插件和这个版本的客户端不一致，"
+                                   "建议更新",
+                             "en": "X-Plane: {path}\nThe installed plugin does not match "
+                                   "this build of the client — updating is recommended"},
+    "plugin.current":       {"zh": "X-Plane：{path}\n插件已是最新",
+                             "en": "X-Plane: {path}\nThe plugin is up to date"},
+    # 协议对不上时插件是静默丢帧的，症状只有"他机一架都不出现"，所以这句要
+    # 明说因果，不能只说"版本不一致"
+    "plugin.protocol_mismatch": {"zh": "装着的插件用的是第 {installed} 版桥接协议，客户端是"
+                                       "第 {bundled} 版——不更新的话，他机会一架都不出现，"
+                                       "而且不会有任何报错。",
+                                 "en": "The installed plugin speaks bridge protocol "
+                                       "version {installed}, this client speaks "
+                                       "{bundled} — until it is updated no traffic will "
+                                       "appear at all, and nothing will report an error."},
+    "plugin.no_xppython3":  {"zh": "还没装 XPPython3，装了插件也不会被加载。"
+                                   "X-Plane 12 装 v4.x，X-Plane 11.52 装 v3.1.5"
+                                   "（v4 不兼容 XP11）：https://xppython3.readthedocs.io",
+                             "en": "XPPython3 is not installed, so the plugin will not be "
+                                   "loaded. X-Plane 12 needs v4.x, X-Plane 11.52 needs "
+                                   "v3.1.5 (v4 does not work on XP11): "
+                                   "https://xppython3.readthedocs.io"},
+    "plugin.installed":     {"zh": "已装好", "en": "Installed"},
+    "plugin.installed_body": {"zh": "插件已装到\n{path}\n\n重启 X-Plane 后生效。",
+                              "en": "The plugin was installed to\n{path}\n\nRestart "
+                                    "X-Plane for it to take effect."},
+    "plugin.failed":        {"zh": "安装失败", "en": "Installation failed"},
+    "plugin.failed_body":   {"zh": "写不进去：{error}\n\nX-Plane 装在 Program Files 之类"
+                                   "的位置时，需要用管理员身份运行本程序。",
+                             "en": "Could not write the file: {error}\n\nIf X-Plane is "
+                                   "installed somewhere like Program Files, run this "
+                                   "program as an administrator."},
+
+    # ---------- 更新 ----------
+    # 查到新版只是弹一句，装不装是用户的事。措辞要说清下载走的是自己的服务器
+    # ——大陆连 GitHub 很不稳，这正是这个功能存在的理由。
+    "update.title":         {"zh": "有新版本", "en": "A new version is available"},
+    "update.body":          {"zh": "XPC for CAN {version} 已经发布{size}。\n"
+                                   "你现在用的是 {current}。",
+                             "en": "XPC for CAN {version} is out{size}.\n"
+                                   "You are running {current}."},
+    # 包大小是可有可无的一段，所以单独成键——括号的写法两种语言不一样，
+    # 写死在 body 的参数里会让英文界面出现一对中文全角括号。
+    "update.size":          {"zh": "（{size}）", "en": " ({size})"},
+    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+                                   "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
+                             "en": "The download comes from airwaysn's own server, not "
+                                   "from GitHub.\nUnzip it over the old folder — your "
+                                   "settings are not in there."},
+    "update.download":      {"zh": "下载", "en": "Download"},
+    "update.notes":         {"zh": "看更新说明", "en": "Release notes"},
+    "update.skip":          {"zh": "跳过这个版本", "en": "Skip this version"},
+    "update.later":         {"zh": "以后再说", "en": "Later"},
+    "update.check":         {"zh": "检查更新", "en": "Check for updates"},
+    "update.check_tip":     {"zh": "看看有没有新版本。下载走 airwaysn 自己的服务器，"
+                                   "不直接连 GitHub",
+                             "en": "See whether a newer version is out. The download "
+                                   "comes from airwaysn's own server, not from GitHub"},
+    "update.current":       {"zh": "已经是最新版本（{version}）。",
+                             "en": "You are on the latest version ({version})."},
+    "msg.update_available": {"zh": "[更新] 有新版 {version}（已跳过）",
+                             "en": "[Update] {version} is available (skipped)"},
+    "msg.update_downloading": {"zh": "[更新] 正在浏览器里下载 {version}",
+                               "en": "[Update] downloading {version} in your browser"},
+    "msg.update_skipped":   {"zh": "[更新] 已跳过 {version}",
+                             "en": "[Update] skipped {version}"},
+
     # ---------- 设置 ----------
     "settings.title":       {"zh": "设置", "en": "Settings"},
     "settings.tab_audio":   {"zh": "音频", "en": "Audio"},
