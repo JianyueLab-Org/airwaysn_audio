@@ -96,5 +96,107 @@ class PymumbleIntegrationTest(unittest.TestCase):
                          "补丁之后不该再因为 ssl.wrap_socket 缺失而崩")
 
 
+class SendBufferTest(unittest.TestCase):
+    """发送缓冲满了不等于连接断了。
+
+    这是"一发话就掉线"的病根。pymumble 没有 UDP 通道，话音塞进 UDPTUNNEL 和
+    控制消息走同一条 TCP，而那条 socket 是非阻塞的，发送循环却按 C 的写法兜错
+    （`if sent < 0`——Python 里 send 是抛异常）。于是上行堵一下，
+    `BlockingIOError` 一路穿到 `Mumble.run()` 的 `except socket.error`，
+    连接被判死。真实日志里：掉线都在按下 PTT 两三秒后，而且每次第一下重连就成功
+    ——因为网络上根本没断。
+    """
+
+    def make(self, blocks, error=None, timeout=1.0):
+        """一个前 `blocks` 次写不动、之后正常的 socket。blocks=None 表示永远写不动。"""
+        outer = self
+
+        class Sock:
+            def __init__(self):
+                self.attempts = 0
+                self.sent = []
+                self.selected = 0
+
+            def send(self, data):
+                self.attempts += 1
+                if blocks is None or self.attempts <= blocks:
+                    raise (error or BlockingIOError(10035, "would block"))
+                self.sent.append(bytes(data))
+                return len(data)
+
+            def fileno(self):
+                return 1
+
+            def recv(self, size):
+                return b"payload"
+
+        sock = Sock()
+        guarded = mumblecompat._RetryingSocket(sock, timeout=timeout)
+        # 不真的去 select 一个假 fd
+        original_select = mumblecompat.select.select
+        mumblecompat.select.select = lambda r, w, x, t=None: (
+            sock.__setattr__("selected", sock.selected + 1), ([], [], []))[1]
+        outer.addCleanup(setattr, mumblecompat.select, "select", original_select)
+        return sock, guarded
+
+    def test_a_full_buffer_is_retried_not_raised(self):
+        sock, guarded = self.make(blocks=3)
+        self.assertEqual(guarded.send(b"audio"), 5)
+        self.assertEqual(sock.attempts, 4, "应当重试到写得进去为止")
+        self.assertEqual(sock.sent, [b"audio"])
+        self.assertGreaterEqual(sock.selected, 1, "重试之间要等 socket 可写")
+
+    def test_tls_want_write_is_the_same_case(self):
+        """TLS 上缓冲满抛的是 SSLWantWriteError，不是 BlockingIOError。"""
+        sock, guarded = self.make(blocks=2, error=ssl.SSLWantWriteError())
+        self.assertEqual(guarded.send(b"x"), 1)
+        self.assertEqual(sock.attempts, 3)
+
+    def test_a_socket_that_never_drains_still_reports_a_failure(self):
+        """真的堵死了还是要当断线——不能无限期挂在那里。"""
+        sock, guarded = self.make(blocks=None, timeout=0.05)
+        with self.assertRaises(BlockingIOError):
+            guarded.send(b"x")
+
+    def test_everything_else_passes_through(self):
+        sock, guarded = self.make(blocks=0)
+        self.assertEqual(guarded.recv(7), b"payload")
+        self.assertEqual(guarded.fileno(), 1, "select() 要靠 fileno()")
+
+    def test_every_connection_gets_the_guard_including_reconnects(self):
+        """必须挂在 connect() 上：pymumble 每次重连都会重建 socket。
+
+        漏掉重连那一次，那条连接就退回旧行为——而这个症状只在网络不好的用户
+        那里出现，自己这边根本复现不了。
+        """
+        import pymumble_py3.mumble as mumble_module
+
+        original = mumble_module.Mumble.connect
+        self.addCleanup(setattr, mumble_module.Mumble, "connect", original)
+
+        def fake_connect(self):
+            self.control_socket = object()      # 每次连接都是一个新 socket
+            return 1
+
+        mumble_module.Mumble.connect = fake_connect
+        self.assertTrue(mumblecompat.patch_send(), "补丁没打上")
+
+        client = mumble_module.Mumble.__new__(mumble_module.Mumble)
+        for round_number in (1, 2):             # 首连，然后一次重连
+            client.control_socket = None
+            mumble_module.Mumble.connect(client)
+            self.assertIsInstance(
+                client.control_socket, mumblecompat._RetryingSocket,
+                f"第 {round_number} 次连接之后 socket 没有被包住")
+
+    def test_the_guard_is_not_stacked(self):
+        client = type("M", (), {"control_socket": object()})()
+        plain = client.control_socket
+        self.assertTrue(mumblecompat.guard_control_socket(client))
+        self.assertIs(client.control_socket._sock, plain)
+        self.assertFalse(mumblecompat.guard_control_socket(client),
+                         "已经包过就不该再套一层")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
