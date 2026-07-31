@@ -31,6 +31,48 @@ log = logging.getLogger("mumblecompat")
 SEND_TIMEOUT = 2.0
 
 
+class _SendStats:
+    """上行堵了多少次、最久一次等了多久。
+
+    单独统计而不是每次都记日志：上行紧张时一秒能进几十次重试，逐条记只会把
+    真正的线索淹掉。调用方（voice.py / broadcast.py）在掉线时和定期各取一次
+    汇总——**「掉线前这一分钟堵过 37 次、最久 0.8 秒」比任何一行流水都说明问题**，
+    它直接区分了"上行真的不行"和"只是一次瞬时抖动"。
+    """
+
+    def __init__(self):
+        self.blocked = 0          # 写不动过多少次
+        self.gave_up = 0          # 其中彻底放弃（判定断线）的次数
+        self.worst = 0.0          # 最久的一次等待
+        self.total = 0.0          # 累计等待时间
+
+    def record(self, waited, gave_up=False):
+        self.blocked += 1
+        self.total += waited
+        self.worst = max(self.worst, waited)
+        if gave_up:
+            self.gave_up += 1
+
+    def drain(self):
+        """取走并清零。返回 None 表示这段时间一次都没堵过。"""
+        if not self.blocked:
+            return None
+        summary = (f"the send buffer was full {self.blocked} time(s) "
+                   f"(worst {self.worst * 1000:.0f} ms, {self.total:.1f} s total"
+                   + (f", {self.gave_up} of them gave up" if self.gave_up else "")
+                   + ")")
+        self.__init__()
+        return summary
+
+
+_stats = _SendStats()
+
+
+def send_stats():
+    """取走自上次调用以来的上行拥塞汇总，没有就返回 None。"""
+    return _stats.drain()
+
+
 class _RetryingSocket:
     """给非阻塞 socket 的 `send()` 补上"等它可写再续发"。
 
@@ -65,9 +107,15 @@ class _RetryingSocket:
 
     def send(self, data):
         deadline = time.monotonic() + self._timeout
+        waited = 0.0
         while True:
             try:
-                return self._sock.send(data)
+                sent = self._sock.send(data)
+                if waited:
+                    # 只统计，不每次都打日志——上行紧张时这里一秒能进几十次，
+                    # 记成日志反而把真正的线索淹掉。汇总由调用方定期打印。
+                    _stats.record(waited)
+                return sent
             except (BlockingIOError, ssl.SSLWantWriteError) as e:
                 error, readable = e, False
             except ssl.SSLWantReadError as e:
@@ -76,13 +124,17 @@ class _RetryingSocket:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                _stats.record(waited, gave_up=True)
                 log.warning("the control socket stayed unwritable for %.0f s, "
                             "treating it as a lost connection", self._timeout)
                 raise error
+
+            started = time.monotonic()
             if readable:
                 select.select([self._sock], [], [], remaining)
             else:
                 select.select([], [self._sock], [], remaining)
+            waited += time.monotonic() - started
 
 
 def guard_control_socket(mumble):

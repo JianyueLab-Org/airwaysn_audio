@@ -497,7 +497,10 @@ class XpcWindow(QMainWindow):
         self._model_cache[callsign] = path
         self.traffic.mark_model_clean(callsign)
         if model:
-            log.info("%s (%s/%s) → %s: %s", callsign,
+            # 机型还没问到时先用通用模型顶上，半秒后 #SB 回来会再匹配一次并覆盖
+            # 掉它。两行里只有后一行是结论，前一行降到 DEBUG。
+            level = log.debug if not entry.get("equipment") else log.info
+            level("%s (%s/%s) → %s: %s", callsign,
                      entry.get("equipment") or "?", entry.get("airline") or "?",
                      model.name, why)
         else:

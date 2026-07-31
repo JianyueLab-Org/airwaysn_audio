@@ -326,8 +326,11 @@ class TrafficInjector:
         self.aircraft[callsign] = {"object_id": None, "title": title,
                                    "request_id": request_id,
                                    "requested_at": time.time()}
-        log.info("asking the simulator to create %s: model %r, request %d",
-                 callsign, title, request_id)
+        # 机型还没问到时先拿通用模型顶上，半秒后 #SB 回来会用正确模型再建一次。
+        # 两条里只有后一条是结论，前一条降到 DEBUG——他机多的时候这类占了大头。
+        level = log.debug if not entry.get("equipment") else log.info
+        level("asking the simulator to create %s: model %r, request %d",
+              callsign, title, request_id)
 
     def _move(self, object_id, entry):
         values = (ctypes.c_double * len(_Definition.FIELDS))(
