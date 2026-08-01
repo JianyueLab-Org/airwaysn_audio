@@ -192,7 +192,9 @@ class TrafficTable:
             if aircraft is None:
                 aircraft = Aircraft(callsign)
                 self.aircraft[callsign] = aircraft
-                log.info("new aircraft %s", callsign)
+                # 降 DEBUG：紧跟着的模型匹配那行已经点了名。离线那条
+                # 留在 INFO——飞机什么时候消失的，是查问题要看的
+                log.debug("new aircraft %s", callsign)
             aircraft.update(Sample(now, latitude, longitude, altitude, pitch,
                                    bank, heading, on_ground, groundspeed),
                             squawk=squawk, mode=mode)
@@ -218,7 +220,9 @@ class TrafficTable:
                 self.aircraft[callsign] = aircraft
             changed = aircraft.set_plane_info(**info)
         if changed:
-            log.info("%s is a %s/%s", callsign,
+            # 降到 DEBUG：紧跟着的"最终匹配"那行本来就带机型和航司，
+            # 而每架飞机都要来一次，真实日志里这类占了三成
+            log.debug("%s is a %s/%s", callsign,
                      aircraft.equipment or "?", aircraft.airline or "?")
         return aircraft
 

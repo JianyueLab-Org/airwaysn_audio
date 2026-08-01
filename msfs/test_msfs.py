@@ -609,6 +609,99 @@ class InjectorTest(unittest.TestCase):
         injector = self.inject.TrafficInjector(sim=None)
         self.assertIsInstance(injector._requested_titles, dict)
 
+    def _fake_simconnect(self):
+        """照着 Python-SimConnect 的形状做一个替身。
+
+        关键是复制它那个**构造时就把方法包成 ctypes 跳板**的做法
+        （SimConnect.py:140 的 `my_dispatch_proc_rd = dll.DispatchProc(...)`），
+        收消息的循环调的是跳板而不是属性（同文件 181 行）。不复制这一点，
+        这条测试就测不出真问题。
+        """
+        test = self
+
+        class Dll:
+            @staticmethod
+            def DispatchProc(func):
+                # 真的 ctypes 会包一层，这里只要"包的是当时那个函数"这个语义
+                return ("trampoline", func)
+
+        class Sim:
+            def __init__(self):
+                self.dll = Dll()
+                self.hSimConnect = object()
+                self.calls = []
+                self.my_dispatch_proc = self.original
+                self.my_dispatch_proc_rd = self.dll.DispatchProc(
+                    self.my_dispatch_proc)
+
+            def original(self, pData, cbData, pContext):
+                self.calls.append("original")
+
+            def deliver(self, pData):
+                """模拟那个循环：调跳板里存的那个函数。"""
+                return self.my_dispatch_proc_rd[1](pData, 0, None)
+
+        return Sim()
+
+    def test_the_dispatch_hook_replaces_the_trampoline_not_just_the_attribute(self):
+        """只改 `my_dispatch_proc` 属性的话，我们这一层永远不会被调用。
+
+        Python-SimConnect 在 __init__ 里就把原方法包成了 ctypes 跳板，收消息的
+        循环调的是跳板。实测（v2.0.3 的日志）的后果：10 次创建请求、**0 个对象
+        号**、0 次移除、0 条警告——他机生成在初始位置之后就不动了，离线也删不
+        掉，机型问到后重新匹配又再建一架。
+        """
+        injector = self.inject.TrafficInjector(sim=None)
+        sim = self._fake_simconnect()
+        injector.sim = sim
+        injector.available = True
+        injector._enums = type("E", (), {
+            "SIMCONNECT_RECV_ID": type("R", (), {
+                "SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID": 12,
+                "SIMCONNECT_RECV_ID_EXCEPTION": 9})(),
+        })()
+
+        injector._install_dispatch()
+
+        self.assertIsNot(sim.my_dispatch_proc_rd[1], sim.original,
+                         "跳板还指着原方法——循环调的就是它，我们这层等于没装")
+        self.assertIs(sim.my_dispatch_proc_rd[1], sim.my_dispatch_proc,
+                      "跳板和属性必须是同一个函数")
+
+    def test_an_assigned_object_id_reaches_our_table(self):
+        """走完整条路：循环调跳板 → 我们记下 requestID→objectID → 交回原处理。
+
+        记不下来的话 `record["object_id"]` 永远是 None，`_sync_one` 每轮停在
+        "还在等 objectID"，他机就再也不动了。
+        """
+        import ctypes
+
+        injector = self.inject.TrafficInjector(sim=None)
+        sim = self._fake_simconnect()
+        injector.sim = sim
+        injector.available = True
+
+        class Body(ctypes.Structure):
+            _fields_ = [("dwID", ctypes.c_uint32),
+                        ("dwRequestID", ctypes.c_uint32),
+                        ("dwObjectID", ctypes.c_uint32)]
+
+        injector._enums = type("E", (), {
+            "SIMCONNECT_RECV_ID": type("R", (), {
+                "SIMCONNECT_RECV_ID_ASSIGNED_OBJECT_ID": 12,
+                "SIMCONNECT_RECV_ID_EXCEPTION": 9})(),
+            "SIMCONNECT_RECV_ASSIGNED_OBJECT_ID": Body,
+        })()
+        injector._install_dispatch()
+
+        message = Body(dwID=12, dwRequestID=10001, dwObjectID=4242)
+        sim.deliver(ctypes.pointer(message))
+
+        self.assertEqual(injector._assigned.get(10001), 4242,
+                         "对象号没有被记下来")
+        self.assertEqual(sim.calls, ["original"],
+                         "记完之后必须原样交回包自己的处理")
+
     def _fake_injector(self, removed):
         """一个不碰 SimConnect 的注入器，只记下 AIRemoveObject 调了哪些对象。"""
         injector = self.inject.TrafficInjector(sim=None)

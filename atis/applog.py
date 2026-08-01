@@ -15,11 +15,16 @@
 
 import logging
 import logging.handlers
+import platform
 import os
 import sys
 
 LOG_NAME = "atis-for-can.log"
-MAX_BYTES = 2 * 1024 * 1024
+# 一行大约 80 字节，1 MB 就是一万三千行。把每段收听从两行压成一行、
+# 把他机的中间态降到 DEBUG 之后，同样一个文件能装下的时长翻了一倍还多，
+# 所以上限从 2 MB 收到 1 MB——用户要发日志时，四个文件加起来 4 MB 比
+# 8 MB 好发得多，而覆盖的时间反而更长。
+MAX_BYTES = 1024 * 1024
 BACKUPS = 3
 
 _log_path = None
@@ -64,9 +69,16 @@ def setup(debug=False):
     logging.captureWarnings(True)
     _install_excepthook()
 
-    logging.getLogger("startup").info(
-        "log level %s, file %s", logging.getLevelName(level),
-        _log_path or "(none)")
+    startup = logging.getLogger("startup")
+    startup.info("log level %s, file %s", logging.getLevelName(level),
+                 _log_path or "(none)")
+    # 一行环境。用户发上来的日志十有八九缺的就是这些：装在哪、是不是解压到临时
+    # 目录跑的（见过在 360zip 的临时目录里跑的，设置每次都丢）、Python 和系统
+    # 版本、以及这是打包的还是从源码跑的。问一遍要一个来回，写进去零成本。
+    startup.info("%s %s | %s | cwd %s | %s",
+                 platform.system(), platform.release(),
+                 "packaged" if getattr(sys, "frozen", False) else "from source",
+                 os.getcwd(), sys.version.split()[0])
     return _log_path
 
 
