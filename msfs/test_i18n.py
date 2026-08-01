@@ -227,8 +227,9 @@ class BindingLabelTest(unittest.TestCase):
             "keyboard": i18n.binding_label(ptt.keyboard_binding("v")),
             "mouse": i18n.binding_label(ptt.Binding(ptt.MOUSE, button="x1")),
             "joystick": i18n.binding_label(ptt.Binding(ptt.JOYSTICK, button=3)),
+            "hat": i18n.binding_label(ptt.Binding(ptt.HAT, hat=0, direction="up")),
         }
-        self.assertEqual(len(set(labels.values())), 3, labels)
+        self.assertEqual(len(set(labels.values())), 4, labels)
         for text in labels.values():
             self.assertNotIn("{", text)
 
@@ -236,6 +237,18 @@ class BindingLabelTest(unittest.TestCase):
         import ptt
         binding = ptt.Binding(ptt.JOYSTICK, button=3, device_name="Saitek X52")
         self.assertIn("Saitek X52", i18n.binding_label(binding))
+
+    def test_a_hat_reads_as_a_hat_with_its_arrow(self):
+        # 箭头由 ptt.py 的 token() 给，说法在这边拼——方向不用翻译，箭头两种
+        # 语言是同一个
+        import ptt
+        binding = ptt.Binding(ptt.HAT, hat=1, direction="down", device_name="Yoke")
+        for language in ("zh", "en"):
+            i18n.set_language(language)
+            text = i18n.binding_label(binding)
+            self.assertIn("1↓", text)
+            self.assertIn("Yoke", text)
+            self.assertNotIn("{", text)
 
     def test_ptt_module_carries_no_ui_text(self):
         """ptt.py 里的字符串字面量不该有中文（注释和文档字符串不算）。"""

@@ -573,6 +573,17 @@ def main():
         assert added not in dialog.ptt_list.bindings, "绑定没移除掉"
     check("加/删一条 PTT 绑定", a_binding_can_be_added_and_removed)
 
+    def a_hat_binding_reads_as_a_hat():
+        """轭上的 PTT 多半在帽键上，那一行得真的能画出来并且认得出是哪个方向。"""
+        hat = ptt.Binding(ptt.HAT, hat=0, direction="up", device_name="Pro Flight Yoke")
+        dialog.ptt_list.on_captured(hat)
+        label = gui.i18n.binding_label(hat)
+        assert "↑" in label, label
+        assert "Pro Flight Yoke" in label, label
+        assert "{" not in label, label
+        dialog.ptt_list.remove(hat)
+    check("帽键绑定能显示", a_hat_binding_reads_as_a_hat)
+
     def an_empty_list_still_builds():
         """一条绑定都没有时也得能画出来——这时界面上是一句"PTT 用不了"。"""
         dialog.ptt_list.bindings = []

@@ -181,6 +181,12 @@ class Voice:
         self._last_rx = 0.0
         self._sent_frames = 0           # 本次 PTT 已发出的帧数
         self._received_frames = 0       # 本段接收已播放的帧数
+        # 放不出来的帧要合并着报。收到的音频是 20 ms 一帧，播放一坏就是每帧一条
+        # ——真实日志里同一句话刷了 8553 遍，把当天所有别的线索全冲没了，1 MB
+        # 的滚动窗口也就只剩几分钟。所以只在原因**变了**的时候说一句，帧数攒着，
+        # 到这段接收结束时并进那一条结论里。
+        self._play_errors = 0           # 本段接收放不出来的帧数
+        self._play_error = ""           # 上一次的原因，用来判断要不要再说一遍
         self._skip_reason = ""          # 明明按着 PTT 却没发的原因
         self._stuck_reason = ""         # 迟迟进不了频率频道的原因
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
@@ -764,7 +770,7 @@ class Voice:
                              channel["channel_id"])
                     if session is None:
                         log.warning("session is None: the server will simply ignore "
-                                    "this MoveCmd — it will neither take "
+                                    "this MoveCmd, it will neither take "
                                     "effect nor report an error")
                     # move_in() 也走 execute_command(blocking=True)，和建频道
                     # 一样会无限期卡住，同样自己发命令
@@ -977,6 +983,8 @@ class Voice:
             if not self.receiving:
                 self.receiving = True
                 self._received_frames = 0
+                self._play_errors = 0
+                self._play_error = ""
                 self._talker = user.get("name", "?")
                 log.debug("receiving audio from %s", self._talker)
                 if self.on_rx:
@@ -987,14 +995,32 @@ class Voice:
             samples = (samples * volume).astype(np.int16)
             if not self._output:
                 # 收到了但扬声器没开——"听不到别人"和"根本没人说话"是两回事
-                log.warning("audio received but the speaker is not open, nothing "
-                            "will be heard")
+                self._note_play_error("the speaker is not open")
                 return
             self._output.write(samples.tobytes())
             self._received_frames += 1
             self._received_total += 1
         except Exception as e:
-            log.warning("failed to play the received audio: %s", e)
+            self._note_play_error("%s: %s" % (e.__class__.__name__, e))
+
+    def _note_play_error(self, reason):
+        """记一帧放不出来的音频。同一个原因只说一次，其余的攒起来。
+
+        每帧一条 WARNING 是这份日志里最贵的一个习惯：一段十几秒的通话就是几百
+        条一模一样的话。这里只在原因**换了**（或者是这段接收里的第一条）时说一
+        句完整的，带上扬声器现在是什么状态；剩下的攒进 _play_errors，由 _run()
+        那条"heard …"的结论行一并报出来，这样一段接收还是一行，而且那一行现在
+        能说清"听见了，但一帧都没放出来，因为 X"。
+        """
+        self._play_errors += 1
+        if reason == self._play_error:
+            log.debug("still cannot play the received audio: %s", reason)
+            return
+        self._play_error = reason
+        log.warning("cannot play the received audio from %s: %s (speaker %s, "
+                    "%d Hz); the audio is arriving, it is the playback that fails",
+                    getattr(self, "_talker", "?"), reason,
+                    "open" if self._output else "not open", self._rate)
 
     def _run(self):
         """发送线程：按住 PTT 就把麦克风送上去，同时管接收灯的超时。"""
@@ -1002,9 +1028,18 @@ class Voice:
             try:
                 if self.receiving and time.time() - self._last_rx > RX_TIMEOUT:
                     self.receiving = False
-                    log.info("heard %s for %.1f s (%d frames)",
+                    # 放不出来的帧并进这一行。"heard X for 3.1 s (0 frames)" 单看
+                    # 只说明没放出声，说不出为什么——而为什么正是用户要问的那件事。
+                    dropped = ""
+                    if self._play_errors:
+                        dropped = ("; %d frame(s) could not be played (%s)"
+                                   % (self._play_errors, self._play_error))
+                    log.info("heard %s for %.1f s (%d frames)%s",
                              getattr(self, "_talker", "?"),
-                             self._received_frames * 0.02, self._received_frames)
+                             (self._received_frames + self._play_errors) * 0.02,
+                             self._received_frames, dropped)
+                    self._play_errors = 0
+                    self._play_error = ""
                     if self.on_rx:
                         self.on_rx(False)
 

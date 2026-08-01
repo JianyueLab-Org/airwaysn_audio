@@ -676,6 +676,95 @@ class FakeStream:
         pass
 
 
+class PlaybackErrorLogTest(unittest.TestCase):
+    """放不出来的音频要合并着报，一段接收一行结论，不是一帧一行。
+
+    收到的音频是 20 ms 一帧，所以播放一坏就是每秒 50 条 WARNING。真实日志里
+    `failed to play the received audio: [Errno -9988] Stream closed` 出现了
+    8553 次，把那一天所有别的线索都挤出了 1 MB 的滚动窗口——而这 8553 行说的
+    是同一件事。合并之后，"听见了但一帧都没放出来，因为 X"是一行就能看懂的。
+    """
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.module = voice
+        self.voice = voice.Voice(
+            "host", "1000", "pw",
+            settings=types.SimpleNamespace(mic_volume=100, speaker_volume=100))
+        self.voice.mumble = None           # 没有 myself，_on_sound 就不比自己
+        self.voice.running = True
+
+        class BrokenSpeaker:
+            def write(self, data):
+                raise OSError("[Errno -9988] Stream closed")
+
+        self.voice._output = BrokenSpeaker()
+        self.chunk = types.SimpleNamespace(pcm=b"\x00\x00" * 960)
+
+    def tearDown(self):
+        self.voice.running = False
+
+    def _hear(self, frames):
+        for _ in range(frames):
+            self.voice._on_sound({"name": "1003"}, self.chunk)
+
+    def test_repeated_failures_collapse_into_one_warning(self):
+        with self.assertLogs("voice", level="DEBUG") as caught:
+            self._hear(50)
+        warnings = [r.getMessage() for r in caught.records
+                    if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("Stream closed", warnings[0])
+        self.assertIn("speaker open", warnings[0])   # 扬声器是什么状态也要说
+        self.assertEqual(self.voice._play_errors, 50)
+
+    def test_a_new_reason_is_reported_again(self):
+        # 攒着不等于咽下去：换了个原因就是新情况，得说
+        self._hear(2)
+        with self.assertLogs("voice", level="WARNING") as caught:
+            self.voice._output = None      # 现在是"扬声器根本没开"
+            self._hear(2)
+        self.assertIn("the speaker is not open",
+                      "\n".join(r.getMessage() for r in caught.records))
+
+    def test_the_burst_conclusion_carries_the_count_and_the_reason(self):
+        self._hear(3)
+        with self.assertLogs("voice", level="INFO") as caught:
+            thread = threading.Thread(target=self.voice._run, daemon=True)
+            thread.start()
+            deadline = time.time() + 4
+            while time.time() < deadline and self.voice.receiving:
+                time.sleep(0.02)
+            self.voice.running = False
+            thread.join(timeout=2)
+        heard = [r.getMessage() for r in caught.records
+                 if r.getMessage().startswith("heard ")]
+        self.assertTrue(heard, "这段接收结束时没有结论行")
+        self.assertIn("3 frame(s) could not be played", heard[0])
+        self.assertIn("Stream closed", heard[0])
+        # 时长要算上没放出来的帧，否则一段十几秒的通话会显示成 0.0 s
+        self.assertIn("0.1 s", heard[0])
+
+    def test_a_clean_burst_says_nothing_extra(self):
+        self.voice._output = FakeStream()
+        with self.assertLogs("voice", level="INFO") as caught:
+            self._hear(3)
+            thread = threading.Thread(target=self.voice._run, daemon=True)
+            thread.start()
+            deadline = time.time() + 4
+            while time.time() < deadline and self.voice.receiving:
+                time.sleep(0.02)
+            self.voice.running = False
+            thread.join(timeout=2)
+        heard = [r.getMessage() for r in caught.records
+                 if r.getMessage().startswith("heard ")]
+        self.assertTrue(heard)
+        self.assertNotIn("could not be played", heard[0])
+
+
 class VoiceRuntimeTest(unittest.TestCase):
     """把 Voice 真的跑起来：切频道、发话音、掉线重连之后还能不能用。"""
 

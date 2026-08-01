@@ -9,6 +9,7 @@ pygame 的机器上跑——CI 就是这样的机器。
 
 import hashlib
 import os
+import re
 import threading
 import time
 import unittest
@@ -65,10 +66,11 @@ def fake_pynput():
 
 # ---------- 假的 pygame ----------
 class FakeStick:
-    def __init__(self, index, name="Fake Stick", buttons=8):
+    def __init__(self, index, name="Fake Stick", buttons=8, hats=0):
         self.index = index
         self._name = name
         self._buttons = [False] * buttons
+        self._hats = [(0, 0)] * hats
         self.quit_called = False
 
     def init(self):
@@ -92,13 +94,29 @@ class FakeStick:
     def release(self, index):
         self._buttons[index] = False
 
+    # pygame 的帽键：一对 (x, y)，每个分量是 -1 / 0 / 1，回中是 (0, 0)
+    def get_numhats(self):
+        return len(self._hats)
+
+    def get_hat(self, index):
+        return self._hats[index]
+
+    def push(self, index, direction):
+        self._hats[index] = ptt.HAT_DIRECTIONS[direction]
+
+    def center(self, index):
+        self._hats[index] = (0, 0)
+
 
 class FakePygame:
-    def __init__(self, sticks=()):
+    def __init__(self, sticks=(), open_error=None):
         self.sticks = list(sticks)
         self.event = self
         self.joystick = self
         self.pumped = 0
+        # 打开设备时抛出来的东西。Windows 上真的会这样：DirectInput 的
+        # SetCooperativeLevel 失败，设备明明在，就是打不开
+        self.open_error = open_error
 
     # pygame.event.pump()
     def pump(self):
@@ -112,6 +130,8 @@ class FakePygame:
         return len(self.sticks)
 
     def Joystick(self, index):        # noqa: N802 —— 照 pygame 的大写名字
+        if self.open_error:
+            raise RuntimeError(self.open_error)
         return self.sticks[index]
 
 
@@ -157,12 +177,51 @@ class NameTest(unittest.TestCase):
         self.assertEqual(ptt.mouse_name(FakeButton("button9")), "x2")
 
 
+class HatTest(unittest.TestCase):
+    """帽键的两个纯函数。飞行摇杆和轭上的 PTT 多半就在帽键上。"""
+
+    def test_a_direction_is_named_from_the_pair(self):
+        self.assertEqual(ptt.hat_direction((0, 1)), "up")
+        self.assertEqual(ptt.hat_direction((1, 1)), "up_right")
+        self.assertEqual(ptt.hat_direction((0, 0)), "")     # 回中不算按下
+
+    def test_garbage_is_not_a_direction(self):
+        for value in (None, (), (5, 5), "up"):
+            self.assertEqual(ptt.hat_direction(value), "", value)
+            self.assertFalse(ptt.hat_pressed(value, "up"), value)
+
+    def test_a_cardinal_binding_survives_the_diagonal(self):
+        # 绑了"上"的人推到右上，想说的还是话。正好卡在斜角上就哑掉是最难自查的
+        # 一种故障——界面上一切正常
+        self.assertTrue(ptt.hat_pressed((0, 1), "up"))
+        self.assertTrue(ptt.hat_pressed((1, 1), "up"))
+        self.assertTrue(ptt.hat_pressed((-1, 1), "up"))
+        self.assertFalse(ptt.hat_pressed((1, 0), "up"))
+        self.assertFalse(ptt.hat_pressed((0, -1), "up"))
+
+    def test_a_diagonal_binding_needs_both_components(self):
+        # 否则"右上"会被"上"和"右"同时盖住，一条绑定变成两条
+        self.assertTrue(ptt.hat_pressed((1, 1), "up_right"))
+        self.assertFalse(ptt.hat_pressed((0, 1), "up_right"))
+        self.assertFalse(ptt.hat_pressed((1, 0), "up_right"))
+
+    def test_an_unknown_direction_never_transmits(self):
+        self.assertFalse(ptt.hat_pressed((0, 1), ""))
+        self.assertFalse(ptt.hat_pressed((0, 1), "sideways"))
+
+    def test_every_direction_has_an_arrow(self):
+        # token() 拿箭头拼显示名，少一个就会显示成光秃秃的帽键号
+        self.assertEqual(set(ptt.HAT_DIRECTIONS), set(ptt.HAT_ARROWS))
+
+
 class BindingTest(unittest.TestCase):
     def test_round_trip(self):
         for binding in (ptt.Binding(ptt.KEYBOARD, key="v"),
                         ptt.Binding(ptt.MOUSE, button="x2"),
                         ptt.Binding(ptt.JOYSTICK, button=3, device=1,
-                                    device_name="Saitek")):
+                                    device_name="Saitek"),
+                        ptt.Binding(ptt.HAT, hat=1, direction="up_left", device=2,
+                                    device_name="Pro Flight Yoke")):
             self.assertEqual(ptt.Binding.from_dict(binding.to_dict()), binding)
 
     def test_a_broken_entry_is_dropped_not_raised(self):
@@ -170,7 +229,11 @@ class BindingTest(unittest.TestCase):
         for bad in (None, {}, {"kind": "telepathy"}, {"kind": "keyboard"},
                     {"kind": "mouse", "button": "left"},
                     {"kind": "joystick", "button": "三"},
-                    {"kind": "joystick", "button": -1}):
+                    {"kind": "joystick", "button": -1},
+                    {"kind": "hat", "hat": 0},
+                    {"kind": "hat", "hat": 0, "direction": "sideways"},
+                    {"kind": "hat", "hat": -1, "direction": "up"},
+                    {"kind": "hat", "direction": "up"}):
             self.assertIsNone(ptt.Binding.from_dict(bad), bad)
 
     def test_the_token_carries_no_translatable_words(self):
@@ -179,11 +242,24 @@ class BindingTest(unittest.TestCase):
         self.assertEqual(ptt.Binding(ptt.KEYBOARD, key="space").token(), "space")
         self.assertEqual(ptt.Binding(ptt.MOUSE, button="x1").token(), "X1")
         self.assertEqual(ptt.Binding(ptt.JOYSTICK, button=7).token(), "7")
+        # 帽键是"帽键号 + 箭头"。箭头是符号不是词，两种语言共用
+        self.assertEqual(ptt.Binding(ptt.HAT, hat=0, direction="up").token(), "0↑")
+        self.assertEqual(ptt.Binding(ptt.HAT, hat=1, direction="down_right").token(),
+                         "1↘")
 
     def test_the_device_name_does_not_affect_identity(self):
         a = ptt.Binding(ptt.JOYSTICK, button=1, device=0, device_name="A")
         b = ptt.Binding(ptt.JOYSTICK, button=1, device=0, device_name="B")
         self.assertEqual(a, b)
+
+    def test_a_hat_is_not_the_button_with_the_same_number(self):
+        # 两者的序号是各数各的，混起来会让"帽键 0"把"按钮 0"顶掉
+        self.assertNotEqual(ptt.Binding(ptt.HAT, hat=0, direction="up"),
+                            ptt.Binding(ptt.JOYSTICK, button=0))
+
+    def test_two_directions_of_one_hat_are_two_bindings(self):
+        self.assertNotEqual(ptt.Binding(ptt.HAT, hat=0, direction="up"),
+                            ptt.Binding(ptt.HAT, hat=0, direction="down"))
 
 
 class LoadTest(unittest.TestCase):
@@ -372,6 +448,7 @@ class JoystickWatcherTest(unittest.TestCase):
                                  on_change=self.collector)
         watcher.start()
         self.assertTrue(self._wait_for(lambda: self.pygame.pumped > 0))
+        self.stick.quit_called = False      # 出错时报设备清单也会开合一次，先清干净
         watcher.stop()
         self.assertTrue(self._wait_for(lambda: self.stick.quit_called),
                         "停了之后没把摇杆放开")
@@ -391,6 +468,273 @@ class JoystickWatcherTest(unittest.TestCase):
         kb = [l for l in FakeListener.instances if l.on_press][0]
         kb.on_press(FakeKey(char="v"))
         self.assertEqual(self.collector.last, True)
+
+
+class HatWatcherTest(unittest.TestCase):
+    """帽键（POV）走的是摇杆那条轮询线程，但读法完全不同。
+
+    飞行摇杆和轭上的 PTT 十有八九在帽键上，而 SDL 把帽键报成 hat——`get_button()`
+    一辈子也看不见它。
+    """
+
+    def setUp(self):
+        self.stick = FakeStick(0, name="Pro Flight Yoke", buttons=4, hats=2)
+        self.pygame = FakePygame([self.stick])
+        real = ptt._import_pygame
+        ptt._import_pygame = lambda: self.pygame
+        self.addCleanup(setattr, ptt, "_import_pygame", real)
+        self._retry = ptt.JOYSTICK_RETRY
+        ptt.JOYSTICK_RETRY = 0.0
+        self.addCleanup(setattr, ptt, "JOYSTICK_RETRY", self._retry)
+        self.collector = Collector()
+
+    def _watch(self, *bindings):
+        watcher = ptt.PttWatcher(list(bindings), on_change=self.collector)
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def _wait_for(self, predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_a_hat_direction_drives_ptt(self):
+        self._watch(ptt.Binding(ptt.HAT, hat=0, direction="up"))
+        self.stick.push(0, "up")
+        self.assertTrue(self._wait_for(lambda: self.collector.last is True),
+                        "帽键推上去了但 PTT 没起来")
+        self.stick.center(0)
+        self.assertTrue(self._wait_for(lambda: self.collector.last is False))
+
+    def test_a_hat_binding_alone_starts_the_polling(self):
+        # 只绑了帽键、一个摇杆按钮都没绑的时候，轮询线程照样得开着
+        self._watch(ptt.Binding(ptt.HAT, hat=0, direction="left"))
+        self.assertTrue(self._wait_for(lambda: self.pygame.pumped > 0),
+                        "只绑帽键就没人去轮询了")
+
+    def test_another_direction_does_not_transmit(self):
+        self._watch(ptt.Binding(ptt.HAT, hat=0, direction="up"))
+        self.assertTrue(self._wait_for(lambda: self.pygame.pumped > 0))
+        self.stick.push(0, "down")
+        self.assertFalse(self._wait_for(lambda: self.collector.events, timeout=0.3))
+
+    def test_the_other_hat_is_not_this_hat(self):
+        self._watch(ptt.Binding(ptt.HAT, hat=1, direction="up"))
+        self.assertTrue(self._wait_for(lambda: self.pygame.pumped > 0))
+        self.stick.push(0, "up")
+        self.assertFalse(self._wait_for(lambda: self.collector.events, timeout=0.3))
+        self.stick.push(1, "up")
+        self.assertTrue(self._wait_for(lambda: self.collector.last is True))
+
+    def test_a_hat_beyond_the_device_is_not_pressed(self):
+        # 换了个没有那么多帽键的设备。要的是"不响"，不是让轮询线程带着
+        # IndexError 死掉——那样连别的绑定也一起没了
+        self._watch(ptt.Binding(ptt.HAT, hat=5, direction="up"))
+        self.assertFalse(self._wait_for(lambda: self.collector.events, timeout=0.3))
+        self.assertTrue(self.pygame.pumped > 0, "轮询线程死了")
+
+    def test_a_button_and_a_hat_on_one_device_are_ored(self):
+        self._watch(ptt.Binding(ptt.JOYSTICK, button=2),
+                    ptt.Binding(ptt.HAT, hat=0, direction="up"))
+        self.stick.press(2)
+        self.assertTrue(self._wait_for(lambda: self.collector.last is True))
+        self.stick.push(0, "up")
+        self.stick.release(2)
+        # 帽键还推着，不该松开
+        self.assertFalse(self._wait_for(lambda: self.collector.last is False,
+                                        timeout=0.3))
+        self.stick.center(0)
+        self.assertTrue(self._wait_for(lambda: self.collector.last is False))
+
+    def test_stopping_while_the_hat_is_pushed_releases_ptt(self):
+        # 不然发送线程会一直以为还按着，麦克风就留在开着的状态
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.HAT, hat=0, direction="right")],
+                                 on_change=self.collector)
+        watcher.start()
+        self.stick.push(0, "right")
+        self.assertTrue(self._wait_for(lambda: self.collector.last is True))
+        watcher.stop()
+        self.assertEqual(self.collector.last, False)
+
+
+class LogTest(unittest.TestCase):
+    """日志得说清楚，而且不能刷屏。
+
+    这两件事是一件事的两面：一条重复几百遍的 WARNING 既没多告诉你什么，又把
+    真正的线索挤出了滚动窗口（applog 的 MAX_BYTES 是 1 MB）。规矩是——第一次
+    说全，重复的攒着，情况变了再说一次，好了也要说一声。
+    """
+
+    def setUp(self):
+        self.stick = FakeStick(0, name="Pro Flight Yoke", buttons=4, hats=1)
+        self.pygame = FakePygame([self.stick])
+        real = ptt._import_pygame
+        ptt._import_pygame = lambda: self.pygame
+        self.addCleanup(setattr, ptt, "_import_pygame", real)
+        self._retry = ptt.JOYSTICK_RETRY
+        ptt.JOYSTICK_RETRY = 0.0           # 别真的等 3 秒
+        self.addCleanup(setattr, ptt, "JOYSTICK_RETRY", self._retry)
+
+    def _watch(self, *bindings):
+        watcher = ptt.PttWatcher(list(bindings))
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    @staticmethod
+    def _levels(records, level):
+        return [r.getMessage() for r in records if r.levelname == level]
+
+    def test_describe_names_every_kind_without_any_chinese(self):
+        text = ptt.describe([ptt.keyboard_binding("v"),
+                             ptt.Binding(ptt.MOUSE, button="x1"),
+                             ptt.Binding(ptt.JOYSTICK, button=19, device=0,
+                                         device_name="WINCTRL URSA MINOR"),
+                             ptt.Binding(ptt.HAT, hat=0, direction="up")])
+        for expected in ("key V", "mouse X1", "button 19", "WINCTRL URSA MINOR",
+                         "hat 0"):
+            self.assertIn(expected, text)
+        self.assertIsNone(re.search(r"[一-鿿]", text), text)
+        self.assertEqual(ptt.describe([]), "none")
+
+    def test_the_start_line_says_what_is_bound(self):
+        # "PTT watcher started with 1 binding(s)" 单看等于什么都没说——排查
+        # "PTT 不响"的第一步正是"那一条到底绑的是什么"
+        with self.assertLogs("ptt", level="INFO") as caught:
+            self._watch(ptt.Binding(ptt.JOYSTICK, button=19, device=0))
+        started = [m for m in self._levels(caught.records, "INFO")
+                   if "watcher started" in m]
+        self.assertTrue(started)
+        self.assertIn("button 19", started[0])
+
+    def test_a_missing_device_is_not_silent(self):
+        # 以前这条路是静默 return None：绑定指着一个没插的设备，日志里一个字没有
+        self.pygame.sticks = []
+        with self.assertLogs("ptt", level="WARNING") as caught:
+            self._watch(ptt.Binding(ptt.JOYSTICK, button=3, device=1))
+            time.sleep(ptt.POLL_INTERVAL * 5)
+        text = "\n".join(self._levels(caught.records, "WARNING"))
+        self.assertIn("no #1", text)
+        self.assertIn("button 3", text)     # 绑的是什么也要在同一行里
+
+    def test_a_repeated_failure_is_not_repeated_in_the_log(self):
+        self.pygame.sticks = []
+        with self.assertLogs("ptt", level="DEBUG") as caught:
+            self._watch(ptt.Binding(ptt.JOYSTICK, button=0, device=0))
+            time.sleep(ptt.POLL_INTERVAL * 10)
+        warnings = self._levels(caught.records, "WARNING")
+        attempts = [m for m in self._levels(caught.records, "DEBUG")
+                    if "could not open joystick" in m]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertGreater(len(attempts), 1,
+                           "重试根本没发生，这个测试就没在测东西")
+
+    def test_coming_back_is_logged_too(self):
+        # 只剩一串失败的话，看不出后来到底恢复没有
+        self.pygame.sticks = []
+        watcher = self._watch(ptt.Binding(ptt.JOYSTICK, button=0, device=0))
+        time.sleep(ptt.POLL_INTERVAL * 3)
+        with self.assertLogs("ptt", level="INFO") as caught:
+            self.pygame.sticks = [self.stick]      # 插回去了
+            time.sleep(ptt.POLL_INTERVAL * 5)
+        text = "\n".join(self._levels(caught.records, "INFO"))
+        self.assertIn("is back after", text)
+        self.assertIn("Pro Flight Yoke", text)     # 开成功那条会报设备名
+        del watcher
+
+    def test_a_button_beyond_the_device_says_so_once(self):
+        # 设备开得好好的、日志一个字没有、PTT 就是不响——以前正是这样
+        with self.assertLogs("ptt", level="WARNING") as caught:
+            self._watch(ptt.Binding(ptt.JOYSTICK, button=19, device=0))
+            time.sleep(ptt.POLL_INTERVAL * 6)
+        warnings = [m for m in self._levels(caught.records, "WARNING")
+                    if "only has" in m]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("button 19", warnings[0])
+        self.assertIn("Pro Flight Yoke", warnings[0])
+
+    def test_a_hat_beyond_the_device_says_so_once(self):
+        with self.assertLogs("ptt", level="WARNING") as caught:
+            self._watch(ptt.Binding(ptt.HAT, hat=4, direction="up", device=0))
+            time.sleep(ptt.POLL_INTERVAL * 6)
+        warnings = [m for m in self._levels(caught.records, "WARNING")
+                    if "only has" in m]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("hat 4", warnings[0])
+
+    def test_the_device_list_survives_one_bad_device(self):
+        # 排查的往往正是"有一个开不了"，这时更需要看见另外几个是什么
+        good = FakeStick(1, name="Rudder Pedals", buttons=2)
+
+        class OneBad(FakePygame):
+            def Joystick(self, index):      # noqa: N802
+                if index == 0:
+                    raise RuntimeError("SetCooperativeLevel() error 0x80070006")
+                return self.sticks[index]
+
+        pygame = OneBad([self.stick, good])
+        text = ptt.describe_devices(pygame)
+        self.assertIn("2 connected", text)
+        self.assertIn("Rudder Pedals", text)
+
+
+class SdlInitThreadTest(unittest.TestCase):
+    """SDL 只能在调用方那条线程（界面线程）上初始化，不能在轮询/录制线程里。
+
+    Windows 上 SDL 的 DirectInput 要一个隐藏窗口才能 SetCooperativeLevel，那个
+    窗口归建它的线程所有，线程一结束系统就把它销毁，而 SDL 把句柄记在全局里、
+    不会重建。放在轮询线程里初始化的那一版是：第一次好用，等这个线程退出（用户
+    打开一次设置就会），之后每次打开摇杆都是 0x80070006（E_HANDLE），一直到重启
+    客户端。真实日志里用户就是这么从摇杆改绑鼠标侧键的。
+    """
+
+    def setUp(self):
+        self.stick = FakeStick(0, buttons=4, hats=1)
+        self.pygame = FakePygame([self.stick])
+        self.threads = []
+        real = ptt._import_pygame
+        self.addCleanup(setattr, ptt, "_import_pygame", real)
+
+        def spy():
+            self.threads.append(threading.current_thread())
+            return self.pygame
+        ptt._import_pygame = spy
+        realp = ptt._import_pynput
+        ptt._import_pynput = lambda: (None, None)
+        self.addCleanup(setattr, ptt, "_import_pynput", realp)
+
+    def test_the_watcher_initialises_sdl_on_the_calling_thread(self):
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.JOYSTICK, button=0)])
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        time.sleep(ptt.POLL_INTERVAL * 3)      # 轮询线程转几圈，看它会不会自己去初始化
+        self.assertEqual(self.threads, [threading.current_thread()],
+                         "SDL 是在轮询线程里初始化的，那个线程一退出摇杆就废了")
+
+    def test_a_hat_only_binding_also_initialises_on_the_calling_thread(self):
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.HAT, hat=0, direction="up")])
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        time.sleep(ptt.POLL_INTERVAL * 3)
+        self.assertEqual(self.threads, [threading.current_thread()])
+
+    def test_the_capture_initialises_sdl_on_the_calling_thread(self):
+        capture = ptt.PttCapture(lambda binding: None)
+        capture.start()
+        self.addCleanup(capture.stop)
+        time.sleep(ptt.POLL_INTERVAL * 3)
+        self.assertEqual(self.threads, [threading.current_thread()])
+
+    def test_no_pygame_means_no_poll_thread_at_all(self):
+        ptt._import_pygame = lambda: None
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.JOYSTICK, button=0)])
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        self.assertIsNone(watcher._joystick_thread)
 
 
 class CaptureTest(unittest.TestCase):
@@ -429,7 +773,7 @@ class CaptureTest(unittest.TestCase):
 
 class JoystickCaptureTest(unittest.TestCase):
     def setUp(self):
-        self.stick = FakeStick(0, name="Fake Yoke", buttons=4)
+        self.stick = FakeStick(0, name="Fake Yoke", buttons=4, hats=1)
         self.pygame = FakePygame([self.stick])
         real = ptt._import_pygame
         ptt._import_pygame = lambda: self.pygame
@@ -469,6 +813,31 @@ class JoystickCaptureTest(unittest.TestCase):
         time.sleep(ptt.POLL_INTERVAL * 3)
         self.stick.press(1)
         self.assertTrue(self._wait(), "松开再按应该算数")
+
+    def test_a_hat_push_is_captured_with_its_direction(self):
+        # 没有这个，用户在"添加绑定"里按自己轭上的 PTT 什么都不会发生，
+        # 对话框一直停在"请按下…"，看起来像是这个界面坏了
+        capture = ptt.PttCapture(self.captured.append)
+        capture.start()
+        self.addCleanup(capture.stop)
+        time.sleep(0.05)
+        self.stick.push(0, "up")
+        self.assertTrue(self._wait(), "帽键没被录到")
+        self.assertEqual(self.captured[0],
+                         ptt.Binding(ptt.HAT, hat=0, direction="up", device=0))
+        self.assertEqual(self.captured[0].device_name, "Fake Yoke")
+
+    def test_a_hat_already_pushed_when_capture_starts_is_ignored(self):
+        # 起飞前一直推着的配平帽不该被录成 PTT
+        self.stick.push(0, "down")
+        capture = ptt.PttCapture(self.captured.append)
+        capture.start()
+        self.addCleanup(capture.stop)
+        self.assertFalse(self._wait(timeout=0.3))
+        self.stick.center(0)
+        time.sleep(ptt.POLL_INTERVAL * 3)
+        self.stick.push(0, "down")
+        self.assertTrue(self._wait(), "回中之后再推应该算数")
 
 
 class SharedCopyTest(unittest.TestCase):
