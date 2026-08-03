@@ -11,6 +11,14 @@ os.environ['PATH'] = _python_dir + os.pathsep + os.environ.get('PATH', '')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serverconf
 
+# 必须在 import pymumble 之前。pymumble 1.6.1 建 TLS 用的是 ssl.wrap_socket()，
+# 这个函数 Python 3.12 已经删除，而它的兜底分支调的是同一个函数——异常从
+# pymumble 自己的线程里抛出去，这边只看到"连接错误"，于是会去查密码，而 TLS
+# 握手根本没开始。四个客户端一直都调这一句，服务端这队通播机漏了：Debian 13
+# 和新一点的 Ubuntu 上 python 都 >= 3.12，装上就是连不上。
+import mumblecompat
+mumblecompat.install()
+
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
 import threading
