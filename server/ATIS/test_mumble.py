@@ -305,5 +305,23 @@ class RetireBroadcasterTest(unittest.TestCase):
         self.manager._retire("不存在的席位")
 
 
+class CompatPatchTest(unittest.TestCase):
+    """导入 mumble.py 就该把 pymumble 需要的两个补丁打上。
+
+    断言的是补丁真的生效了，不是"源码里有那一行"：漏掉它的症状是通播机在
+    Python 3.12+ 上一律"连接错误"，而排查方向会被带到密码和服务器上去。
+    """
+
+    def test_ssl_wrap_socket_is_available(self):
+        import ssl
+        self.assertTrue(hasattr(ssl, "wrap_socket"),
+                        "pymumble 建 TLS 就靠这个函数，3.12 起要自己补回来")
+
+    def test_the_send_path_is_guarded(self):
+        """发送缓冲满了不该被当成掉线——通播是持续在发音频的。"""
+        from pymumble_py3.mumble import Mumble
+        self.assertTrue(getattr(Mumble.connect, "_airwaysn_guarded", False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

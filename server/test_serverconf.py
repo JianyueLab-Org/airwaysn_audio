@@ -71,16 +71,21 @@ class NoHardcodedSecretTest(EnvGuard):
 
         这些字面量在这个文件里也是拼出来的——写全了的话，这条测试自己就会
         变成它要抓的东西。
+
+        扫的不只是 .py：部署文件才是口令最容易回来的地方，写进 Dockerfile 的
+        口令还会永远留在镜像层和 docker history 里。
         """
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         markers = ("yoyo" + "14185721", "p@" + "ssw0rd")
         skip = {".git", ".venv-test", "__pycache__", "build", "dist", "release"}
+        suffixes = (".py", ".sh", ".yml", ".yaml", ".ini", ".env", ".ps1")
+        names = {"Dockerfile", ".dockerignore"}
         offenders = []
         for root, dirs, files in os.walk(repo):
             dirs[:] = [d for d in dirs
                        if d not in skip and not d.startswith(".venv")]
             for name in files:
-                if not name.endswith(".py"):
+                if not name.endswith(suffixes) and name not in names:
                     continue
                 path = os.path.join(root, name)
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
