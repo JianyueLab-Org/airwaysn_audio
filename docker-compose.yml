@@ -1,0 +1,80 @@
+# 服务端部署：mumble-server + Ice 认证器（server/login.py）。
+#
+#   cp .env.example .env && 改里面的密码
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose exec mumble python3 fix_acl.py --apply    # 头一次要跑
+#
+# 升级：docker compose pull && docker compose up -d
+# 镜像由 .github/workflows/server-image.yml 推到 GHCR。包是私有的话，服务器上
+# 先 docker login ghcr.io（用户名是 GitHub 账号，密码用一个有 read:packages
+# 的 PAT）；或者把这个包在 GitHub 上改成 public。
+#
+# 本地改了代码想直接试：docker compose up -d --build
+
+services:
+  mumble:
+    image: ${SERVER_IMAGE:-ghcr.io/jianyuelab-org/airwaysn_audio-server:latest}
+    # 只有 docker compose up -d --build 时才用得上；平时是拉镜像。
+    build:
+      context: .
+    # 写了 build: 之后，本地没有这个镜像时 compose 默认会**自己构建**而不是拉。
+    # 服务器上那等于要有完整仓库、还要慢慢 apt 一遍——而且悄无声息，你以为
+    # 部的是 CI 出的那个镜像。always 把它拧回"拉"，--build 仍然可以显式压过。
+    pull_policy: always
+    container_name: airwaysn-server
+    # login.py 察觉和 Murmur 的链路断了会主动退出，start.sh 跟着整个退出，
+    # 全靠这一行把它拉起来重新注册认证器。见 server/start.sh 开头的说明。
+    restart: unless-stopped
+    ports:
+      # 语音要 TCP 和 UDP 两个：控制通道走 TCP，语音本身走 UDP（连不通时
+      # 客户端会退回 TCP 隧道，表现是延迟变大而不是没声音）
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+      # Ice 的 6502 故意不映出来：认证器和服务端在同一个容器里，回环就够了，
+      # 映出去等于把只靠一个口令保护的管理接口摆到公网上。fix_acl.py /
+      # whereami.py 都用 docker compose exec 从里面跑。
+    environment:
+      # 不设就不动数据库里已有的那个。第一次部署建议设一次，之后可以删掉——
+      # 密码在挂出来的 sqlite 里，不在镜像里。
+      MUMBLE_SUPERUSER_PASSWORD: ${MUMBLE_SUPERUSER_PASSWORD:-}
+      # 不设的话 start.sh 每次启动随机生成一个写进 ini，login.py 自己会去读
+      # （serverconf.py 的第 3 顺位）。想固定下来再设。
+      MUMBLE_ICE_SECRET: ${MUMBLE_ICE_SECRET:-}
+    volumes:
+      # **必须挂。** SuperUser 密码、注册用户，以及 fix_acl.py 授的
+      # Listen / MakeTempChannel 权限全在这个 sqlite 里。丢了的症状是管制端
+      # 除主频道外全是静音，看不出和换容器有关。
+      - mumble-db:/var/lib/mumble-server
+    # HEALTHCHECK 在镜像里，这里不重复定义
+
+  # 服务端通播机队。默认不启动：docker compose --profile atis up -d
+  #
+  # 用的是另一个镜像（WITH_ATIS=1 才装 pymumble / numpy / edge-tts / ffmpeg /
+  # libopus0），只能本地构建，GHCR 上那个不带这些。
+  #
+  # 它连的是公网上的 hjdczy.top（mumble.py 里写死的），不是上面那个容器，
+  # 所以两者没有启动顺序关系。
+  atis:
+    profiles: [atis]
+    build:
+      context: .
+      args:
+        WITH_ATIS: "1"
+    image: airwaysn-atis-bots:local
+    container_name: airwaysn-atis
+    restart: unless-stopped
+    working_dir: /app/server/ATIS
+    command: ["python3", "-u", "mumble.py"]
+    environment:
+      # 保留账号。login.py 里的旁路已经去掉了，这个 cid 得在 can-web 那边
+      # 真实存在，否则上游接口不认它。
+      ATIS_CID: ${ATIS_CID:-900}
+      # 缺了 mumble.py 自己会拒绝启动并说清楚（serverconf.atis_password
+      # (required=True)）。这里刻意不用 ${VAR:?} 强制：compose 的变量展开是
+      # 对**整份文件**做的，profile 没启用也照样展开，那样一来没配 ATIS 口令
+      # 的机器连普通的 docker compose up -d 都起不来。
+      ATIS_PASSWORD: ${ATIS_PASSWORD:-}
+
+volumes:
+  mumble-db:
