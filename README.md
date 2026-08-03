@@ -127,7 +127,23 @@ unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py`
 
 ### Docker
 
-仓库根目录有一份 `Dockerfile`，跑的是 mumble-server + `login.py`：
+镜像由 CI 构建并推到 GHCR（`.github/workflows/server-image.yml`，只在改
+`server/` 或 `Dockerfile` 时触发），服务器上用 compose 部署：
+
+```bash
+cp .env.example .env      # 改里面的密码；全都可以留空
+docker compose up -d
+docker compose logs -f
+docker compose exec mumble python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
+
+docker compose pull && docker compose up -d             # 升级
+```
+
+包是私有的话，服务器上先 `docker login ghcr.io`（密码用一个带 `read:packages`
+的 PAT），或者把这个包在 GitHub 上改成 public。想回滚就在 `.env` 里把
+`SERVER_IMAGE` 指到某个 `sha-xxxxxxx` 标签——每次构建都会推一个。
+
+本地不用 compose 也行：
 
 ```bash
 docker build -t airwaysn-audio-server .
@@ -136,10 +152,12 @@ docker run -d --name airwaysn-server --restart unless-stopped \
   -v airwaysn-mumble:/var/lib/mumble-server \
   -e MUMBLE_SUPERUSER_PASSWORD=换成你自己的 \
   airwaysn-audio-server
-
-docker logs -f airwaysn-server
-docker exec airwaysn-server python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
 ```
+
+**CI 里那步冒烟不是走过场**：这个镜像的失败模式全是"构建成功、运行时才发现"
+（漏了 `serverconf.py`、`start.sh` 没有执行位、ini 或 slice 路径探错），在
+`docker build` 的输出里一律是绿色的。所以构建完会真的把容器跑起来，等它自己的
+HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和「服务器回调已注册」。
 
 四条别绕过去的：
 
@@ -155,9 +173,15 @@ docker exec airwaysn-server python3 fix_acl.py --apply   # 头一次要跑，见
 - **基础镜像钉死版本**，因为 Listen 权限是 Mumble 1.4 才有的，构建时会校验
   `mumble-server >= 1.4` 并当场失败。
 
-通播机队默认不装依赖（numpy + ffmpeg 太大，而且不在 `CMD` 里）：要跑就
-`docker build --build-arg WITH_ATIS=1 .`，再 `docker exec -w /app/server/ATIS
-airwaysn-server python3 mumble.py`。
+通播机队默认不装依赖（numpy + ffmpeg 太大，而且不在 `CMD` 里），GHCR 上那个
+镜像也不带。要跑它用 compose 的 `atis` profile，那是本地构建的：
+
+```bash
+docker compose --profile atis up -d --build
+```
+
+`.env` 里要有 `ATIS_PASSWORD`。注意 `login.py` 里的保留账号旁路已经去掉了，
+那个 cid（默认 900）得在 can-web 那边真实存在。
 
 `login.py` 是 Ice 认证器：网络没有本地账号，登录一律转给 can-web 的
 `/api/v1/public/auth` 校验。它没跑起来的话，谁都连不上语音。Ice 绑定要在主机上

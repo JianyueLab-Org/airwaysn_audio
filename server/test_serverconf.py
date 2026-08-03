@@ -78,14 +78,16 @@ class NoHardcodedSecretTest(EnvGuard):
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         markers = ("yoyo" + "14185721", "p@" + "ssw0rd")
         skip = {".git", ".venv-test", "__pycache__", "build", "dist", "release"}
-        suffixes = (".py", ".sh", ".yml", ".yaml", ".ini", ".env", ".ps1")
+        suffixes = (".py", ".sh", ".yml", ".yaml", ".ini", ".ps1")
         names = {"Dockerfile", ".dockerignore"}
         offenders = []
         for root, dirs, files in os.walk(repo):
             dirs[:] = [d for d in dirs
                        if d not in skip and not d.startswith(".venv")]
             for name in files:
-                if not name.endswith(suffixes) and name not in names:
+                # .env / .env.example 都要扫：compose 的口令就住在那里
+                if not (name.endswith(suffixes) or name.startswith(".env")
+                        or name in names):
                     continue
                 path = os.path.join(root, name)
                 with open(path, "r", encoding="utf-8", errors="replace") as f:

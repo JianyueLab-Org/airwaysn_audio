@@ -45,7 +45,8 @@ ARG WITH_ATIS=0
 #   python3-zeroc-ice / zeroc-ice-*  —— login.py 的 Ice 绑定和 slice2py
 #   python3-requests                 —— 走 apt 而不是 pip，省掉 --break-system-packages
 #   tzdata                           —— 不装的话上面那个 TZ 是空设，日志还是 UTC
-#   netcat-openbsd                   —— start.sh 等 Ice 端口
+#   procps                           —— HEALTHCHECK 里的 pgrep
+# 等端口用的是 bash 自带的 /dev/tcp，所以不需要 nc。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     mumble-server \
     python3 \
@@ -55,7 +56,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zeroc-ice-slice \
     ca-certificates \
     tzdata \
-    netcat-openbsd \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
@@ -77,11 +77,14 @@ RUN if [ "$WITH_ATIS" = "1" ]; then \
 # /etc/mumble-server.ini；slice 文件的位置和名字也随版本变（1.5 起 Murmur.ice
 # 改名 MumbleServer.ice，login.py 两个都 import 得了，先 MumbleServer 后
 # Murmur）。写死的话换一个基础镜像就是构建成功、运行时才莫名其妙。
+# 版本从 dpkg 拿而不是 mumble-server -version：murmur 对不认识的参数打的是
+# usage，从那里 grep 数字什么都可能抓到。注意 dpkg 版本可能带 epoch（1:1.5.735）
+# 和 debian 后缀（-2build1），grep 只取中间的语义版本。
 RUN set -eu; \
     mkdir -p /etc/airwaysn /app/server; \
-    ver="$(mumble-server -version 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"; \
+    ver="$(dpkg-query -W -f '${Version}' mumble-server 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"; \
     if [ -z "$ver" ]; then \
-        echo "读不出 mumble-server 的版本号，跳过版本校验" >&2; \
+        echo "读不出 mumble-server 的版本号（不是 dpkg 装的？），跳过版本校验" >&2; \
     else \
         major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"; \
         if [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt 4 ]; }; then \
@@ -145,9 +148,11 @@ VOLUME /var/lib/mumble-server
 EXPOSE 64738/tcp
 EXPOSE 64738/udp
 
-# 认证器死了但容器还活着，是最难发现的故障：语音端口照常应答，所有人却都登不上
+# 认证器死了但容器还活着，是最难发现的故障：语音端口照常应答，所有人却都登不上。
+# pgrep 的模式必须写成 [l]ogin —— 健康检查自己的 sh -c 命令行里就带着这串字，
+# 直接写 login.py 会匹配到自己，于是 login.py 死没死它都报健康。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD nc -z 127.0.0.1 64738 && pgrep -f "login.py" > /dev/null || exit 1
+    CMD bash -c '(exec 3<>/dev/tcp/127.0.0.1/64738) 2>/dev/null && pgrep -f "[l]ogin\.py" > /dev/null'
 
 # 启动
 CMD ["./start.sh"]

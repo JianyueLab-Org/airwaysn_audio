@@ -13,6 +13,7 @@ commands"）。命令一旦没被服务器处理，调用线程就永久卡死�
 它在播。
 """
 
+import os
 import sys
 import threading
 import time
@@ -321,6 +322,23 @@ class CompatPatchTest(unittest.TestCase):
         """发送缓冲满了不该被当成掉线——通播是持续在发音频的。"""
         from pymumble_py3.mumble import Mumble
         self.assertTrue(getattr(Mumble.connect, "_airwaysn_guarded", False))
+
+    def test_the_copy_matches_the_clients(self):
+        """mumblecompat.py 必须和客户端那份逐字节相同。
+
+        这个仓库靠复制共享（msfs 对 xpc 也是这么钉的），漂移了就意味着某个
+        补丁只修了一边。
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        theirs = os.path.join(here, "..", "..", "xpc", "mumblecompat.py")
+        if not os.path.exists(theirs):
+            self.skipTest("不在完整仓库里（比如容器里只带了 server/）")
+        with open(os.path.join(here, "mumblecompat.py"), "rb") as f:
+            ours = f.read()
+        with open(theirs, "rb") as f:
+            reference = f.read()
+        self.assertEqual(ours, reference,
+                         "server/ATIS 和 xpc 的 mumblecompat.py 不一致了")
 
 
 if __name__ == "__main__":

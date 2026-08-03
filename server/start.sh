@@ -38,14 +38,24 @@ MUMBLE_INI="${MUMBLE_INI:-/etc/mumble/mumble-server.ini}"
 
 mumble_pid=""
 login_pid=""
+stopping=0
 
 shutdown() {
-    trap - TERM INT
+    trap - TERM INT EXIT
     [ -n "$login_pid" ] && kill "$login_pid" 2>/dev/null || true
     [ -n "$mumble_pid" ] && kill "$mumble_pid" 2>/dev/null || true
     wait 2>/dev/null || true
 }
-trap shutdown TERM INT
+
+on_signal() {
+    stopping=1
+    shutdown
+}
+# EXIT 也要挂：set -e 中途退出（比如 wait_for_ice 超时）不走 TERM 的 trap，
+# 不挂的话已经起来的 mumble-server 就被留在后台了——容器里 PID 1 一死会连坐
+# 收掉，裸机上那就是个孤儿进程，还占着 64738。
+trap on_signal TERM INT
+trap shutdown EXIT
 
 # Ice 口令：环境变量优先，其次沿用 ini 里已有的，都没有就随机生成一个。
 #
@@ -63,6 +73,10 @@ ensure_ice_secret() {
     fi
     # 先删后加，不用 sed 替换：口令里可能有 sed 的分隔符或 & ，替换会被吃掉
     sed -i '/^#\?icesecretwrite=/d' "$MUMBLE_INI"
+    # ini 末行缺换行的话，>> 会把口令直接粘到那一行后面
+    if [ -s "$MUMBLE_INI" ] && [ -n "$(tail -c 1 "$MUMBLE_INI")" ]; then
+        echo >> "$MUMBLE_INI"
+    fi
     printf 'icesecretwrite=%s\n' "$secret" >> "$MUMBLE_INI"
 }
 
@@ -75,15 +89,20 @@ set_superuser_password() {
     # 上面这条是用 root 跑的，别把数据库的属主留成 root——服务端会 setuid 到
     # mumble-server（ini 里的 uname=），然后打不开自己的库
     if id -u mumble-server > /dev/null 2>&1; then
-        chown -R mumble-server:mumble-server /var/lib/mumble-server 2>/dev/null || true
+        chown -R mumble-server: /var/lib/mumble-server 2>/dev/null || true
     fi
+}
+
+# 回环上的端口探测用 bash 自带的 /dev/tcp，连不上立刻失败，不依赖镜像里有 nc
+ice_open() {
+    (exec 3<>"/dev/tcp/127.0.0.1/${ICE_PORT}") 2>/dev/null
 }
 
 # login.py 连的是 Meta:tcp -h 127.0.0.1 -p 6502，端口没开就直接"无法连接到
 # Mumble 服务器"退出。固定 sleep 赌不起，轮询。
 wait_for_ice() {
     local waited=0
-    while ! nc -z 127.0.0.1 "$ICE_PORT" 2>/dev/null; do
+    while ! ice_open; do
         if [ -n "$mumble_pid" ] && ! kill -0 "$mumble_pid" 2>/dev/null; then
             echo "mumble-server 没起来（Ice 端口 $ICE_PORT 一直没开）" >&2
             return 1
@@ -117,11 +136,16 @@ wait -n
 code=$?
 set -e
 
-if [ -n "$mumble_pid" ] && ! kill -0 "$mumble_pid" 2>/dev/null; then
-    echo "mumble-server 退出了（$code），整个停下来" >&2
+# docker stop 发的 TERM 也会把 wait -n 打断（返回 143），别把正常停机说成
+# 是哪个进程出了事。
+# 中文标点紧跟在变量后面时必须写 ${code}：bash 5.3 起会把多字节字符也当成
+# 变量名的一部分，$code）读成一个不存在的变量，set -u 之下当场退出。
+if [ "$stopping" -eq 1 ]; then
+    echo "收到停止信号，退出"
+elif [ -n "$mumble_pid" ] && ! kill -0 "$mumble_pid" 2>/dev/null; then
+    echo "mumble-server 退出了（${code}），整个停下来" >&2
 else
-    echo "login.py 退出了（$code）——认证器不在的话谁都登录不上，整个停下来" >&2
+    echo "login.py 退出了（${code}）——认证器不在的话谁都登录不上，整个停下来" >&2
 fi
 
-shutdown
 exit "$code"
