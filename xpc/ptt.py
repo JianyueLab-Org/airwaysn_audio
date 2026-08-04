@@ -51,6 +51,9 @@ KINDS = (KEYBOARD, MOUSE, JOYSTICK)
 # 能绑的鼠标键。左/中/右不在这里，理由见模块开头。
 MOUSE_BUTTONS = ("x1", "x2")
 
+# 第一个把 SDL 初始化起来的线程。它必须和进程同寿，理由见 prime_joystick()。
+_sdl_thread = None
+
 
 def key_name(key):
     """把 pynput 的按键对象规范成一个字符串。
@@ -235,6 +238,30 @@ def available_joysticks():
         return []
 
 
+def prime_joystick():
+    """在调用方的线程上把 SDL 的摇杆子系统起起来。**只能在界面线程上调**。
+
+    SDL 在 `SDL_Init(SDL_INIT_JOYSTICK)` 里给 DirectInput 建一个隐藏的辅助窗口
+    （`SDL.c` → `SDL_HelperWindowCreate()`），之后每开一个摇杆都拿这个窗口去调
+    `IDirectInputDevice8::SetCooperativeLevel`。两件事凑到一起就成了陷阱：
+
+    - Win32 的窗口属于建它的那个线程，**线程一退出，它建的窗口全被销毁**；
+    - SDL 这个窗口只建一次——`SDL_HelperWindow != NULL` 就直接返回，在 SDL_Quit
+      之前再也不重建。
+
+    所以"哪个线程第一个碰 pygame"是个不可逆的决定。要是让录制线程或者轮询线程
+    第一个碰，它自己那一轮是好的，线程一退 SDL_HelperWindow 就成了野句柄，此后
+    每一次开摇杆都在 `IDirectInputDevice8::SetCooperativeLevel() DirectX error
+    0x80070006`（E_HANDLE，无效窗口句柄）上失败，**重启客户端之前都好不了**。
+    真实日志里就是这个样子：第一次录制成功录到摇杆按钮，两秒后再录就打不开，
+    之后监听线程每 3 秒一条 could not open joystick 0，一直到退出。
+
+    界面线程和进程同寿，所以初始化必须落在它身上。跟 SDL_VIDEODRIVER 无关——
+    这个窗口是摇杆子系统建的，dummy 视频后端照样有。
+    """
+    _import_pygame()
+
+
 def _import_pygame():
     """惰性导入 pygame，失败返回 None。
 
@@ -246,6 +273,7 @@ def _import_pygame():
     抢音频。用 setdefault 而不是直接赋值：gui.py 在更早的地方已经设过一次，
     这里只是保证"就算调用方忘了，也不会错"。
     """
+    global _sdl_thread
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     try:
@@ -261,6 +289,14 @@ def _import_pygame():
     except Exception as e:
         log.warning("could not initialise pygame: %s", e)
         return None
+    if _sdl_thread is None:
+        # 记下来是为了让"错的线程先碰了 SDL"在日志里有一行，而不是过两分钟以
+        # E_HANDLE 的样子出现在别处。理由见 prime_joystick()。
+        _sdl_thread = threading.current_thread()
+        if _sdl_thread is not threading.main_thread():
+            log.warning("SDL came up on %s instead of the main thread; the "
+                        "DirectInput helper window dies with that thread and "
+                        "joysticks will stop opening", _sdl_thread.name)
     return pygame
 
 
@@ -300,6 +336,9 @@ class PttWatcher:
         self._keyboard_listener = None
         self._mouse_listener = None
         self._joystick_thread = None
+        # 已经报过一次"打不开"的设备。重试是每 JOYSTICK_RETRY 一次、不会停的，
+        # 所以同一个设备只在第一次落 WARNING。
+        self._open_failed = set()
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -484,6 +523,10 @@ class PttWatcher:
     def _start_joystick(self):
         if self._joystick_thread is not None:
             return
+        # SDL 要在这里起来，不能等轮询线程自己去 import：这个线程会随着 stop()
+        # 退出，而 SDL 的 DirectInput 辅助窗口跟着建它的线程走。见 prime_joystick()。
+        prime_joystick()
+        self._open_failed.clear()
         thread = threading.Thread(target=self._joystick_loop,
                                   name="ptt-joystick", daemon=True)
         self._joystick_thread = thread
@@ -558,8 +601,7 @@ class PttWatcher:
             self._down[JOYSTICK].clear()
         self._recompute()
 
-    @staticmethod
-    def _open_stick(pygame, index):
+    def _open_stick(self, pygame, index):
         try:
             if index >= pygame.joystick.get_count():
                 return None
@@ -567,9 +609,17 @@ class PttWatcher:
             stick.init()
             log.info("joystick %d opened: %s (%d buttons)",
                      index, stick.get_name(), stick.get_numbuttons())
+            self._open_failed.discard(index)
             return stick
         except Exception as e:
-            log.warning("could not open joystick %d: %s", index, e)
+            # 打不开通常是个稳定状态（设备被别的程序独占、SDL 那边坏了），而重试
+            # 是每 JOYSTICK_RETRY 一次一直不停的。第一次报出来，之后同一个设备落
+            # 到 DEBUG——不然一晚上的日志里全是同一行，别的东西全被顶出去了。
+            if index in self._open_failed:
+                log.debug("joystick %d still will not open: %s", index, e)
+            else:
+                self._open_failed.add(index)
+                log.warning("could not open joystick %d: %s", index, e)
             return None
 
     @staticmethod
@@ -626,6 +676,9 @@ class PttCapture:
             except Exception as e:
                 log.warning("could not listen for a PTT mouse button: %s", e)
         if self._joystick:
+            # 录制线程录完就退，绝不能让它第一个碰 SDL。见 prime_joystick()——
+            # 那样第一次录制是好的，之后所有摇杆都再也打不开了。
+            prime_joystick()
             self._thread = threading.Thread(target=self._joystick_loop,
                                             name="ptt-capture", daemon=True)
             self._thread.start()
@@ -665,13 +718,15 @@ class PttCapture:
         if pygame is None:
             return
         sticks = []
-        try:
-            for index in range(pygame.joystick.get_count()):
+        # 一个设备打不开不该把别的也一起丢掉——常见的是有一个摇杆被模拟器独占着，
+        # 而用户想录的按钮在另一个上面。所以 try 在循环里面。
+        for index in range(pygame.joystick.get_count()):
+            try:
                 stick = pygame.joystick.Joystick(index)
                 stick.init()
                 sticks.append((index, stick))
-        except Exception as e:
-            log.warning("could not open the joysticks for capture: %s", e)
+            except Exception as e:
+                log.warning("could not open joystick %d for capture: %s", index, e)
         if not sticks:
             return
         held = set()
