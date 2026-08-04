@@ -73,11 +73,26 @@ ensure_ice_secret() {
     fi
     # 先删后加，不用 sed 替换：口令里可能有 sed 的分隔符或 & ，替换会被吃掉
     sed -i '/^#\?icesecretwrite=/d' "$MUMBLE_INI"
-    # ini 末行缺换行的话，>> 会把口令直接粘到那一行后面
-    if [ -s "$MUMBLE_INI" ] && [ -n "$(tail -c 1 "$MUMBLE_INI")" ]; then
-        echo >> "$MUMBLE_INI"
-    fi
-    printf 'icesecretwrite=%s\n' "$secret" >> "$MUMBLE_INI"
+    # 空的 icesecretread 是"拒绝一切读"，不是"不设口令"——官方文档写得很明白：
+    # 取消注释但留空就是拒绝访问，要关掉得整行注释掉。留着它 login.py 连
+    # getServer 都拿不到。只删空的：非空的是运维自己设的，不能动。
+    sed -i '/^icesecretread=[[:space:]]*$/d' "$MUMBLE_INI"
+    # **插到第 1 行，不是追加到末尾。** 和 Dockerfile 里写 ice= 是同一个道理：
+    # Murmur 用 QSettings 读 ini，key 归属它上面最近的那个 [section]，追加到
+    # 文件末尾就落进了最后一个节里，Murmur 读不到、也不报错——Ice 会以"没设
+    # 口令"启动，也就是谁连上 6502 谁就是管理员。
+    #
+    # 口令走 ENVIRON 而不是 awk -v：-v 的值会被 awk 当转义序列展开，口令里
+    # 一个反斜杠就能让写进文件的和 login.py 读出来的不是同一个东西（\t 变成
+    # 制表符）。随机生成的那个是纯字母数字碰不到，但 MUMBLE_ICE_SECRET 是人
+    # 填的。sed 的 1i 有同样的毛病，所以两处都不用它。
+    ICE_SECRET_LINE="icesecretwrite=$secret" awk \
+        'BEGIN { print ENVIRON["ICE_SECRET_LINE"] } { print }' \
+        "$MUMBLE_INI" > "$MUMBLE_INI.new"
+    # 原地换内容而不是 mv：mv 会换掉 inode 和属主/权限，而这个文件 Debian 是
+    # 按 640 root:mumble-server 装的
+    cat "$MUMBLE_INI.new" > "$MUMBLE_INI"
+    rm -f "$MUMBLE_INI.new"
 }
 
 # SuperUser 密码只从环境变量来，不给就不动。必须在服务端起来之前设：

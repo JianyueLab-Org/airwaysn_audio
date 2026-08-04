@@ -119,6 +119,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Ice 现场（冒烟挂了就看这一段）
+        # 冒烟失败时最想知道的三件事，而容器一退就问不到了（start.sh 等不到
+        # Ice 会整个退出），所以在冒烟之前单独跑几个一次性容器取出来。
+        #
+        # 排过一次的经历：Murmur 起来了、64738 在听、日志里关于 Ice 一个字都
+        # 没有、6502 从没开过。三件事各自排除一种可能——没链接 Ice 库（那是
+        # 包的问题）、ini 里没有 ice=（那是构建的问题）、ice= 落在某个
+        # [section] 底下（那是 QSettings 分节，Murmur 读不到且不报错）。
+        run: |
+          echo "::group::mumble-server 链接了哪些 Ice 库"
+          docker run --rm --entrypoint sh ${{ env.CI_TAG }} -c \
+            'ldd /usr/bin/mumble-server | grep -i ice || echo "(一个 Ice 库都没链接——这个包没编 Ice)"'
+          echo "::endgroup::"
+
+          echo "::group::ini 里的节，以及 Ice 相关的行"
+          docker run --rm --entrypoint sh ${{ env.CI_TAG }} -c \
+            '. /etc/airwaysn/paths.env; echo "ini=$MUMBLE_INI"; grep -nE "^\[|^#?ice" "$MUMBLE_INI" || echo "(一行都没有)"'
+          echo "::endgroup::"
+
       - name: 冒烟：容器真的能起来并且认证器注册上了
         run: |
           set -euo pipefail

@@ -113,19 +113,25 @@ RUN set -eu; \
 
 # 改 ini：Ice 只听回环，日志走 stdout（logfile 留空 Murmur 就往控制台打，否则
 # 日志进文件、docker logs 是空的）。口令不在这里写，见文件开头第 2 条。
+#
+# **写到文件最前面，不在原地改。** Murmur 用 QSettings 读这个 ini，而
+# QSettings 的 ini 是**分节**的：一个 key 归属它上面最近的那个 [section]，
+# 顶层的 ice 和某个节里的 ice 是两个不同的东西。原来是就地把注释掉的示例
+# 那一行取消注释——只要那一行落在任何一个 [section] 底下，Murmur 就读不到
+# 它，而且**一声不吭**：日志里连一行 Ice 都没有，6502 不开，看起来完全像
+# 这个包没编进 Ice（它编了，mumble-server 依赖 libzeroc-ice3.7t64）。
+# 症状是 start.sh 等 30 秒超时、login.py 根本没起来、健康检查永远 unhealthy。
+# 先把所有 ice= 行删干净（重复的 key QSettings 取最后一个），再插到第 1 行，
+# 那里一定在任何节之前。
 RUN set -eu; \
     . /etc/airwaysn/paths.env; \
-    if grep -qE '^#?ice=' "$MUMBLE_INI"; then \
-        sed -i 's|^#\?ice=.*|ice="tcp -h 127.0.0.1 -p 6502"|' "$MUMBLE_INI"; \
-    else \
-        echo 'ice="tcp -h 127.0.0.1 -p 6502"' >> "$MUMBLE_INI"; \
-    fi; \
-    if grep -qE '^#?logfile=' "$MUMBLE_INI"; then \
-        sed -i 's|^#\?logfile=.*|logfile=|' "$MUMBLE_INI"; \
-    else \
-        echo 'logfile=' >> "$MUMBLE_INI"; \
-    fi; \
-    grep -E '^(ice|logfile|database|uname)=' "$MUMBLE_INI" || true
+    sed -i '/^#\?ice=/d; /^#\?logfile=/d' "$MUMBLE_INI"; \
+    awk 'BEGIN { print "ice=\"tcp -h 127.0.0.1 -p 6502\""; print "logfile=" } { print }' \
+        "$MUMBLE_INI" > "$MUMBLE_INI.new"; \
+    cat "$MUMBLE_INI.new" > "$MUMBLE_INI"; \
+    rm -f "$MUMBLE_INI.new"; \
+    echo "ini 里的节和 Ice 相关行："; \
+    grep -nE '^\[|^#?ice|^(logfile|database|uname)=' "$MUMBLE_INI" || true
 
 # 复制服务端代码。
 #   serverconf.py —— login.py 直接 import，漏了容器起不来

@@ -54,7 +54,17 @@ def from_file(key, path=None):
 def from_ini(path=None, keys=_ICE_INI_KEYS):
     """从 mumble-server.ini 里读 Ice 口令。
 
-    这个文件没有 section 头，configparser 直接读会报错，所以按行扫。
+    按行扫而不是用 configparser：这个文件通常没有 section 头，configparser
+    直接读会报错。
+
+    **注意这和 Murmur 自己的读法不一样，而这个差别咬过人。** Murmur 用
+    QSettings，那是**分节**的——key 归属它上面最近的那个 `[section]`，落在节
+    里的 `ice` / `icesecretwrite` 它一概读不到，且不报错。这里是平扫，不管节，
+    所以同一个文件我们读得到、Murmur 读不到。两边不一致的后果不是登录失败，
+    而是**静悄悄地没有口令**：Murmur 以"没设口令"启动 Ice，谁连上 6502 谁就
+    是管理员，而 login.py 这边照样读出一个口令、连接也照常成功，完全看不出
+    异常。写这个文件的地方（server/start.sh、Dockerfile）因此一律把 key 插到
+    第 1 行，保证在任何节之前。
     """
     path = path or DEFAULT_INI
     try:
