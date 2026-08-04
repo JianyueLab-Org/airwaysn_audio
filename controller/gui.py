@@ -47,7 +47,7 @@ from voice import VoiceClient
 
 log = logging.getLogger("gui")
 
-SERVER = "hjdczy.top"
+SERVER = "audio.airwaysn.org"
 
 # 数据源多久查一次：上了席位之后自动把频率捡回来，同时刷新 CID→呼号 对照表。
 # 席位不会秒变，60 秒足够及时，也不至于把数据源打太狠。

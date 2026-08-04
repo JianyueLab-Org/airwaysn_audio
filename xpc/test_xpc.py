@@ -1460,6 +1460,41 @@ class ChannelNameTest(unittest.TestCase):
         self.assertEqual(voice.channel_name(132.005), "FREQ_132005")
 
 
+class VoiceHostTest(unittest.TestCase):
+    """语音服务器换域名之后，老配置里存的那个旧域名必须换掉。
+
+    mumble_host 是写进 xpc_settings.json 的，所以只改 DEFAULTS 只对全新安装
+    有效。旧域名停掉那天，老用户看到的是"连不上语音服务器"，而设置界面上那
+    一行看着完全正常——没有任何线索指向配置文件。
+    """
+
+    def setUp(self):
+        import settings as settings_module
+        self.module = settings_module
+        self.temp = tempfile.mkdtemp(prefix="xpc_settings_")
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.path = os.path.join(self.temp, "xpc_settings.json")
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_default_voice_host(self):
+        self.assertEqual(self.module.MUMBLE_HOST, "audio.airwaysn.org")
+        self.assertEqual(self.module.Settings(self.path).mumble_host,
+                         "audio.airwaysn.org")
+
+    def test_migrates_the_old_domain(self):
+        self.write({"mumble_host": "hjdczy.top"})
+        self.assertEqual(self.module.Settings(self.path).mumble_host,
+                         "audio.airwaysn.org")
+
+    def test_keeps_a_deliberate_override(self):
+        # 自己指了别的服务器（测试服、局域网）是有意为之，不能替他改掉
+        self.write({"mumble_host": "127.0.0.1"})
+        self.assertEqual(self.module.Settings(self.path).mumble_host, "127.0.0.1")
+
+
 class XPlaneParsingTest(unittest.TestCase):
     """RREF 回包的解析和单位换算。"""
 

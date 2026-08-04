@@ -21,6 +21,8 @@ mumblecompat.install()
 
 import pymumble_py3 as pymumble
 from pymumble_py3 import messages
+from pymumble_py3.constants import (PYMUMBLE_CONN_STATE_CONNECTED,
+                                    PYMUMBLE_CONN_STATE_FAILED)
 import threading
 import numpy as np
 import time
@@ -37,6 +39,11 @@ CHANNEL_TIMEOUT = 5.0
 
 # 收一条通播线程最多等多久。裸的 join() 会让一个卡住的席位把整队拖死。
 JOIN_TIMEOUT = 10.0
+
+# 等服务器认下这次登录最多等多久。原来是固定 sleep(1) 就直接去进频道：网慢
+# 的时候一秒还没认完，会把好连接误判成失败；而登录被拒时一秒又白等——两头
+# 都不合适，改成轮询。
+CONNECT_TIMEOUT = 10.0
 
 class ATISBroadcaster(threading.Thread):
     def __init__(self, atis_id, frequency, atis_text):
@@ -74,15 +81,60 @@ class ATISBroadcaster(threading.Thread):
                 print("跳过创建频道 FREQ_199998")
                 return False
                 
-            self.mumble = pymumble.Mumble("hjdczy.top", self.user, password=self.password, reconnect=True)
+            self.mumble = pymumble.Mumble("audio.airwaysn.org", self.user, password=self.password, reconnect=True)
             self.mumble.set_receive_sound(True)
             self.mumble.start()
-            time.sleep(1)  # 等待连接建立
+
+            if not self._wait_until_connected():
+                self._report_login_failure()
+                return False
 
             return self._join_channel()
         except Exception as e:
             print(f"连接错误: {e}")
             return False
+
+    def _wait_until_connected(self, timeout=CONNECT_TIMEOUT):
+        """等服务器把这次登录认下来，认下来才算连上。
+
+        **start() 返回不代表连上了。** Mumble 是 threading.Thread 的子类，
+        start() 拉起它自己的线程就回来了；登录被拒时 ConnectionRejectedError
+        死在那条线程里，这边什么都收不到。原来紧接着 sleep(1) 就去进频道，于是
+        一个被拒的登录表现成"频道 FREQ_xxxxxx 不存在"或者"进频道请求没有生效"
+        ——排查方向被带到权限和 ACL 上，而问题在账号。
+
+        reconnect=True 时状态多半停在 AUTHENTICATING 反复重试，不会落到
+        FAILED，所以超时也算失败。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            state = getattr(self.mumble, "connected", None)
+            if state == PYMUMBLE_CONN_STATE_CONNECTED:
+                return True
+            if state == PYMUMBLE_CONN_STATE_FAILED:
+                return False
+            time.sleep(0.1)
+        return False
+
+    def _report_login_failure(self):
+        """说清楚为什么登不上，别让人去查频道和权限。
+
+        这队机器人用的保留账号（默认 900）**没有免验证的旁路**——login.py 里
+        那条旁路已经删掉了，`test_there_is_no_shortcut_for_any_account` 钉着它
+        不许加回来。也就是说 `{ATIS_CID}` 这个 cid 得在 can-web 那边真实存在、
+        密码就是它的网站密码、而且 rating >= 1（那个接口拒绝未评级会员）。
+
+        三个条件缺任何一个，现象都一模一样：登录被拒。所以这里把三个条件一起
+        列出来，而不是只说一句"连接错误"。
+        """
+        account = serverconf.atis_account()
+        print(f"账号 {self.user} 没能登上语音服务器（{CONNECT_TIMEOUT:.0f} 秒内没有认下来）。"
+              f"\n  这队机器人没有免验证通道，cid={account} 是拿去 can-web 的"
+              f" /api/v1/public/auth 验的，和普通用户走同一条路。三件事都要成立："
+              f"\n    1. can-web 那边确实有 cid={account} 这个账号"
+              f"\n    2. ATIS_PASSWORD 就是它的网站密码"
+              f"\n    3. 它的 rating >= 1（未评级的会员那个接口一律拒绝）"
+              f"\n  换账号改环境变量 ATIS_CID，不要去改 login.py。")
 
     def _join_channel(self):
         """进入本席位的频率频道，成功才返回 True。
