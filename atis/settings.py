@@ -20,8 +20,9 @@ DEFAULT_FSD_HOST = "fsd.airwaysn.org"
 DEFAULT_FSD_PORT = 6809
 
 # 早期版本把 FSD 主机错填成了语音服务器的地址。那台机器上没有 FSD，
-# 留着只会一直连不上，所以读配置时直接换掉。
-WRONG_FSD_HOSTS = {"hjdczy.top"}
+# 留着只会一直连不上，所以读配置时直接换掉。语音服务器的新旧两个域名都要认：
+# 旧的还留在老配置里，新的是同一个人下次还会填错的那个。
+WRONG_FSD_HOSTS = {"hjdczy.top", "audio.airwaysn.org"}
 
 # 自动刷新天气的间隔（秒）
 DEFAULT_METAR_REFRESH = 300
@@ -48,7 +49,7 @@ class Settings:
         self.cid = ""
         self.metar_url = weather.DEFAULT_METAR_URL
         # FSD 服务端：席位靠它出现在网络上，气象也从它那里要。
-        # 和语音服务器（hjdczy.top:64738）不是同一台。
+        # 和语音服务器（audio.airwaysn.org:64738）不是同一台。
         self.fsd_host = DEFAULT_FSD_HOST
         self.fsd_port = DEFAULT_FSD_PORT
         self.real_name = ""

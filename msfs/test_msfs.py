@@ -8,7 +8,9 @@ xpc/test_xpc.py 覆盖，这里只测换掉的那一层：SimConnect 的单位�
 """
 
 import hashlib
+import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -757,6 +759,42 @@ class InjectorTest(unittest.TestCase):
         # 每架都是完整的飞机模型，放太多会掉帧
         self.assertLessEqual(self.inject.MAX_AIRCRAFT, 64)
         self.assertGreater(self.inject.MAX_AIRCRAFT, 0)
+
+
+class VoiceHostTest(unittest.TestCase):
+    """语音服务器换域名之后，老配置里存的那个旧域名必须换掉。
+
+    settings.py 是和 xpc 有意分开的一份（配置文件名不一样），所以这一条要在
+    两边各测一次。mumble_host 存进 msfs_settings.json，只改 DEFAULTS 只对全新
+    安装有效；旧域名停掉那天老用户看到的是"连不上语音服务器"，而设置界面上
+    那一行看着完全正常。
+    """
+
+    def setUp(self):
+        import settings as settings_module
+        self.module = settings_module
+        self.temp = tempfile.mkdtemp(prefix="msfs_settings_")
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.path = os.path.join(self.temp, "msfs_settings.json")
+
+    def write(self, data):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_default_voice_host(self):
+        self.assertEqual(self.module.MUMBLE_HOST, "audio.airwaysn.org")
+        self.assertEqual(self.module.Settings(self.path).mumble_host,
+                         "audio.airwaysn.org")
+
+    def test_migrates_the_old_domain(self):
+        self.write({"mumble_host": "hjdczy.top"})
+        self.assertEqual(self.module.Settings(self.path).mumble_host,
+                         "audio.airwaysn.org")
+
+    def test_keeps_a_deliberate_override(self):
+        # 自己指了别的服务器（测试服、局域网）是有意为之，不能替他改掉
+        self.write({"mumble_host": "127.0.0.1"})
+        self.assertEqual(self.module.Settings(self.path).mumble_host, "127.0.0.1")
 
 
 class SharedCopyTest(unittest.TestCase):

@@ -306,6 +306,77 @@ class RetireBroadcasterTest(unittest.TestCase):
         self.manager._retire("不存在的席位")
 
 
+class ConnectGateTest(unittest.TestCase):
+    """登录没被认下来就不该往下走。
+
+    start() 返回不代表连上了：登录被拒时 ConnectionRejectedError 死在 pymumble
+    自己的线程里，这边什么都收不到。原来紧接着 sleep(1) 就去进频道，一个被拒的
+    登录于是表现成"频道不存在"或者"进频道请求没有生效"——排查方向被带到 ACL 和
+    权限上，而问题在账号。
+    """
+
+    def setUp(self):
+        from pymumble_py3.constants import (PYMUMBLE_CONN_STATE_AUTHENTICATING,
+                                            PYMUMBLE_CONN_STATE_CONNECTED,
+                                            PYMUMBLE_CONN_STATE_FAILED)
+        self.AUTHENTICATING = PYMUMBLE_CONN_STATE_AUTHENTICATING
+        self.CONNECTED = PYMUMBLE_CONN_STATE_CONNECTED
+        self.FAILED = PYMUMBLE_CONN_STATE_FAILED
+        self._timeout = mumble_module.CONNECT_TIMEOUT
+        self.caster = mumble_module.ATISBroadcaster.__new__(
+            mumble_module.ATISBroadcaster)
+
+    def tearDown(self):
+        mumble_module.CONNECT_TIMEOUT = self._timeout
+
+    def wait(self, states, timeout=0.5):
+        """states 是依次返回的连接状态，最后一个之后一直保持不变。"""
+        remaining = list(states)
+
+        class Fake:
+            @property
+            def connected(_self):
+                return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+        self.caster.mumble = Fake()
+        return self.caster._wait_until_connected(timeout)
+
+    def test_a_connection_that_comes_up_is_accepted(self):
+        self.assertTrue(self.wait([self.AUTHENTICATING, self.CONNECTED]))
+
+    def test_an_explicit_failure_is_not_waited_out(self):
+        started = time.time()
+        self.assertFalse(self.wait([self.FAILED], timeout=5))
+        self.assertLess(time.time() - started, 2,
+                        "服务端已经说了失败，不该再等满超时")
+
+    def test_a_rejected_login_that_keeps_retrying_still_gives_up(self):
+        """reconnect=True 时被拒的登录多半停在 AUTHENTICATING 反复重试。
+
+        它永远不会落到 FAILED，所以只认 FAILED 的话这里会一直等下去——超时
+        必须也算失败。
+        """
+        self.assertFalse(self.wait([self.AUTHENTICATING], timeout=0.3))
+
+    def test_the_failure_message_names_the_account_and_the_three_conditions(self):
+        """报错要说清是账号的事，不是频道的事。
+
+        这队机器人没有免验证通道（login.py 那条旁路已删，且有测试钉着不许加
+        回来），所以三个条件缺一不可，而三者的现象一模一样。
+        """
+        import io
+        import contextlib
+        self.caster.user = "900_atis127800"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.caster._report_login_failure()
+        text = buffer.getvalue()
+        self.assertIn("900_atis127800", text)
+        self.assertIn("ATIS_CID", text, "要告诉人怎么换账号")
+        self.assertIn("rating", text, "未评级会员会被上游拒绝，这条最容易漏")
+        self.assertNotIn("频道", text, "别把人往频道和权限上带")
+
+
 class CompatPatchTest(unittest.TestCase):
     """导入 mumble.py 就该把 pymumble 需要的两个补丁打上。
 
@@ -323,22 +394,39 @@ class CompatPatchTest(unittest.TestCase):
         from pymumble_py3.mumble import Mumble
         self.assertTrue(getattr(Mumble.connect, "_airwaysn_guarded", False))
 
+    # 所有带 mumblecompat.py 的组件。这里列全而不是只比 xpc 一份：原来只钉了
+    # server/ATIS ↔ xpc，于是两个 legacy 飞行员端悄悄停在了老版本上——只有
+    # ssl.wrap_socket 那一半，没有 patch_send()，也就是说"一发话就掉线"那个病
+    # 在它们身上一直还在，而没有任何测试会发现。
+    COMPONENTS = ("client", "xplane_client", "controller", "atis",
+                  "xpc", "msfs")
+
     def test_the_copy_matches_the_clients(self):
-        """mumblecompat.py 必须和客户端那份逐字节相同。
+        """mumblecompat.py 必须和**每一个**客户端那份逐字节相同。
 
         这个仓库靠复制共享（msfs 对 xpc 也是这么钉的），漂移了就意味着某个
-        补丁只修了一边。
+        补丁只修了一边——而这个文件里的两个补丁，缺哪一个都是"连不上"或者
+        "一发话就掉线"，排查方向还都会被带到密码和网络上去。
         """
         here = os.path.dirname(os.path.abspath(__file__))
-        theirs = os.path.join(here, "..", "..", "xpc", "mumblecompat.py")
-        if not os.path.exists(theirs):
-            self.skipTest("不在完整仓库里（比如容器里只带了 server/）")
+        repo = os.path.join(here, "..", "..")
         with open(os.path.join(here, "mumblecompat.py"), "rb") as f:
             ours = f.read()
-        with open(theirs, "rb") as f:
-            reference = f.read()
-        self.assertEqual(ours, reference,
-                         "server/ATIS 和 xpc 的 mumblecompat.py 不一致了")
+
+        checked = 0
+        for component in self.COMPONENTS:
+            theirs = os.path.join(repo, component, "mumblecompat.py")
+            if not os.path.exists(theirs):
+                continue        # 容器里只带了 server/，比不了
+            with open(theirs, "rb") as f:
+                reference = f.read()
+            self.assertEqual(
+                ours, reference,
+                f"server/ATIS 和 {component} 的 mumblecompat.py 不一致了")
+            checked += 1
+
+        if not checked:
+            self.skipTest("不在完整仓库里（比如容器里只带了 server/）")
 
 
 if __name__ == "__main__":

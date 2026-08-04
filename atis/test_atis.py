@@ -907,9 +907,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(self.module.Settings().fsd_port, 6809)
 
     def test_migrates_the_voice_host_away(self):
-        # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD
-        self.write({"fsd_host": "hjdczy.top"})
-        self.assertEqual(self.module.Settings().fsd_host, "fsd.airwaysn.org")
+        # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
+        # 语音服务器换过域名，新旧两个都得认：旧的还留在老配置里，新的是
+        # 同一个人下次还会填错的那个。
+        for host in ("hjdczy.top", "audio.airwaysn.org"):
+            with self.subTest(host=host):
+                self.write({"fsd_host": host})
+                self.assertEqual(self.module.Settings().fsd_host,
+                                 "fsd.airwaysn.org")
 
     def test_keeps_a_deliberate_override(self):
         self.write({"fsd_host": "127.0.0.1", "fsd_port": 16809})

@@ -53,7 +53,7 @@ services:
   # 用的是另一个镜像（WITH_ATIS=1 才装 pymumble / numpy / edge-tts / ffmpeg /
   # libopus0），只能本地构建，GHCR 上那个不带这些。
   #
-  # 它连的是公网上的 hjdczy.top（mumble.py 里写死的），不是上面那个容器，
+  # 它连的是公网上的 audio.airwaysn.org（mumble.py 里写死的），不是上面那个容器，
   # 所以两者没有启动顺序关系。
   atis:
     profiles: [atis]

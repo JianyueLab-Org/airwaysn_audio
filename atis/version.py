@@ -26,9 +26,13 @@ import sys
 log = logging.getLogger("version")
 
 # 手工维护的**回退**值。真正发出去的版本号由 CI 决定：推到 main 之后，
-# 工作流数一遍已有的 v2.0.* 标签，取最大的那个 +1，写进 buildinfo.json。
+# 工作流数一遍已有的 v2.1.* 标签，取最大的那个 +1，写进 buildinfo.json。
 # 从源码跑时没有 buildinfo.json，就显示这个。
-VERSION = "2.0.0"
+#
+# 主次版本（2.1）是人的决定，改这里的同时**必须**把 release.yml 的 SERIES
+# 一起改成同一个系列：两边不一致的话，CI 会照旧在老系列里递增，而从源码跑
+# 的人看到的是新系列——同一份代码报两个版本号，还没有任何地方会报错。
+VERSION = "2.1.0"
 
 # CI 用它把算出来的版本号传进打包过程（gui.spec 会调 freeze()）。
 VERSION_ENV = "AIRWAYSN_VERSION"
@@ -120,7 +124,7 @@ def freeze(target_dir, source_dir=None):
     """打包时把版本号和当前 git 状态写进 target_dir/buildinfo.json。
 
     给 gui.spec 调用。版本号优先取环境变量 AIRWAYSN_VERSION——CI 推到 main
-    之后会算出下一个补丁号（v2.0.xxx 里的 xxx）并从那里传进来；本地打包没设
+    之后会算出下一个补丁号（v2.1.xxx 里的 xxx）并从那里传进来；本地打包没设
     这个变量，就用 VERSION。
 
     写不出来也不让打包失败——没有 build 号的包仍然是能用的，为了一行版本号让

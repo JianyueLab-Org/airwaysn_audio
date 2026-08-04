@@ -393,7 +393,7 @@ class RadioGUI(QMainWindow):
             except Exception as e:
                 log.error("写入账号到设置失败: %s", e)
 
-            self.radio_client = MumbleRadioClient("hjdczy.top", username, password, settings=self.settings)
+            self.radio_client = MumbleRadioClient("audio.airwaysn.org", username, password, settings=self.settings)
             log.info("MumbleRadioClient 初始化完成")
             
             # Mumble 连接回调：同步更新 radio_client 的独立连接标记
