@@ -1500,9 +1500,40 @@ class AtisStationsFromFeedTest(unittest.TestCase):
                          ["ZSPD"])
 
     def test_empty_and_missing_data(self):
+        """拿不到数据时给空列表。
+
+        **data=None 不是"没有数据"，是"你自己去取"** —— atis_stations 会调
+        fetch()，也就是真的去连 data.airwaysn.org。这条断言原来直接写
+        data=None，于是网络上只要有人在播通播，它就拿回真实席位而不是空列表，
+        CI 随机红一次（实测抓到的是 ZBSJ_ATIS 127.650）。测的本来就是"取不到
+        数据"这条路，把 fetch 换成替身才是它的本意。
+        """
+        original = datafeed.fetch
+        datafeed.fetch = lambda *a, **k: None
+        self.addCleanup(setattr, datafeed, "fetch", original)
+
         self.assertEqual(datafeed.atis_stations(data=None), [])
         self.assertEqual(datafeed.atis_stations(data={}), [])
         self.assertEqual(datafeed.atis_stations(data=self.feed()), [])
+
+    def test_it_never_reaches_the_network_on_its_own(self):
+        """给了 data 就不该再去取 —— 否则每个用例都在打真实数据源。
+
+        上面那条踩过一次了，钉住它：给了 data 的调用一次网络都不许发。
+        """
+        calls = []
+        original = datafeed.fetch
+
+        def counting_fetch(*args, **kwargs):
+            calls.append(args)
+            return None
+
+        datafeed.fetch = counting_fetch
+        self.addCleanup(setattr, datafeed, "fetch", original)
+
+        datafeed.atis_stations(data=self.feed(self.entry("ZSPD_ATIS")))
+        datafeed.atis_stations(data={})
+        self.assertEqual(calls, [])
 
 
 class BroadcastRulesTest(unittest.TestCase):
