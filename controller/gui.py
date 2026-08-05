@@ -37,6 +37,7 @@ import ptt
 from i18n import t
 import radiostack
 import update
+import theme
 import version
 from radiostack import RadioStack
 from settings import Settings, SettingsDialog
@@ -104,7 +105,7 @@ class Dot(QWidget):
     def __init__(self, color=IDLE_COLOR, size=10, parent=None):
         super().__init__(parent)
         self._size = size
-        self.setFixedSize(size, size)
+        self.setFixedSize(theme.px(size), theme.px(size))
         self.set_color(color)
 
     def set_color(self, color):
@@ -266,21 +267,23 @@ class RadioRow(CardWidget):
         self.setup_ui(radio)
 
     def setup_ui(self, radio):
-        self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+        # 尺寸都过 theme.px()：卡片里的像素值是照 9pt 量的，而 macOS 的界面
+        # 字号是 13pt，不换算的话 RX/TX 会被文字撑满、挤成一坨（见 theme.px）。
+        self.setFixedSize(theme.px(CARD_WIDTH), theme.px(CARD_HEIGHT))
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(theme.px(10), theme.px(8), theme.px(8), theme.px(8))
+        layout.setSpacing(theme.px(6))
 
         # ---- 上半：左边频率/呼号，右边 RX/TX ----
         # 照 TrackAudio 的 radio-content：左右各约一半，RX/TX 是右侧两个大按钮，
         # 点击目标大，急着切频率时不容易点歪
         upper = QHBoxLayout()
-        upper.setSpacing(8)
+        upper.setSpacing(theme.px(8))
 
         left = QVBoxLayout()
         left.setSpacing(0)
         self.freq_label = QLabel()
-        self.freq_label.setFont(QFont(MONO_FONT, 17, QFont.Weight.DemiBold))
+        self.freq_label.setFont(theme.mono_font(17, QFont.Weight.DemiBold))
         self.freq_label.setStyleSheet(f"color: {TEXT_COLOR};")
         left.addWidget(self.freq_label)
 
@@ -291,40 +294,40 @@ class RadioRow(CardWidget):
         upper.addLayout(left, 1)
 
         right = QVBoxLayout()
-        right.setSpacing(4)
+        right.setSpacing(theme.px(4))
         self.rx_button = self._toggle("RX", lambda: self.window.toggle_rx(self.khz))
         self.tx_button = self._toggle("TX", lambda: self.window.toggle_tx(self.khz))
         for button in (self.rx_button, self.tx_button):
-            button.setFixedSize(52, 26)
+            button.setFixedSize(theme.px(52), theme.px(26))
             right.addWidget(button)
         upper.addLayout(right)
         layout.addLayout(upper)
 
         # ---- 下半：XC / 静音 / 移除，再下面是音量 ----
         controls = QHBoxLayout()
-        controls.setSpacing(4)
+        controls.setSpacing(theme.px(4))
         self.xc_button = self._toggle("XC", lambda: self.window.toggle_xc(self.khz))
-        self.xc_button.setFixedSize(36, 22)
+        self.xc_button.setFixedSize(theme.px(36), theme.px(22))
         controls.addWidget(self.xc_button)
 
         # TrackAudio 把静音做成 RX 的右键，这里保留一个显式按钮：中文用户里
         # 没人会去猜右键，而误静音了又完全没有提示
         self.mute_button = StateToggle("", self)
-        self.mute_button.setFixedSize(46, 22)
+        self.mute_button.setFixedSize(theme.px(46), theme.px(22))
         self.mute_button.clicked.connect(
             lambda checked: self.window.set_muted(self.khz, checked))
         controls.addWidget(self.mute_button)
 
         self.volume = Slider(Qt.Orientation.Horizontal, self)
         self.volume.setRange(0, 100)
-        self.volume.setFixedHeight(18)
+        self.volume.setFixedHeight(theme.px(18))
         self.volume.valueChanged.connect(
             lambda value: self.window.set_volume(self.khz, value))
         controls.addWidget(self.volume, 1)
 
         self.remove_button = TransparentToolButton(self)
         self.remove_button.setIcon(FluentIcon.CLOSE)
-        self.remove_button.setFixedSize(22, 22)
+        self.remove_button.setFixedSize(theme.px(22), theme.px(22))
         self.remove_button.clicked.connect(
             lambda: self.window.remove_radio(self.khz))
         controls.addWidget(self.remove_button)
@@ -410,7 +413,7 @@ class ControllerWindow(QMainWindow):
         super().__init__()
         self.setWindowIcon(QIcon(icon_path))
         self.setWindowTitle(t("app.title"))
-        self.setMinimumSize(620, 480)
+        self.setMinimumSize(theme.px(620), theme.px(480))
 
         self.settings = Settings()
         # 语言：存过就用存的，第一次启动跟系统走
@@ -476,7 +479,7 @@ class ControllerWindow(QMainWindow):
         # 登录框收进一张卡片，居中——原来是几行光秃秃的输入框贴在窗口上
         card = CardWidget()
         card.setBorderRadius(8)
-        card.setFixedWidth(340)
+        card.setFixedWidth(theme.px(340))
         layout = QVBoxLayout(card)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(12)
@@ -593,19 +596,19 @@ class ControllerWindow(QMainWindow):
         # 上限还是 INPUT_WIDTH——屏幕再宽也没必要把输入框拉到一米长。
         self.freq_input = LineEdit()
         self.freq_input.setPlaceholderText(t("main.freq_hint"))
-        self.freq_input.setMinimumWidth(120)
+        self.freq_input.setMinimumWidth(theme.px(120))
         self.freq_input.setMaximumWidth(200)
         self.freq_input.returnPressed.connect(self.add_radio)
         self.callsign_input = LineEdit()
         self.callsign_input.setPlaceholderText(t("main.callsign_hint"))
-        self.callsign_input.setMinimumWidth(160)
+        self.callsign_input.setMinimumWidth(theme.px(160))
         self.callsign_input.setMaximumWidth(INPUT_WIDTH)
         self.callsign_input.returnPressed.connect(self.add_radio)
         self.add_button = add_button = PrimaryPushButton()
         add_button.setText(t("main.add"))
         add_button.setIcon(FluentIcon.ADD)
         # 图标加中文标签，给够宽度，别让 Qt 把文字压成省略号
-        add_button.setMinimumWidth(112)
+        add_button.setMinimumWidth(theme.px(112))
         add_button.clicked.connect(self.add_radio)
         # 两个输入框分掉多余的宽度（呼号那个占大头），按钮紧跟其后、保持自然
         # 宽度，多出来的空间留在最右边。窗口窄下去时先压缩输入框，按钮不会被
@@ -701,19 +704,21 @@ class ControllerWindow(QMainWindow):
             # 精简时只留图标：那两个字在这种窗口里占的是卡片的地方
             button.setText("" if enabled else label)
             if enabled:
-                button.setFixedSize(30, 26)
+                button.setFixedSize(theme.px(30), theme.px(26))
             else:
                 button.setMinimumSize(0, 0)
                 button.setMaximumSize(16777215, 16777215)
 
         # 最小尺寸要跟着放开，否则窗口缩不下去——一张卡加上留白就够了
         if enabled:
-            self.setMinimumSize(CARD_WIDTH + 2 * COMPACT_MARGINS[0] + 4,
-                                CARD_HEIGHT + 70)
+            self.setMinimumSize(
+                theme.px(CARD_WIDTH + 2 * COMPACT_MARGINS[0] + 4),
+                theme.px(CARD_HEIGHT + 70))
             self.resize(self.minimumWidth(), self.minimumHeight())
         else:
-            self.setMinimumSize(620, 480)
-            self.resize(max(self.width(), 620), max(self.height(), 480))
+            self.setMinimumSize(theme.px(620), theme.px(480))
+            self.resize(max(self.width(), theme.px(620)),
+                        max(self.height(), theme.px(480)))
 
         self.settings.compact = enabled
         self.settings.save_settings()
@@ -913,7 +918,7 @@ class ControllerWindow(QMainWindow):
             # 而且管制员认的本来就是呼号。频率放进悬停提示，要看还是看得到。
             button = PillPushButton(callsign, self)
             button.setCheckable(False)
-            button.setFixedHeight(24)
+            button.setFixedHeight(theme.px(24))
             # 按文字量给宽度，别让 Qt 去压缩它
             width = button.fontMetrics().horizontalAdvance(callsign) + 24
             button.setFixedWidth(width)

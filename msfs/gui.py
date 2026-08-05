@@ -100,7 +100,7 @@ class Indicator(QLabel):
         self._colour = colour
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFixedSize(46, 26)
-        self.setFont(QFont(theme.MONO_FONT, 10, QFont.Weight.Bold))
+        self.setFont(theme.mono_font(10, QFont.Weight.Bold))
         self.set_lit(False)
 
     def set_lit(self, lit):
@@ -257,7 +257,7 @@ class MsfsWindow(QMainWindow):
 
         self.messages = TextEdit()
         self.messages.setReadOnly(True)
-        self.messages.setFont(QFont(theme.MONO_FONT, 10))
+        self.messages.setFont(theme.mono_font(10))
         layout.addWidget(self.messages)
 
         row = QHBoxLayout()
@@ -279,7 +279,7 @@ class MsfsWindow(QMainWindow):
         card = Card(t("controllers.title"))
         layout = QVBoxLayout()
         self.controller_list = ListWidget()
-        self.controller_list.setFont(QFont(theme.MONO_FONT, 10))
+        self.controller_list.setFont(theme.mono_font(10))
         self.controller_list.itemDoubleClicked.connect(self.controller_clicked)
         layout.addWidget(self.controller_list)
         hint = CaptionLabel(t("controllers.hint"))
@@ -298,7 +298,7 @@ class MsfsWindow(QMainWindow):
         layout.addWidget(self.rx_light)
 
         self.com1_label = BodyLabel(t("radio.com1_none"))
-        self.com1_label.setFont(QFont(theme.MONO_FONT, 15, QFont.Weight.Bold))
+        self.com1_label.setFont(theme.mono_font(15, QFont.Weight.Bold))
         layout.addWidget(self.com1_label)
 
         self.channel_label = CaptionLabel("")
@@ -308,12 +308,12 @@ class MsfsWindow(QMainWindow):
         layout.addStretch()
 
         self.traffic_label = CaptionLabel(t("radio.traffic", count=0))
-        self.traffic_label.setFont(QFont(theme.MONO_FONT, 10))
+        self.traffic_label.setFont(theme.mono_font(10))
         self.traffic_label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
         layout.addWidget(self.traffic_label)
 
         self.position_label = CaptionLabel(t("radio.position_none"))
-        self.position_label.setFont(QFont(theme.MONO_FONT, 10))
+        self.position_label.setFont(theme.mono_font(10))
         self.position_label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
         layout.addWidget(self.position_label)
 

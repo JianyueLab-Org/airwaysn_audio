@@ -338,6 +338,12 @@ Two things this episode should teach:
 
 `SAY_TIMEOUT` exists for the reason the rest of this file keeps repeating: a blocking call with no timeout parks the broadcast thread forever, and the symptom is the *absence* of a log line.
 
+**Every hardcoded pixel in the UI was tuned against a 9pt font, and macOS uses 13pt.** Qt's default is `Segoe UI` 9pt on Windows and `.AppleSystemUIFont` **13pt** on macOS — 44% larger text inside boxes whose sizes are constants. On the controller's radio card the effect was that `RX` and `TX` filled their 52×26 buttons completely and the 4px gap between them disappeared, so they read as one merged green block. `theme.px()` converts a design pixel into the current font's scale and `theme.ui_scale()` is the ratio; at 9pt both are the identity, so **Windows geometry is unchanged to the pixel** (`test_theme.py` pins that explicitly). It only ever scales up — shrinking below the design size would clip text rather than merely waste space.
+
+**`MONO_FONT = "Consolas"` does not exist on macOS, and Qt does not tell you.** `QFont("Consolas")` silently resolves to the default *proportional* font, which defeats the only reason those labels use a monospace font at all: so that a column of frequencies lines up. Use `theme.mono_font()`, which passes a family list through `setFamilies()` (Consolas → SF Mono → Menlo → …) so Windows keeps Consolas and macOS gets a real fixed-pitch face. `xpc/gui.py` and `msfs/gui.py` had six such sites each.
+
+**`smoke_gui.py` structurally cannot catch either of these.** The offscreen platform reports `Sans Serif` **9pt** — the same size the design was tuned for — so an offscreen render always looks correct and never resembles what a Mac actually draws. Checking macOS layout means pinning the font size explicitly (`app.setFont(QFont("Helvetica", 13))`) and rendering with `widget.grab().save(...)`, which is what `test_theme.py` does numerically. Do not treat a passing smoke run as evidence that the macOS UI is fine.
+
 **Two macOS permissions, and only one of them announces itself.**
 
 - **Microphone.** Needs `NSMicrophoneUsageDescription` in `Info.plist`, which is why `BUNDLE()` exists in the specs at all. Without the key macOS does not deny the request — **it kills the process**, so the app vanishes the moment PTT is pressed and the log just stops. `atis` deliberately has no such key: it opens no local audio device, and asking for a permission you never use is worse than not asking.

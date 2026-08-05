@@ -48,7 +48,65 @@ SURFACE_BG = "#252839"      # 卡片底
 # ---------- 字体 ----------
 # 频率和呼号用等宽：一屏十几个频率时数字能对齐，扫视快得多。整个界面都用等宽
 # 会让中文很难看，所以只给这几处用。Consolas 是 Windows 自带的，装机即有。
+#
+# **macOS 上没有 Consolas。** Qt 找不到就悄悄退回默认的比例字体，于是频率的数字
+# 不再对齐——正是这几处用等宽的唯一理由。所以按平台给一串候选，Qt 取第一个装了
+# 的：SF Mono 是 macOS 自带的，Menlo 更老的系统也有。
 MONO_FONT = "Consolas"
+MONO_FALLBACKS = ("Consolas", "SF Mono", "Menlo", "Monaco",
+                  "DejaVu Sans Mono", "Courier New")
+
+
+def mono_font(size, weight=None):
+    """要一个等宽字体，按平台自动挑一个装了的。
+
+    用 setFamilies() 而不是 QFont(MONO_FONT)：后者只认一个名字，在没有 Consolas
+    的机器上直接退回比例字体，而且不会有任何报错——数字对不齐是唯一的症状。
+    """
+    from PyQt6.QtGui import QFont
+    font = QFont()
+    font.setFamilies(list(MONO_FALLBACKS))
+    font.setPointSize(size)
+    if weight is not None:
+        font.setWeight(weight)
+    return font
+
+
+# ---------- 尺寸 ----------
+# 界面里写死的那些像素值（卡片多大、按钮多大）都是照 9pt 调出来的——Windows 上
+# Qt 的默认字号就是 9pt。
+#
+# **macOS 给的是 13pt。** 同样一个 52×26 的按钮，字大了 44%，"RX" 就把整个按钮
+# 塞满，两个按钮之间那 4px 的缝看不见了，挤成一坨。这不是 macOS 打包的问题，是
+# "把像素值当常量"的问题：字号是跟着平台走的，像素值不跟着走就必然对不上。
+#
+# 离屏平台给的恰好也是 9pt，所以 **smoke_gui.py 永远复现不出这个**——它看到的
+# 排版和 Windows 一样。要核对 macOS 的样子只能显式把字号钉成 13 再画一遍。
+DESIGN_POINT_SIZE = 9
+
+
+def ui_scale():
+    """当前字号相对设计字号的倍数。Windows 上就是 1.0。
+
+    只放大不缩小：字号比设计值还小的时候，按原尺寸留白总比把控件挤扁好看。
+    """
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return 1.0                      # 还没建 QApplication，按设计值算
+    size = app.font().pointSize()
+    if size <= 0:
+        return 1.0                      # 用的是 pixelSize，比不了，别乱缩放
+    return max(1.0, size / float(DESIGN_POINT_SIZE))
+
+
+def px(value):
+    """把一个照设计字号量出来的像素值换算到当前字号。
+
+    **不能在 import 阶段调用**：那时候 QApplication 还没建出来，永远得到 1.0，
+    于是所有尺寸又被冻回设计值。要在建控件的时候调。
+    """
+    return int(round(value * ui_scale()))
 
 
 def apply_theme():
