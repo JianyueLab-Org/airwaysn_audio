@@ -1,8 +1,12 @@
 # 推到 main 就打包、自动进一位补丁号、发 Release。
 #
-# 版本号规则：**只有 v2.0.xxx 的 xxx 会自动动。** 主版本和次版本（2.0）是人的
-# 决定，写在 version.py 的 VERSION 里；补丁号由这个工作流数已有的 v2.0.* 标签
-# 得出，取最大的那个加一。想发 2.1 就去改 VERSION 并把下面的 SERIES 一起改。
+# 版本号规则：**只有 v2.1.xxx 的 xxx 会自动动。** 主版本和次版本（2.1）是人的
+# 决定，写在 version.py 的 VERSION 里；补丁号由这个工作流数已有的 v2.1.* 标签
+# 得出，取最大的那个加一。想发 2.2 就去改 VERSION 并把下面的 SERIES 一起改。
+#
+# **两边必须同时改。** 只改一边不会有任何报错：SERIES 留在老系列的话 CI 照旧
+# 在那里递增，而从源码跑的人看到的是 version.py 里的新系列，同一份代码报两个
+# 版本号。换系列时 latest 数不到本系列的标签，从 .0 开始，这是对的。
 #
 # 为什么不让 version.py 自己维护补丁号：那需要每次发版都回推一个提交改文件，
 # 而那个提交又会触发这个工作流，自己咬自己。数标签没有这个问题——标签就是
@@ -38,7 +42,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SERIES: "2.0"          # 自动递增只在这个系列里进行
+  SERIES: "2.1"          # 自动递增只在这个系列里进行；要和 version.py 的 VERSION 同系列
   # runner 的 stdout 默认是 cp1252，而这个仓库的日志和 print 全是中文——
   # server/login.py 的 print(f"认证用户: {name}")、version.freeze() 的
   # print(f"版本 …")，都会直接 UnicodeEncodeError。测试那边表现为十几个用例
@@ -49,8 +53,8 @@ jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
-      number: ${{ steps.next.outputs.number }}   # 2.0.7
-      tag: ${{ steps.next.outputs.tag }}         # v2.0.7
+      number: ${{ steps.next.outputs.number }}   # 2.1.7
+      tag: ${{ steps.next.outputs.tag }}         # v2.1.7
     steps:
       - uses: actions/checkout@v4
         with:

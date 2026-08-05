@@ -91,6 +91,27 @@ class TrafficInjector:
 
         包自带的处理只写一个环境变量，不带 requestID，多架飞机同时创建时无法
         区分。这里在它前面插一层，记完再原样交回去。
+
+        **光换 `my_dispatch_proc` 这个属性是没用的。** Python-SimConnect 在
+        `__init__` 里就把它包成了一个 ctypes 跳板：
+
+            self.my_dispatch_proc_rd = self.dll.DispatchProc(self.my_dispatch_proc)
+
+        而收消息的循环调的是那个跳板（`SimConnect.py:181` 的
+        `CallDispatch(..., self.my_dispatch_proc_rd, ...)`），跳板里存的是**构造
+        那一刻的原方法**。所以只改属性的话，我们这一层从头到尾不会被调用一次。
+
+        症状极具迷惑性：创建请求发得出去（日志里一行行"请求把 X 放进模拟器"），
+        但 ASSIGNED_OBJECT_ID 一个都收不到——于是 `record["object_id"]` 永远是
+        None，`_sync_one` 每轮都停在"还在等 objectID"，**他机被生成在初始位置
+        之后就再也不动**，离线了也删不掉（没有对象号就没法 AIRemoveObject），
+        而机型问到之后的重新匹配又会再建一架，飞机就这么翻倍。EXCEPTION 消息
+        同样收不到，所以模拟器拒绝过的模型也进不了 bad_titles，每轮重试。
+        真实日志（v2.0.3）里的样子：10 次创建请求、0 个对象号、0 次移除、
+        0 条警告。
+
+        所以跳板也要一起换掉。循环每轮都重读 `my_dispatch_proc_rd`，所以运行中
+        替换是安全的、立即生效。
         """
         sc = self.sim
         enums = self._enums
@@ -116,6 +137,15 @@ class TrafficInjector:
             return original(pData, cbData, pContext)
 
         sc.my_dispatch_proc = dispatch
+        # 收消息的循环用的是这个跳板，不换它等于什么都没做（见上面那段）
+        try:
+            sc.my_dispatch_proc_rd = sc.dll.DispatchProc(dispatch)
+        except Exception as e:
+            # 换不掉就退回原样：他机会不动，但客户端其余部分照常工作，
+            # 而且日志里说得清是为什么。
+            log.warning("could not rebind the SimConnect dispatch callback, "
+                        "traffic will not move: %s", e)
+            sc.my_dispatch_proc = original
 
     def _note_exception(self, body):
         """SimConnect 的异步错误。
@@ -296,8 +326,11 @@ class TrafficInjector:
         self.aircraft[callsign] = {"object_id": None, "title": title,
                                    "request_id": request_id,
                                    "requested_at": time.time()}
-        log.info("asking the simulator to create %s: model %r, request %d",
-                 callsign, title, request_id)
+        # 机型还没问到时先拿通用模型顶上，半秒后 #SB 回来会用正确模型再建一次。
+        # 两条里只有后一条是结论，前一条降到 DEBUG——他机多的时候这类占了大头。
+        level = log.debug if not entry.get("equipment") else log.info
+        level("asking the simulator to create %s: model %r, request %d",
+              callsign, title, request_id)
 
     def _move(self, object_id, entry):
         values = (ctypes.c_double * len(_Definition.FIELDS))(

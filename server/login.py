@@ -54,6 +54,34 @@ AUTH_TEMPORARY_FAILURE = -3
 # 全局关闭标志，Ctrl+C 时立即设置，阻止清理时再做 Ice 调用
 _shutting_down = False
 
+# 通播账号的名字形状：{cid}_atis{频率6位}，由 atis/broadcast.py 和
+# server/ATIS/mumble.py 拼出来。**结尾要卡死**——原来是 r"^.*_atis\d{6}"，
+# 不卡结尾的话 1000_atis1180001 也算匹配，而取 id 时 split 拿到的是 7 位的
+# 1180001，等于凭空造出一个谁也不认识的用户 id。
+ATIS_NAME = re.compile(r"^(?P<cid>.*)_atis(?P<freq>\d{6})$")
+
+
+def is_atis_name(name):
+    return ATIS_NAME.match(name) is not None
+
+
+def user_id_for(name):
+    """名字 → Murmur 用户 id。名字不合法时抛 ValueError。
+
+    **authenticate 和 nameToId 必须共用这一个函数。** 它们原来各写各的，对
+    通播账号给出的答案不一样（一个 118000，一个 -2），而这种不一致不会有任何
+    报错，只会让按名字配的权限静默落空。
+
+    普通用户：id 就是 ASN 号，所以 Mumble 用户名必须是纯数字。
+    通播账号：id 是频率那六位，这样同一个人在不同频率上开的多个通播不会互相
+    顶掉（同名踢人是按名字判的，名字里带着频率）。代价是不同 cid 在**同一个**
+    频率上开通播会拿到同一个 id——这个取舍是全网约定的一部分，见 CLAUDE.md。
+    """
+    matched = ATIS_NAME.match(name)
+    if matched:
+        return int(matched.group("freq"))
+    return int(name)
+
 
 class AuthenticatorI(MumbleIce.ServerAuthenticator):
     def __init__(self, server, adapter, context=None):
@@ -95,16 +123,12 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
         try:
             print(f"认证用户: {name}")
-            # 检查是否是ATIS登录
-            atis_pattern = re.compile(r"^.*_atis\d{6}")
-            if atis_pattern.match(name):
+            if is_atis_name(name):
                 print(f"匹配到ATIS登录: {name}")
                 result = login_ATIS(name, pw)
-                # 提取atis后面的6位数字作为用户ID
-                user_id = int(name.split("_atis")[1])
             else:
                 result = login(name, pw)
-                user_id = int(name)
+            user_id = user_id_for(name)
 
             if result == VERIFY_OK:
                 self.kick_previous_session(name)
@@ -120,12 +144,27 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
             return (AUTH_FAILED, "", [])
 
     def nameToId(self, name, current=None):
+        """名字 → 用户 id。**必须和 authenticate 给出同一个答案。**
+
+        原来这里只有 int(name)，通播账号（1000_atis118000）在这里抛异常、
+        回落到 -2，而 authenticate 对同一个名字给的是 118000。两个方法各说
+        各话的后果是按名字把通播账号写进 ACL 不生效——setACL 收下了，权限却
+        落在一个不存在的用户上，看着完全成功。
+        """
         try:
-            return int(name)
-        except:
-            return -2
+            return user_id_for(name)
+        except ValueError:
+            return AUTH_FALLTHROUGH
 
     def idToName(self, id, current=None):
+        """用户 id → 名字。
+
+        **通播账号这条路是还不回去的**，不是没写：id 取的是频率六位，cid 那
+        一截在 authenticate 里就丢了，118000 既可能是 ASN 118000 也可能是
+        118.000 上的某个通播。这里只能给出数字本身。Murmur 拿它做的是显示和
+        ACL 反查，当前部署（根 ACL 只用 all 组）碰不到这条路。真要能反查，
+        得先改 id 的算法，而那个算法是全网约定，见 CLAUDE.md。
+        """
         return str(id)
 
     def getInfo(self, id, current=None):
@@ -236,7 +275,8 @@ def login_ATIS(name, password):
     ——它那个保留账号（默认 900）上游接口并不认识，要么把旁路加回来，要么在
     can-web 那边给它建一个真账号。
     """
-    cid = name.split("_atis")[0]
+    matched = ATIS_NAME.match(name)
+    cid = matched.group("cid") if matched else name.split("_atis")[0]
     print(f"ATIS登录: cid={cid}")           # 密码不进日志
     return verify(cid, password)
 

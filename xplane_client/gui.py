@@ -379,7 +379,7 @@ class RadioGUI(QMainWindow):
             log.info("X-Plane 已发现 @ %s:%s，初始频率 %.3f MHz", addr[0], addr[1], freq)
 
             self.radio_client = MumbleRadioClient(
-                "hjdczy.top", username, password, settings=self.settings,
+                "audio.airwaysn.org", username, password, settings=self.settings,
             )
             # 手动设置 X-Plane 地址和初始频率（避免重复发现）
             self.radio_client.xplane._addr = addr

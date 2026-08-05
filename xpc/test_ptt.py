@@ -393,6 +393,78 @@ class JoystickWatcherTest(unittest.TestCase):
         self.assertEqual(self.collector.last, True)
 
 
+class SdlThreadTest(unittest.TestCase):
+    """SDL 必须由界面线程第一个初始化，不能由摇杆的后台线程。
+
+    这条是从一份真实日志里来的：01:28:11 录到了 `<Binding joystick 1>`，两秒后
+    再录就 `IDirectInputDevice8::SetCooperativeLevel() DirectX error 0x80070006`，
+    之后监听线程每 3 秒一条打不开，一直到用户退出客户端。
+
+    原因不在摇杆上，也不在 SDL_VIDEODRIVER 上。SDL 在 SDL_Init(SDL_INIT_JOYSTICK)
+    里给 DirectInput 建一个隐藏的辅助窗口，开每个摇杆时拿它调
+    SetCooperativeLevel；Win32 的窗口属于建它的线程，线程一退窗口就被销毁，而
+    SDL 只建这一次（SDL_HelperWindow 非空就直接返回）。所以第一次初始化落在录制
+    线程上的话，那个线程一结束，句柄就野了，E_HANDLE 是"无效窗口句柄"。
+
+    修法只有一个：让第一次初始化落在和进程同寿的线程上。所以这里测的是"谁调用
+    了 _import_pygame"，而不是别的什么现象。
+    """
+
+    def setUp(self):
+        self.stick = FakeStick(0, buttons=4)
+        self.pygame = FakePygame([self.stick])
+        self.threads = []
+        real = ptt._import_pygame
+        self.addCleanup(setattr, ptt, "_import_pygame", real)
+        ptt._import_pygame = self._record
+        realp = ptt._import_pynput
+        ptt._import_pynput = lambda: (None, None)
+        self.addCleanup(setattr, ptt, "_import_pynput", realp)
+
+    def _record(self):
+        self.threads.append(threading.current_thread())
+        return self.pygame
+
+    def test_the_watcher_brings_sdl_up_on_the_calling_thread(self):
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.JOYSTICK, button=0)])
+        watcher.start()
+        self.addCleanup(watcher.stop)
+        self.assertTrue(self.threads, "start() 之后 SDL 还没起来")
+        self.assertIs(self.threads[0], threading.current_thread(),
+                      "SDL 是在后台线程上起来的：那个线程一退，DirectInput 的"
+                      "辅助窗口就没了，之后所有摇杆都打不开")
+
+    def test_the_capture_brings_sdl_up_on_the_calling_thread(self):
+        capture = ptt.PttCapture(lambda binding: None)
+        capture.start()
+        self.addCleanup(capture.stop)
+        self.assertTrue(self.threads, "start() 之后 SDL 还没起来")
+        self.assertIs(self.threads[0], threading.current_thread(),
+                      "录制线程第一个碰了 SDL：这一次能录上，下一次就再也打不开了")
+
+    def test_a_device_that_will_not_open_is_only_reported_once(self):
+        # 打不开一般是个稳定状态，而重试永不停止。真实日志里同一行刷了整整一屏，
+        # 1 MB 的滚动窗口就是这么被顶满的。
+        class Refusing(FakePygame):
+            def Joystick(self, index):    # noqa: N802
+                raise OSError("IDirectInputDevice8::SetCooperativeLevel() "
+                              "DirectX error 0x80070006")
+
+        self.pygame = Refusing([self.stick])
+        retry = ptt.JOYSTICK_RETRY
+        ptt.JOYSTICK_RETRY = 0.0
+        self.addCleanup(setattr, ptt, "JOYSTICK_RETRY", retry)
+        watcher = ptt.PttWatcher([ptt.Binding(ptt.JOYSTICK, button=0)])
+        with self.assertLogs("ptt", level="DEBUG") as caught:
+            watcher.start()
+            time.sleep(0.2)
+            watcher.stop()
+        warnings = [r for r in caught.records
+                    if r.levelname == "WARNING" and "0x80070006" in r.getMessage()]
+        self.assertEqual(len(warnings), 1,
+                         "同一个打不开的设备报了 %d 次" % len(warnings))
+
+
 class CaptureTest(unittest.TestCase):
     def setUp(self):
         FakeListener.instances = []

@@ -9,5 +9,8 @@ atis_settings.json
 release/
 *.log
 
+# docker compose 读的口令文件，只在服务器上放一份（格式见 .env.example）
+.env
+
 # macOS 的 Finder 会在每个被打开过的目录里留一个
 .DS_Store

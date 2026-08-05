@@ -293,6 +293,48 @@ class AuthenticateTest(UpstreamTestCase):
         user_id, _, _ = self.authenticate("不是数字", "pw")
         self.assertEqual(user_id, login_module.AUTH_FAILED)
 
+    def test_a_malformed_atis_name_is_refused_rather_than_given_a_bogus_id(self):
+        """`_atis` 后面不是正好 6 位的，不能当通播账号放行。
+
+        旧正则不卡结尾，1000_atis1180001 也算匹配，取 id 时 split 拿到 7 位的
+        1180001——凭空造出一个谁也不认识的用户 id，而且它和任何真实频率都对不上。
+        现在这种名字落回普通用户那条路，int() 抛错，认证失败。
+        """
+        self.upstream(Response(200))
+        user_id, _, _ = self.authenticate("1000_atis1180001", "pw")
+        self.assertEqual(user_id, login_module.AUTH_FAILED)
+
+
+class UserIdAgreementTest(unittest.TestCase):
+    """nameToId 必须和 authenticate 对同一个名字给出同一个 id。
+
+    两个方法原来各写各的：authenticate 认得 `1000_atis118000` 并给 118000，
+    nameToId 在 int() 上抛异常、回落到 -2。后果是按名字把通播账号写进 ACL
+    不生效——setACL 收下了，权限却落在一个不存在的用户上，看着完全成功。
+    """
+
+    def setUp(self):
+        self.auth = login_module.AuthenticatorI.__new__(
+            login_module.AuthenticatorI)
+
+    def test_a_plain_account_is_its_asn_id(self):
+        self.assertEqual(self.auth.nameToId("1000"), 1000)
+        self.assertEqual(login_module.user_id_for("1000"), 1000)
+
+    def test_an_atis_account_is_its_frequency(self):
+        self.assertEqual(self.auth.nameToId("1000_atis118000"), 118000)
+
+    def test_it_agrees_with_authenticate(self):
+        for name in ("1000", "1005_atis127800", "900_atis118000"):
+            with self.subTest(name=name):
+                self.assertEqual(self.auth.nameToId(name),
+                                 login_module.user_id_for(name))
+
+    def test_an_unknown_name_falls_through_to_the_server(self):
+        # -2 = 不认识这个用户，交回服务端自己的账号库
+        self.assertEqual(self.auth.nameToId("SuperUser"),
+                         login_module.AUTH_FALLTHROUGH)
+
 
 class WatchConnectionTest(unittest.TestCase):
     """守着和 Murmur 的链路。断了要退出，不能假装还活着。"""

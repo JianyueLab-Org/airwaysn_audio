@@ -200,6 +200,10 @@ class Voice:
         # 掉线掉没了，而不是用户自己点的断开。
         self.gave_up = False
         self._was_dropped = False          # 掉过线，用来在连回来时报一句"已重连"
+        # 给 _health() 用的累计量：上一份健康报告以来收发了多少帧
+        self._sent_total = 0
+        self._received_total = 0
+        self._last_health = 0.0            # 上次打健康报告的时间
 
     # ---------- 状态 ----------
     def _status(self, state, message):
@@ -256,10 +260,15 @@ class Voice:
             frames_per_buffer=self._chunk, output_device_index=output_index)
         # 把真正打开的设备名记下来。"听不到/说不出"最常见的原因就是选错了
         # 设备（比如麦克风指到了不存在的虚拟声卡），只报采样率看不出来。
-        log.info("audio ready: %d Hz, %d samples per frame; mic=%s, speaker=%s",
-                 self._rate, self._chunk,
-                 self._device_name(input_index, True),
-                 self._device_name(output_index, False))
+        devices = (self._rate, self._chunk,
+                   self._device_name(input_index, True),
+                   self._device_name(output_index, False))
+        # 这行有一百多个字符，而每次打开设置都会重开一次设备。设备没换就别重复：
+        # 真实日志里它出现了四次，一个字都没变。
+        level = log.debug if devices == getattr(self, "_last_devices", None) else log.info
+        self._last_devices = devices
+        level("audio ready: %d Hz, %d samples per frame; mic=%s, speaker=%s",
+              *devices)
 
     def _device_name(self, index, is_input):
         try:
@@ -798,6 +807,10 @@ class Voice:
             if self._sent_frames:
                 log.info("PTT up, sent %d frames (about %.1f s)",
                          self._sent_frames, self._sent_frames * 0.02)
+                # 发话是最容易把上行问题暴露出来的时刻。堵过才打，没堵就不出声。
+                congestion = mumblecompat.send_stats()
+                if congestion:
+                    log.warning("while transmitting: %s", congestion)
             else:
                 log.warning("PTT up but not a single frame was sent: %s",
                             self._skip_reason or "reason unknown")
@@ -884,6 +897,35 @@ class Voice:
         self.stop(state='offline',
                   message=t("voice.give_up", limit=self.reconnect_limit))
 
+    def _health(self):
+        """一行说清这条连接此刻的状况。
+
+        掉线那一刻最想知道的三件事：**ping 往返**（链路本来就慢，还是突然断
+        的）、**上行有没有堵过**（区分"真的传不出去"和"一次瞬时抖动"）、
+        **这段时间收发了多少**（连接是活着没人说话，还是根本没通）。
+        原来掉线只有一句"connection dropped"，这三样一个都没有，只能靠猜。
+        """
+        parts = []
+        try:
+            stats = self.mumble.ping_stats if self.mumble else {}
+            average = stats.get("avg")
+            if average:
+                parts.append(f"ping {average:.0f} ms")
+                worst = stats.get("max")
+                if worst:
+                    parts[-1] += f" (worst {worst:.0f} ms)"
+        except Exception:
+            pass
+
+        congestion = mumblecompat.send_stats()
+        if congestion:
+            parts.append(congestion)
+
+        parts.append(f"sent {self._sent_total} / received {self._received_total} "
+                     f"frames since the last report")
+        self._sent_total = self._received_total = 0
+        return "; ".join(parts)
+
     def _on_reconnect_attempt(self, attempt, limit):
         """每发起一次重连报一次，界面上能看到"重连中 1/3"。"""
         self._status('reconnecting',
@@ -921,7 +963,7 @@ class Voice:
         if getattr(self.mumble, "gave_up", False):
             return                      # _mumble_loop 那边会走 _give_up()
         log.warning("voice connection dropped, waiting for pymumble to reconnect "
-                    "(up to %d attempts)", self.reconnect_limit)
+                    "(up to %d attempts); %s", self.reconnect_limit, self._health())
         self._status('reconnecting',
                      t("voice.dropped_retrying", limit=self.reconnect_limit))
 
@@ -935,7 +977,8 @@ class Voice:
             if not self.receiving:
                 self.receiving = True
                 self._received_frames = 0
-                log.info("receiving audio from %s", user.get("name", "?"))
+                self._talker = user.get("name", "?")
+                log.debug("receiving audio from %s", self._talker)
                 if self.on_rx:
                     self.on_rx(True)
 
@@ -949,6 +992,7 @@ class Voice:
                 return
             self._output.write(samples.tobytes())
             self._received_frames += 1
+            self._received_total += 1
         except Exception as e:
             log.warning("failed to play the received audio: %s", e)
 
@@ -958,8 +1002,9 @@ class Voice:
             try:
                 if self.receiving and time.time() - self._last_rx > RX_TIMEOUT:
                     self.receiving = False
-                    log.info("reception ended, %d frames in this burst (about %.1f s)",
-                             self._received_frames, self._received_frames * 0.02)
+                    log.info("heard %s for %.1f s (%d frames)",
+                             getattr(self, "_talker", "?"),
+                             self._received_frames * 0.02, self._received_frames)
                     if self.on_rx:
                         self.on_rx(False)
 
@@ -1008,6 +1053,7 @@ class Voice:
                 with self._lock:
                     self.mumble.sound_output.add_sound(samples.tobytes())
                 self._sent_frames += 1
+                self._sent_total += 1
             except Exception as e:
                 log.debug("the transmit thread raised: %s", e)
                 time.sleep(0.1)

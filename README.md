@@ -129,10 +129,75 @@ pyinstaller gui.spec
 跑在 Mumble/Murmur 主机上。
 
 ```bash
+cd server
 ./start.sh            # 起 mumble-server + login.py
 ./start.sh --login    # 只起 login.py
-cd server/ATIS && python3 mumble.py    # 通播机队，需要 PATH 里有 ffmpeg
+cd ATIS && python3 mumble.py          # 通播机队，需要 PATH 里有 ffmpeg
 ```
+
+`start.sh` 里**任何一个进程退出，整个退出**（容器上配 `--restart
+unless-stopped` 让外面重新拉起）。两个方向都会出事：`login.py` 不在，Murmur
+回落到自己的空账号库，所有人登录被拒而客户端显示"密码错误"；`mumble-server`
+重启之后认证器不会被自动重新注册，`login.py` 的 `watch_connection()` 察觉链路
+断了会主动退出——"退出比假装还活着好"。
+
+### Docker
+
+镜像由 CI 构建并推到 GHCR（`.github/workflows/server-image.yml`，只在改
+`server/` 或 `Dockerfile` 时触发），服务器上用 compose 部署：
+
+```bash
+cp .env.example .env      # 改里面的密码；全都可以留空
+docker compose up -d
+docker compose logs -f
+docker compose exec mumble python3 fix_acl.py --apply   # 头一次要跑，见下面"权限"
+
+docker compose pull && docker compose up -d             # 升级
+```
+
+包是私有的话，服务器上先 `docker login ghcr.io`（密码用一个带 `read:packages`
+的 PAT），或者把这个包在 GitHub 上改成 public。想回滚就在 `.env` 里把
+`SERVER_IMAGE` 指到某个 `sha-xxxxxxx` 标签——每次构建都会推一个。
+
+本地不用 compose 也行：
+
+```bash
+docker build -t airwaysn-audio-server .
+docker run -d --name airwaysn-server --restart unless-stopped \
+  -p 64738:64738/tcp -p 64738:64738/udp \
+  -v airwaysn-mumble:/var/lib/mumble-server \
+  -e MUMBLE_SUPERUSER_PASSWORD=换成你自己的 \
+  airwaysn-audio-server
+```
+
+**CI 里那步冒烟不是走过场**：这个镜像的失败模式全是"构建成功、运行时才发现"
+（漏了 `serverconf.py`、`start.sh` 没有执行位、ini 或 slice 路径探错），在
+`docker build` 的输出里一律是绿色的。所以构建完会真的把容器跑起来，等它自己的
+HEALTHCHECK 变 healthy，再确认日志里出现了「认证器已设置」和「服务器回调已注册」。
+
+四条别绕过去的：
+
+- **不要发布 6502。** Ice 绑在 127.0.0.1，认证器和它同容器，回环就够；映出去
+  等于把只靠一个口令保护的管理接口摆到公网上（何况绑在回环上时那个映射根本
+  不生效）。
+- **口令不进镜像**，写进 `Dockerfile` 的会永远留在镜像层和 `docker history`
+  里。Ice 口令由 `start.sh` 启动时随机生成写进 ini，`serverconf.py` 自己会去
+  读；SuperUser 密码只从 `MUMBLE_SUPERUSER_PASSWORD` 来。
+- **`/var/lib/mumble-server` 必须挂卷**：SuperUser 密码、注册用户和 `fix_acl.py`
+  授的权限都在那个 sqlite 里。不挂的话每换一次容器就得重授一次，而症状是管制端
+  除了主频道以外全是静音，看不出和换容器有关。
+- **基础镜像钉死版本**，因为 Listen 权限是 Mumble 1.4 才有的，构建时会校验
+  `mumble-server >= 1.4` 并当场失败。
+
+通播机队默认不装依赖（numpy + ffmpeg 太大，而且不在 `CMD` 里），GHCR 上那个
+镜像也不带。要跑它用 compose 的 `atis` profile，那是本地构建的：
+
+```bash
+docker compose --profile atis up -d --build
+```
+
+`.env` 里要有 `ATIS_PASSWORD`。注意 `login.py` 里的保留账号旁路已经去掉了，
+那个 cid（默认 900）得在 can-web 那边真实存在。
 
 `login.py` 是 Ice 认证器：网络没有本地账号，登录一律转给 can-web 的
 `/api/v1/public/auth` 校验。它没跑起来的话，谁都连不上语音。Ice 绑定要在主机上
@@ -181,8 +246,10 @@ python3 server/fix_acl.py --apply    # 真的写进去
 - **pymumble 1.6.1 在 Python 3.12 上开箱即坏。** 它用 `ssl.wrap_socket()` 建 TLS，
   而这个函数 3.12 已经删除，它的 `except AttributeError` 兜底又调回同一个函数。
   异常从 pymumble 自己的线程里抛出去，外面只看到"服务器拒绝连接"，于是你会去查
-  密码，而 TLS 握手根本没开始。`mumblecompat.install()` 补上这个函数，**所有组件
-  都在 import 时调用它**。
+  密码，而 TLS 握手根本没开始。`mumblecompat.install()` 补上这个函数，**所有说
+  Mumble 的组件都在 import pymumble 之前调用它**——包括 `server/ATIS/mumble.py`，
+  它一直漏着，而 Debian 13 / 新一点的 Ubuntu 上 python 都 ≥3.12，通播机队装上就
+  连不上。
 - **pymumble 的阻塞命令永远不会超时。** `channels.new_channel()` 和
   `users.myself.move_in()` 都走 `execute_command(blocking=True)`，那个
   `lock.acquire()` 没有任何超时（pymumble 源码里就写着 TODO）。命令没被处理就

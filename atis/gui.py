@@ -53,7 +53,7 @@ from settings import Settings, SettingsDialog
 log = logging.getLogger("gui")
 
 # 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.airwaysn.org:6809）。
-SERVER = "hjdczy.top"
+SERVER = "audio.airwaysn.org"
 
 # 外观在 theme.py 里，四个客户端共用一份——它们多半并排开着，长得不一样会很跳。
 # 这里只把用到的名字取出来，**不要在这个文件里再写死任何 #rrggbb**。

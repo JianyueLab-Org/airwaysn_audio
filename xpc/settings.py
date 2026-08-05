@@ -19,9 +19,15 @@ log = logging.getLogger("settings")
 
 SETTINGS_FILE = "xpc_settings.json"
 
-MUMBLE_HOST = "hjdczy.top"
+MUMBLE_HOST = "audio.airwaysn.org"
 FSD_HOST = "fsd.airwaysn.org"
 FSD_PORT = 6809
+
+# 语音服务器的旧域名。mumble_host 是存进配置文件的，所以光换上面那个默认值
+# 只对全新安装有效——老用户的 json 里还是旧域名，等旧域名停掉那天他们看到的
+# 是"连不上语音服务器"，而设置界面上那一行看着完全正常。读配置时换掉。
+# 只认这一个旧值：用户自己填的别的地址是有意为之，不能动。
+OLD_MUMBLE_HOSTS = {"hjdczy.top"}
 
 DEFAULTS = {
     "cid": "",
@@ -90,6 +96,10 @@ class Settings:
         for key in DEFAULTS:
             if key in data:
                 setattr(self, key, data[key])
+        if self.mumble_host in OLD_MUMBLE_HOSTS:
+            log.info("the voice server was renamed, using %s instead of %s",
+                     MUMBLE_HOST, self.mumble_host)
+            self.mumble_host = MUMBLE_HOST
         # 音量存坏了会让整条音频链路失灵，夹一下
         self.mic_volume = max(0, min(200, int(self.mic_volume or 100)))
         self.speaker_volume = max(0, min(200, int(self.speaker_volume or 100)))

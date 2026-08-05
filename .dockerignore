@@ -1,0 +1,20 @@
+# 服务端镜像只用得上 server/。把其余的挡在构建上下文外面，否则每次 build 都
+# 要把四个客户端、图标和 .git 一起传给 daemon。
+*
+!server
+
+# 口令永远不进镜像（这个文件本来就 gitignore 了，这里再挡一道：它在服务器上
+# 是存在的，一旦被打进镜像就跟着镜像到处走）
+server/server_secrets.json
+
+# 生成的 Ice 绑定按容器里的 Mumble 版本重新生成，别把主机上那份带进去——版本
+# 对不上的话 import 得进来但调用起来是错的
+server/MumbleServer
+server/MumbleServer_ice.py
+server/MumbleServer.ice
+server/Murmur
+server/Murmur_ice.py
+server/Murmur.ice
+
+**/__pycache__
+**/*.pyc
