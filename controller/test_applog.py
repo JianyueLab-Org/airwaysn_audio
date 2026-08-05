@@ -5,7 +5,12 @@
 日志本身坏了是最难发现的——正因为坏了才没有日志。所以专门钉几条：文件真的写出来
 了、级别对、未捕获的异常（含线程里的）确实落盘。
 
-会在临时目录里跑，不碰工作目录下的真实日志。
+会在临时目录里跑，不碰使用者真实的日志。
+
+**换当前目录是不够的。** 日志路径现在走 apppaths：macOS 上它落在
+~/Library/Application Support/ 里，跟当前目录没关系——只 chdir 的话，跑一遍这个
+文件就会往使用者真实的日志里写东西（而且断言照样通过，看不出来）。
+AIRWAYSN_DATA_DIR 才是那个说了算的开关。
 """
 
 import logging
@@ -23,6 +28,9 @@ class LogSetupTest(unittest.TestCase):
         self.previous_cwd = os.getcwd()
         self.temp = tempfile.mkdtemp(prefix="applog_test_")
         os.chdir(self.temp)
+        # 见模块开头：光 chdir 挡不住 macOS 上的 Application Support
+        self.previous_data_dir = os.environ.get(applog.apppaths.ENV_OVERRIDE)
+        os.environ[applog.apppaths.ENV_OVERRIDE] = self.temp
         self.addCleanup(self.restore)
 
     def restore(self):
@@ -30,6 +38,9 @@ class LogSetupTest(unittest.TestCase):
         for handler in list(logging.getLogger().handlers):
             logging.getLogger().removeHandler(handler)
         os.chdir(self.previous_cwd)
+        os.environ.pop(applog.apppaths.ENV_OVERRIDE, None)
+        if self.previous_data_dir is not None:
+            os.environ[applog.apppaths.ENV_OVERRIDE] = self.previous_data_dir
 
     def read_log(self, path):
         for handler in logging.getLogger().handlers:

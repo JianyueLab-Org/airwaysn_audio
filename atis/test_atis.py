@@ -897,6 +897,19 @@ class SettingsTest(unittest.TestCase):
         self.temp = tempfile.mkdtemp(prefix="atis_settings_")
         os.chdir(self.temp)
         self.addCleanup(lambda: os.chdir(self.previous_cwd))
+        # 配置路径走 apppaths，在 macOS 上跟当前目录没关系——光 chdir 的话，
+        # 下面 write() 出来的文件根本不会被读到（Settings 去 Application
+        # Support 里找），而且还会在使用者家目录里建目录。
+        import apppaths
+        previous = os.environ.get(apppaths.ENV_OVERRIDE)
+        os.environ[apppaths.ENV_OVERRIDE] = self.temp
+
+        def restore_env():
+            os.environ.pop(apppaths.ENV_OVERRIDE, None)
+            if previous is not None:
+                os.environ[apppaths.ENV_OVERRIDE] = previous
+
+        self.addCleanup(restore_env)
 
     def write(self, data):
         with open("atis_settings.json", "w", encoding="utf-8") as f:
@@ -1008,7 +1021,11 @@ class LanguageSegmentTest(unittest.TestCase):
         engine = self._fake_engine()
         synth._ready = lambda: engine
 
-        pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
+        # 钉住 SAPI 那条路。不钉的话这条用例在 macOS 上根本走不到——那里合成
+        # 走的是系统的 `say`，一次 runAndWait 都不会有。而"只能进一次
+        # runAndWait"是 Windows 上的死穴，必须在每台机器上都验到。
+        with mock.patch.object(broadcast, "_MACOS", False):
+            pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
         self.assertIsNotNone(pcm, "双语稿没合成出来")
 
         runs = [c for c in engine.calls if c[0] == "run"]
@@ -1024,11 +1041,180 @@ class LanguageSegmentTest(unittest.TestCase):
     def test_the_gap_really_lands_in_the_audio(self):
         synth = broadcast.Synthesizer()
         synth._ready = lambda: self._fake_engine()
-        pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
+        # 同上，钉住 SAPI 那条路：假引擎写的是每段 0.1 秒，下面的长度才算得准
+        with mock.patch.object(broadcast, "_MACOS", False):
+            pcm = synth._render(f"{self.ENGLISH} {self.CHINESE}")
         seconds = len(pcm) / (2.0 * broadcast.TARGET_RATE)
         # 两段各 0.1 秒 + 间隔 + 0.2 秒收尾
         self.assertAlmostEqual(seconds, 0.1 * 2 + broadcast.LANGUAGE_GAP + 0.2,
                                delta=0.05)
+
+
+class MacosSpeechTest(unittest.TestCase):
+    """macOS 上的语音合成走系统的 `say`，不走 pyttsx3。
+
+    为什么非换不可：pyttsx3 的 nsss 驱动 `save_to_file` 写出来的是 **AIFF**
+    （文件头 `FORM…AIFC`），不管扩展名给的是什么。`_read_wav` 的 wave.open 必然
+    抛 "file does not start with RIFF id"，被 `_render` 接住记一句"合成失败"
+    ——通播一声不响，而日志里看不出是格式问题。
+
+    这些用例在每个平台上都跑：把 subprocess 换掉之后，验的是命令怎么拼、稿子
+    怎么写，和跑在哪台机器上无关。
+    """
+
+    ENGLISH = "Beijing Capital information Juliet runway three six left"
+    CHINESE = "首都机场情报通播 朱丽叶 使用跑道 三六左"
+
+    def setUp(self):
+        import sys
+        from unittest import mock as _mock
+        try:
+            import opuslib  # noqa: F401
+        except Exception:
+            for name in ("opuslib", "opuslib.api", "opuslib.api.decoder",
+                         "opuslib.api.encoder", "opuslib.api.info",
+                         "opuslib.exceptions"):
+                sys.modules.setdefault(name, _mock.MagicMock())
+        global broadcast
+        import broadcast
+        # 音色表是全局缓存的，不清掉的话真机上列出来的一百多个音色会盖过
+        # 用例自己喂进去的那两个
+        broadcast._say_voices_cache = None
+
+    def tearDown(self):
+        broadcast._say_voices_cache = None
+
+    # ---------- 挑音色 ----------
+    def _voices(self, listing):
+        """把 `say -v '?'` 的输出喂进去。"""
+        result = mock.Mock(stdout=listing, returncode=0)
+        with mock.patch.object(broadcast.subprocess, "run", return_value=result):
+            return broadcast._say_voices()
+
+    def test_the_voice_listing_is_parsed_from_the_right_hand_side(self):
+        """名字里有空格和括号，locale 是 `#` 之前的最后一个词。
+
+        `Tingting (Chinese (China mainland)) zh_CN` —— 从左边 split 取第二个
+        会得到 "(Chinese"，然后一个中文音色都挑不出来。
+        """
+        voices = self._voices(
+            "Tingting (Chinese (China mainland)) zh_CN    # 你好！我叫婷婷。\n"
+            "Samantha            en_US    # Hello! My name is Samantha.\n")
+        self.assertIn(("Tingting (Chinese (China mainland))", "zh_CN"), voices)
+        self.assertIn(("Samantha", "en_US"), voices)
+
+    def test_a_preferred_name_is_matched_by_prefix(self):
+        """名字会变：同一个音色早年叫 Ting-Ting，现在带一长串括号。"""
+        listing = ("Tingting (Chinese (China mainland)) zh_CN    # 婷婷\n"
+                   "Samantha            en_US    # Samantha\n")
+        with mock.patch.object(broadcast, "_say_voices_cache",
+                               self._voices(listing)):
+            self.assertTrue(broadcast._say_voice(True).startswith("Tingting"))
+            self.assertEqual(broadcast._say_voice(False), "Samantha")
+
+    def test_it_falls_back_to_the_locale_when_no_preferred_name_is_installed(self):
+        listing = ("Nobody (Chinese (China mainland)) zh_CN    # 你好\n"
+                   "Stranger            en_GB    # Hello\n")
+        with mock.patch.object(broadcast, "_say_voices_cache",
+                               self._voices(listing)):
+            self.assertEqual(broadcast._say_voice(True),
+                             "Nobody (Chinese (China mainland))")
+            self.assertEqual(broadcast._say_voice(False), "Stranger")
+
+    def test_no_voices_is_not_an_error(self):
+        """列不出音色就交给 say 的默认音色，总比不出声强。"""
+        with mock.patch.object(broadcast, "_say_voices_cache", []):
+            self.assertIsNone(broadcast._say_voice(True))
+            self.assertIsNone(broadcast._say_voice(False))
+
+    # ---------- 拼命令 ----------
+    def _run_say(self, text):
+        """跑一遍 `_write_segments_say`，返回 (命令表, 合成器)。"""
+        import wave as wave_module
+        synth = broadcast.Synthesizer()
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            path = command[command.index("-o") + 1]
+            with wave_module.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(22050)
+                w.writeframes(b"\x00\x01" * 2205)     # 0.1 秒
+            return mock.Mock(returncode=0, stderr="")
+
+        with mock.patch.object(broadcast.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(broadcast, "_MACOS", True):
+                with mock.patch.object(broadcast, "_say_voices_cache", []):
+                    pcm = synth._render(text)
+        return commands, pcm
+
+    def test_each_segment_gets_its_own_process_and_its_own_rate(self):
+        """一段一个 say，中文那段用中文语速。
+
+        SAPI 那边"整篇只能进一次 runAndWait"的限制在这里不存在——那是 Windows
+        驱动的毛病，不是这段逻辑的。
+        """
+        commands, pcm = self._run_say(f"{self.ENGLISH} {self.CHINESE}")
+        self.assertEqual(len(commands), 2, "两段应当各起一个 say")
+        rates = [c[c.index("-r") + 1] for c in commands]
+        self.assertEqual(rates, [str(broadcast.RATE_ENGLISH),
+                                 str(broadcast.RATE_CHINESE)])
+        self.assertIsNotNone(pcm)
+
+    def test_it_asks_say_for_a_wav_not_whatever_the_extension_implies(self):
+        """必须显式要 WAVE。
+
+        nsss 那条路就是栽在这里：默认写出来的是 AIFF，`wave.open` 读不回来。
+        """
+        commands, _ = self._run_say(self.ENGLISH)
+        self.assertIn("--file-format=WAVE", commands[0])
+        self.assertIn("--data-format=" + broadcast.SAY_DATA_FORMAT, commands[0])
+
+    def test_the_script_goes_through_a_file_not_the_command_line(self):
+        """稿子用 `-f`。
+
+        一篇通播是几百个字，而且以 `-` 开头的片段（跑道、负数的露点）当参数传
+        会被 say 当成选项。文件按 UTF-8 写，中文段落才对。
+        """
+        commands, _ = self._run_say(self.CHINESE)
+        self.assertIn("-f", commands[0])
+        text_path = commands[0][commands[0].index("-f") + 1]
+        with open(text_path, encoding="utf-8") as f:
+            written = f.read()
+        self.assertIn("朱丽叶", written)
+        # [[volm …]] 是 say 的内嵌命令，会被解释掉而不是念出来
+        self.assertTrue(written.startswith("[[volm"))
+
+    def test_a_failing_say_is_reported_not_silently_empty(self):
+        """say 挂了要抛出去，让 `_render` 记一句，而不是返回半截音频。"""
+        synth = broadcast.Synthesizer()
+        result = mock.Mock(returncode=1, stderr="no such voice")
+        # 音色表钉成空的，否则挑音色那一步也会走进这个替身，验的就不是合成那次
+        with mock.patch.object(broadcast, "_say_voices_cache", []):
+            with mock.patch.object(broadcast.subprocess, "run",
+                                   return_value=result):
+                with self.assertRaises(RuntimeError):
+                    synth._write_segments_say([(False, self.ENGLISH)])
+
+    def test_there_is_a_timeout(self):
+        """没有超时的阻塞调用会把播报线程永远停在那儿。"""
+        self.assertGreater(broadcast.SAY_TIMEOUT, 0)
+        synth = broadcast.Synthesizer()
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("stop here")
+
+        # 音色表钉成空的，验到的 timeout 才一定是合成那次传的
+        with mock.patch.object(broadcast, "_say_voices_cache", []):
+            with mock.patch.object(broadcast.subprocess, "run",
+                                   side_effect=fake_run):
+                with self.assertRaises(RuntimeError):
+                    synth._write_segments_say([(False, self.ENGLISH)])
+        self.assertEqual(seen.get("timeout"), broadcast.SAY_TIMEOUT)
 
 
 class ResampleTest(unittest.TestCase):

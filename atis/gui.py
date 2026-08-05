@@ -251,7 +251,7 @@ class AtisWindow(QMainWindow):
         i18n.set_language(self.settings.language or i18n.system_language())
         # **一定要带路径。** 不带 path 的 Profile 是内存里的一份，不读也不存——
         # 界面拿它当配置用的话，打开就是空席位列表，加了席位也一个都存不下来。
-        self.profile = Profile(path=profile_module.DEFAULT_PROFILE_PATH)
+        self.profile = Profile(path=profile_module.default_profile_path())
         self.broadcasters = {}          # callsign -> Broadcaster（语音）
         self.fsd_clients = {}           # callsign -> FSDClient（网络在线与文字通播）
         self.metars = {}                # callsign -> Metar

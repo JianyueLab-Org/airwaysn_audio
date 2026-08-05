@@ -8,3 +8,6 @@ atis_profile.json
 atis_settings.json
 release/
 *.log
+
+# macOS 的 Finder 会在每个被打开过的目录里留一个
+.DS_Store

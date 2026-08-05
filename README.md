@@ -27,10 +27,19 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 `xpc/` 和 `msfs/` 是功能最全的两个：除了语音还会登录 FSD，所以飞机会出现在
 网络上、也能看到别人。`client/` 和 `xplane_client/` 只有语音，更轻量。
 
-每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
-组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`、
-`voice.py` 等都有多份副本）。改公共逻辑要逐个核对副本，`xpc` 和 `msfs` 的
-`voice.py`、`traffic.py` 必须逐字节一致，有测试盯着。
+每个组件都是**从自己的目录独立运行**的。组件之间靠**复制**共享代码，不是
+import（`mumblecompat.py`、`applog.py`、`voice.py` 等都有多份副本）。改公共
+逻辑要逐个核对副本，`xpc` 和 `msfs` 的 `voice.py`、`traffic.py` 必须逐字节
+一致，有测试盯着。
+
+配置和日志的位置由各组件的 `apppaths.py` 决定：**Windows 上还是当前目录**
+（和以前一样，就在 exe 边上），macOS 上是 `~/Library/Application Support/<包名>/`
+——双击 `.app` 时当前目录是 `/`，写不进去。`AIRWAYSN_DATA_DIR` 可以覆盖，
+测试就是靠它把数据钉在临时目录里的。
+
+**平台支持**：`controller`、`atis`、`xpc` 有 Windows 和 macOS 两种包；
+`msfs` 只有 Windows，因为微软模拟器没有 macOS 版。macOS 的具体坑（opus 的
+运行时钩子、通播的语音合成、辅助功能授权）都写在 `CLAUDE.md` 的 macOS 一节。
 
 ---
 
@@ -47,6 +56,13 @@ pip install PyQt6 pymumble pyaudio numpy pygame keyboard pynput SimConnect
 
 pymumble 通过 ctypes 加载原生的 **opus** 库，找不到就 `Could not find Opus
 library`。仓库里各组件目录下有 `opus.dll`，把那个目录加进 `PATH` 即可。
+
+macOS 上 opus 和 portaudio 都不是系统自带的，要先装：
+
+```bash
+brew install opus portaudio      # portaudio 是 PyAudio 编译时要的（macOS 没有 wheel）
+cd controller && python gui.py
+```
 
 ```powershell
 cd client;        python gui.py     # 需要 MSFS 已启动

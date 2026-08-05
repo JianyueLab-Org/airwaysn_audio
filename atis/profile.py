@@ -14,6 +14,8 @@ import logging
 import json
 import os
 
+import apppaths
+
 # 这些 ValueError 会原样进 QMessageBox，是界面文字
 from i18n import t
 
@@ -247,10 +249,27 @@ class Station:
 
 DEFAULT_PROFILE_NAME = "默认"
 
-# 配置文件名。相对当前目录——所以客户端必须在自己那个目录里跑（见 CLAUDE.md）。
-# 有名字的常量是为了别再写第二遍字面量：`Profile()` 不带 path 是**内存里的一份**，
-# 不读不存，界面拿它当配置用的话打开就是空的，而且改了什么都存不下来。
-DEFAULT_PROFILE_PATH = "atis_profile.json"
+# 配置文件名。有名字的常量是为了别再写第二遍字面量：`Profile()` 不带 path 是
+# **内存里的一份**，不读不存，界面拿它当配置用的话打开就是空的，而且改了什么都
+# 存不下来。
+DEFAULT_PROFILE_NAME_ON_DISK = "atis_profile.json"
+
+
+def default_profile_path():
+    """席位配置文件的完整路径。
+
+    以前这里是个裸文件名，相对当前目录解析——所以客户端必须在自己那个目录里跑。
+    在 macOS 上双击 .app 时当前目录是 `/`，于是**整份席位配置存不下来**，而界面
+    上一切正常：席位加得进去，重启之后一个都不在了。走 apppaths 之后 Windows
+    的行为一点没变，macOS 落到 ~/Library/Application Support/atis-for-can/。
+    """
+    return apppaths.data_file(DEFAULT_PROFILE_NAME_ON_DISK)
+
+
+# **不要**在这里放一个 `DEFAULT_PROFILE_PATH = default_profile_path()`。模块级
+# 常量是导入时求值的，会把路径冻在"导入那一刻"——冒烟测试和便携安装靠
+# AIRWAYSN_DATA_DIR 换目录，冻住之后那个环境变量就白设了，测试会去读写使用者
+# 真实的席位配置。和 i18n 那几个 kind→文案 字典是同一个坑，见 CLAUDE.md。
 
 
 class Profile:
@@ -357,8 +376,10 @@ class ProfileSet:
     加了这个功能，让所有人打开就是空配置。
     """
 
-    def __init__(self, path=DEFAULT_PROFILE_PATH):
-        self.path = path
+    def __init__(self, path=None):
+        # 默认值不能直接写成 default_profile_path()：默认参数是导入时求值的，
+        # 会把路径冻住，AIRWAYSN_DATA_DIR 就再也换不动了。
+        self.path = path or default_profile_path()
         self.profiles = []
         self.active_name = DEFAULT_PROFILE_NAME
         self.load()

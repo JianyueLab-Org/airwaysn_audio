@@ -61,6 +61,21 @@ from settings import Settings
 log = logging.getLogger("gui")
 
 APP_NAME = "XPC for CAN"
+
+
+def resource_path(name):
+    """找随程序一起分发的资源。
+
+    以前这里直接写 `"favicon.ico"`，相对当前目录解析。打包之后当前目录是用户
+    双击时所在的目录，不是程序目录——**在 macOS 上双击 .app 那就是 `/`**，图标
+    永远取不到，而 Qt 不会报错，只是默默用默认图标。管制端和通播端一直是走
+    __file__ / sys._MEIPASS 的，这里补齐。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+ICON_PATH = resource_path("favicon.ico")
 # 版本号和 build 号统一在 version.py 里。build 号是打包时由 gui.spec 固化的
 # ——打包之后程序里没有 .git，运行时问不出来。
 VERSION = version.VERSION
@@ -141,8 +156,8 @@ class XpcWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.resize(980, 660)
         self.setStyleSheet(theme.window_qss())
-        if os.path.exists("favicon.ico"):
-            self.setWindowIcon(QIcon("favicon.ico"))
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
 
         self._build_ui()
         self._connect_signals()
@@ -783,10 +798,35 @@ class PttBindingList(QWidget):
         self.add_button.clicked.connect(self.toggle_capture)
         layout.addWidget(self.add_button)
 
+        # macOS 没给辅助功能授权时，键盘和鼠标 PTT 是**静默**失效的：监听器建得
+        # 出来也活着，只是收不到事件。这里明说一句并给一个直达系统设置的按钮，
+        # 否则用户看到的只是"按了没反应"，然后去查麦克风。其他平台上
+        # input_permission_ok() 永远为真，这一段完全不出现。
+        self.permission_hint = CaptionLabel(t("settings.ptt_untrusted"))
+        self.permission_hint.setWordWrap(True)
+        self.permission_hint.setStyleSheet(f"color: {theme.ACTIVE_COLOR};")
+        self.grant_button = PushButton(t("settings.ptt_grant"))
+        self.grant_button.clicked.connect(ptt.open_input_permission_settings)
+        layout.addWidget(self.permission_hint)
+        layout.addWidget(self.grant_button)
+
         self.captured.connect(self.on_captured)
         self.rebuild()
 
+    def refresh_permission(self):
+        """按当前授权状态显示或藏起那条提示。
+
+        每次打开设置都重新问一次：授权是用户去系统设置里点的，中途就变了，
+        而这个对话框不会重建。
+        """
+        needed = any(b.kind in (ptt.KEYBOARD, ptt.MOUSE) for b in self.bindings)
+        show = needed and not ptt.input_permission_ok()
+        self.permission_hint.setVisible(show)
+        self.grant_button.setVisible(show)
+
     def rebuild(self):
+        # 提示跟着绑定走：只绑摇杆的人不该看到一条讲键盘授权的话
+        self.refresh_permission()
         while self.rows.count():
             item = self.rows.takeAt(0)
             widget = item.widget()
@@ -1279,6 +1319,10 @@ def main():
     applog.setup(debug="--debug" in sys.argv or bool(settings.debug))
     logging.getLogger("startup").info("%s %s", APP_NAME, version.full())
     app = QApplication(sys.argv)
+    # 应用级图标。macOS 的程序坞图标取的是这个，不设就是一只灰色的 Python
+    # 火箭；管制端和通播端本来就设了。
+    if os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
     theme.apply_theme()             # 必须在建窗口之前
     window = XpcWindow()
     window.show()

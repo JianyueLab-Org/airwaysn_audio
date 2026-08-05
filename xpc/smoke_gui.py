@@ -8,9 +8,14 @@
 
 import os
 import sys
+import tempfile
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 配置走 apppaths，在 macOS 上落在 ~/Library/Application Support/ 里。这个脚本
+# 虽然把 Settings.save 换成了空操作，但读的那一份仍然是使用者真实的配置——断言
+# 就跟着别人的设置走了。钉在临时目录里，跑起来才是确定的。
+os.environ["AIRWAYSN_DATA_DIR"] = tempfile.mkdtemp(prefix="airwaysn-xpc-smoke-")
 # 界面语言钉死，断言才有确定的结果。不钉的话，第一次启动是跟系统走的，在英文
 # 系统上跑这个脚本，所有比中文字面量的断言都会失败。
 os.environ.setdefault("AIRWAYSN_LANG", "zh")

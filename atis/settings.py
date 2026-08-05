@@ -7,6 +7,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             LineEdit, PrimaryPushButton, PushButton)
 
 import applog
+import apppaths
 import datafeed
 import i18n
 import netconfig
@@ -44,7 +45,9 @@ def clamp_refresh(value):
 
 class Settings:
     def __init__(self):
-        self.config_file = "atis_settings.json"
+        # 裸文件名走 apppaths：Windows 上还是当前目录（和以前一样），macOS 上进
+        # ~/Library/Application Support——双击 .app 时当前目录是 `/`，存不下去。
+        self.config_file = apppaths.data_file("atis_settings.json")
         self.cid = ""
         self.metar_url = weather.DEFAULT_METAR_URL
         # FSD 服务端：席位靠它出现在网络上，气象也从它那里要。

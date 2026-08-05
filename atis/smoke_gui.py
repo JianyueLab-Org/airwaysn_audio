@@ -21,6 +21,10 @@ os.environ.setdefault("AIRWAYSN_LANG", "zh")
 # airports.py 和图标走的都是 __file__ / sys._MEIPASS，所以换目录是安全的。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(tempfile.mkdtemp(prefix="airwaysn-atis-smoke-"))
+# 换目录在 macOS 上不够：那里的席位配置和设置走 apppaths，落在
+# ~/Library/Application Support/ 里，跟当前目录没关系——不钉住的话这个脚本会
+# 读坏使用者真实的 atis_profile.json。AIRWAYSN_DATA_DIR 优先级最高。
+os.environ["AIRWAYSN_DATA_DIR"] = os.getcwd()
 
 # pymumble 需要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
 try:

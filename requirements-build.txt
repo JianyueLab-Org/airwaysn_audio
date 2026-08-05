@@ -6,6 +6,12 @@
 #
 # **Python 必须是 3.12。** PyAudio 没有 3.13+ 的 wheel，从源码编要 PortAudio
 # 头文件加 MSVC；3.11 及以下没试过。
+#
+# **macOS 上还要先 `brew install opus portaudio`。** 这个清单只管 Python 那半边：
+# opus 是 opuslib 运行时用 ctypes 加载的原生库（Windows 上各组件目录里带了
+# opus.dll，macOS 上系统不自带、也没有哪个 wheel 里有），portaudio 则是 PyAudio
+# 在 macOS 上必须现编——那里根本没有 wheel——编的时候要它的头文件。
+# macOS 打的三个包是 controller / atis / xpc；msfs 没有，因为 MSFS 没有 macOS 版。
 
 # ---- 界面 ----
 PyQt6

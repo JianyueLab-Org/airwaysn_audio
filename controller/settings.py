@@ -17,6 +17,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentI
                             TransparentToolButton)
 
 import applog
+import apppaths
 import i18n
 import ptt
 import theme
@@ -31,7 +32,10 @@ DEFAULT_PTT_KEY = "v"
 
 class Settings:
     def __init__(self):
-        self.config_file = "radio_settings.json"
+        # 裸文件名走 apppaths：Windows 上还是当前目录（和以前一样），macOS 上进
+        # ~/Library/Application Support——双击 .app 时当前目录是 `/`，存不下去，
+        # 表现出来就是"这软件记不住我的设置"。
+        self.config_file = apppaths.data_file("radio_settings.json")
         # PTT 现在是一串绑定（键盘 / 鼠标侧键 / 摇杆），任意一个按住即发话。
         # 原来的 ptt_key 单字段读得进来，见 load_settings()。
         self.ptt_bindings = [ptt.keyboard_binding(DEFAULT_PTT_KEY)]
@@ -138,11 +142,36 @@ class PttBindingList(QWidget):
         self.add_button.clicked.connect(self.toggle_capture)
         layout.addWidget(self.add_button)
 
+        # macOS 没给辅助功能授权时，键盘和鼠标 PTT 是**静默**失效的：监听器建得
+        # 出来也活着，只是收不到事件。这里明说一句并给一个直达系统设置的按钮，
+        # 否则用户看到的只是"按了没反应"，然后去查麦克风。其他平台上
+        # input_permission_ok() 永远为真，这一段完全不出现。
+        self.permission_hint = CaptionLabel(t("settings.ptt_untrusted"))
+        self.permission_hint.setWordWrap(True)
+        self.permission_hint.setStyleSheet(f"color: {theme.ACTIVE_COLOR};")
+        self.grant_button = PushButton(t("settings.ptt_grant"))
+        self.grant_button.clicked.connect(ptt.open_input_permission_settings)
+        layout.addWidget(self.permission_hint)
+        layout.addWidget(self.grant_button)
+
         self.captured.connect(self.on_captured)
         self.rebuild()
 
+    def refresh_permission(self):
+        """按当前授权状态显示或藏起那条提示。
+
+        每次打开设置都重新问一次：授权是用户去系统设置里点的，中途就变了，
+        而这个对话框不会重建。
+        """
+        needed = any(b.kind in (ptt.KEYBOARD, ptt.MOUSE) for b in self.bindings)
+        show = needed and not ptt.input_permission_ok()
+        self.permission_hint.setVisible(show)
+        self.grant_button.setVisible(show)
+
     # ---------- 列表 ----------
     def rebuild(self):
+        # 提示跟着绑定走：只绑摇杆的人不该看到一条讲键盘授权的话
+        self.refresh_permission()
         while self.rows.count():
             item = self.rows.takeAt(0)
             widget = item.widget()

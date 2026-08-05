@@ -32,7 +32,7 @@ The pilot clients now carry `applog.py` too, so all five GUI components log rath
 
 ## Commands
 
-Run each app **from inside its own directory** — icon paths (`.\favicon.ico`) and config files are resolved relative to the CWD:
+Run each app **from inside its own directory** — that is still how a source run is meant to work, and on Windows the config files are resolved relative to the CWD. (Icons now go through `resource_path()` / `sys._MEIPASS` in all three, and config paths go through `apppaths.py`, which is what makes a macOS `.app` — whose CWD is `/` — work at all. See the macOS section.)
 
 ```powershell
 cd client;        python gui.py     # MSFS pilot client (needs MSFS running)
@@ -53,6 +53,15 @@ pyinstaller gui.spec
 
 **Run the one in `dist/`, never the one in `build/`.** PyInstaller leaves an identically-named exe in its work directory (`build/gui/`, named after the spec file), but that one is only the bootloader plus the archive — `python312.dll`, `opus.dll` and the Qt libraries all live in `dist/<name>/_internal/`. Launching the `build/` copy fails with *"Failed to load Python DLL … LoadLibrary: The specified module could not be found"*, which reads like a broken build but is just the wrong exe. The shippable output is `dist/audio-for-can/`, `dist/atis-for-can/` and `dist/xpc-for-can/`.
 
+Build a macOS bundle — same spec, same command, run on a Mac (PyInstaller does not cross-compile):
+
+```bash
+brew install opus portaudio      # 都不是系统自带的，见下面的 macOS 一节
+cd controller && pyinstaller gui.spec
+```
+
+The output is `dist/<name>.app`. **`controller`, `atis` and `xpc` build on macOS; `msfs` does not and is not meant to** — SimConnect is Windows-only because Microsoft Flight Simulator is. The `.app` is ad-hoc signed by PyInstaller, which is enough to run but not enough to satisfy Gatekeeper on a downloaded copy; see the macOS section.
+
 Tests — every component except `server/login.py` has some; each runs from its own directory and needs no server, no audio device and no network:
 
 ```powershell
@@ -60,6 +69,7 @@ cd controller
 python -m unittest test_radiostack -v    # radio stack model + RX/TX/XC coupling rules
 python -m unittest test_radiostack.CouplingRulesTest.test_tx_forces_rx_on   # one test
 python -m unittest test_applog           # logging, including uncaught-exception capture
+python -m unittest test_apppaths          # 配置/日志放哪儿：Windows 不变，macOS 进 Application Support
 python -m unittest test_i18n             # both languages present, no hardcoded UI strings
 python -m unittest test_ptt              # keyboard / joystick / mouse PTT, with fake devices
 python smoke_gui.py                      # builds every window/dialog offscreen
@@ -67,6 +77,7 @@ python smoke_gui.py                      # builds every window/dialog offscreen
 cd atis
 python -m unittest test_atis -v          # METAR, templates, stations, vATIS import, network config, FSD
 python -m unittest test_applog
+python -m unittest test_apppaths
 python -m unittest test_i18n             # 两种语言都齐，且源码里没有写死的界面文字
 python smoke_gui.py
 
@@ -74,6 +85,7 @@ cd xpc
 python -m unittest test_xpc -v           # PBH, position packets, RREF, traffic, model matching
 python -m unittest test_i18n             # 两种语言都齐；ptt.py 里不能有界面文字
 python -m unittest test_ptt
+python -m unittest test_apppaths
 python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
 python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
 python -m unittest test_xpc.PluginInstallTest   # 插件安装：目录识别、新旧判定、协议号
@@ -122,7 +134,7 @@ Three environment facts that will cost an afternoon otherwise:
 - **pymumble's blocking commands never time out.** `channels.new_channel()` and `users.myself.move_in()` both go through `execute_command(blocking=True)`, whose `lock.acquire()` has no timeout — pymumble's own source says so (`mumble.py:587`, *"TODO: manage a timeout for blocking commands"*). If the command is never processed the calling thread dies there permanently, and the symptom is the *absence* of a log line: the log stops after "建一个临时的" with neither success nor error, because the thread never returned from that line. Confirmed to leave pilot clients stuck in the root channel (nobody hears them, they hear nobody) and is the likely real cause of the ATIS `Channel FREQ_xxxxxx does not exists` report. **No component may call those two wrappers.** Build the message yourself — `messages.CreateChannel(0, name, True)` / `messages.MoveCmd(mumble.users.myself_session, channel_id)` — send it with `execute_command(cmd, blocking=False)`, and poll for the result against `CHANNEL_TIMEOUT` (5 s): the channel appearing in the table, and `myself["channel_id"]` actually changing. Never book a move as done just because the command was sent, or the retry loop thinks it succeeded while the user is still where they were. `xpc/voice.py` is the reference; the same shape is now in `client/`, `xplane_client/`, `controller/voice.py`, `atis/broadcast.py` and `server/ATIS/mumble.py`. The tests fake it with a Mumble stub whose *blocking* entry points never return, so anything that reaches for them hangs and is caught by a `join(timeout=…)`.
 - **pymumble's whole loop dies with the thread that constructed it.** `Mumble.__init__` records `self.parent_thread = threading.current_thread()` (`mumble.py:59`, commented *"main thread of the calling application"*), and the main loop runs `while … and self.parent_thread.is_alive() and not self.exit:` — with the command-queue drain (`while self.commands.is_cmd(): self.treat_command(…)`) **inside** it. `xpc/gui.py` and `msfs/gui.py` start voice with `threading.Thread(target=voice.start).start()`; `Voice.start()` built the `Mumble` object on that throwaway thread and returned as soon as its worker threads were up, so the loop exited seconds after connecting. Everything then *looks* fine — the connection stays open, the channel table stays populated, `mumble.connected` stays at `CONNECTED` (the loop exiting never resets it) — but no queued command is ever sent again. `MoveCmd` sits in the queue forever, the server never receives it, and so it neither moves you nor answers with `PermissionDenied`; the log fills with `发出了进入 FREQ_124550 的请求，但 5 秒内没有生效` against a channel that provably exists with the right id. **The one MSFS/XPC bug that looked like a server problem for days was this.** `Voice.start()` now pins `mumble.parent_thread = threading.main_thread()` right after construction — fixed in `voice.py` rather than at the call sites, so a future `Thread(target=voice.start)` can't reintroduce it silently. Shutdown is unaffected: `_release()` goes through `mumble.stop()`, which clears `reconnect` and sets `exit` itself. The rest of the connection lifecycle was then brought over from the old pilot clients wholesale, because that shape is the one proven against this server: **`Voice.start()` runs `mumble.run()` on a thread it owns (`_mumble_loop`) rather than calling `mumble.start()`**, and connection state lives in a `_connection_established` `threading.Event` flipped by the `PYMUMBLE_CLBK_CONNECTED` / `PYMUMBLE_CLBK_DISCONNECTED` callbacks (`client/radio.py` calls it the same thing). Two consequences worth knowing. Running the loop yourself means a rejected login arrives as a real `ConnectionRejectedError` out of `run()` — with `start()` it dies inside pymumble's own thread and all you can do is infer "probably the password" from a status code; `_reject_reason` now carries the server's own words into the error message. And **never test liveness with `mumble.is_alive()` here**: `Mumble` subclasses `Thread`, but since we call `run()` rather than `start()` that thread is never started, so `is_alive()` is permanently `False` — wiring it into the `connected` property makes voice look permanently disconnected. `stop()` joins `_mumble_loop` *after* `_release()`, since it is `mumble.stop()` clearing `reconnect` that lets `run()` return at all. Pinned by `VoiceParentThreadTest`, whose fake copies pymumble's `parent_thread = current_thread()` line and whose `run()` blocks until stopped, so it tests real behaviour rather than matching source text; `VoiceChannelTest.test_a_dead_main_loop_is_not_reported_as_connected` covers the other half, where the status code still says `CONNECTED` after the loop is gone.
 - **`msfs/gui.spec` must also bundle `SimConnect.dll`.** Same trap as opus, worse symptom. Python-SimConnect loads it with `os.path.splitext(os.path.abspath(__file__))[0] + '.dll'`, so PyInstaller never sees it, and it has to land in `_internal/SimConnect/` because the path is derived from the module's own location. Leave it out and the packaged app still starts, still scans liveries, and simply never reads the simulator — the UI just says *"连不上 MSFS（模拟器是否已启动？）"* forever, sending the user off to check MSFS instead of the installer. `--debug` distinguishes the two: a working DLL logs `Did not find Flight Simulator running`, a missing one logs a DLL load error.
-- **Every spec must bundle `opus.dll`.** `opuslib` loads it through `ctypes` at runtime, so PyInstaller's static analysis never sees it and a packaged build dies at startup on any machine that does not already have Opus. All four specs now run the same `find_opus()` (`find_library` → the component's own `opus.dll` → `pyogg`'s copy).
+- **Every spec must bundle `opus.dll`.** `opuslib` loads it through `ctypes` at runtime, so PyInstaller's static analysis never sees it and a packaged build dies at startup on any machine that does not already have Opus. All four specs now run the same `find_opus()` (`find_library` → the component's own `opus.dll` → `pyogg`'s copy). On macOS it looks for `libopus.dylib` under both Homebrew prefixes instead — and **bundling it there is not sufficient**, which is the single most dangerous trap in the macOS work; see `rthook_opus.py` and the macOS section.
 - **pymumble needs the native `opus` library** (`opuslib` loads it through `ctypes` at runtime). Without it every import of `radio.py`/`voice.py` dies with `Could not find Opus library`. `controller/gui.spec` now locates `opus.dll` at build time and bundles it — via `find_library`, then `pyogg`'s copy, then `controller/opus.dll` — so a packaged build works on a machine that has never seen Opus. The other three specs do not do this yet.
 - **`favicon.ico` is actually a PNG** with the wrong extension. Qt sniffs the content so the window icon is fine, but PyInstaller 6 refuses it as an exe icon unless `pillow` is installed to convert it.
 
@@ -136,7 +148,7 @@ python xplane.py --probe    # try every candidate dataref and print raw + MHz
 python xplane.py --data     # DATA output row 3 (must be enabled in X-Plane settings)
 ```
 
-Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6` + `PyQt6-Fluent-Widgets` (all four shipped clients), `pymumble`, `pyaudio`, `numpy`, `pynput` (keyboard and mouse PTT), `pygame` (joystick PTT), `keyboard` (only the two legacy pilot clients), `SimConnect` (`msfs/`), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`). `requirements-build.txt` is the authoritative list for the four packaged clients.
+Third-party packages used (install with pip — note the PyPI name for pymumble_py3 is **`pymumble`**): `PyQt6` + `PyQt6-Fluent-Widgets` (all four shipped clients), `pymumble`, `pyaudio`, `numpy`, `pynput` (keyboard and mouse PTT), `pygame` (joystick PTT), `keyboard` (only the two legacy pilot clients), `SimConnect` (`msfs/`), `edge-tts` + `requests` + `pyttsx3` + `scipy` (server ATIS), `zeroc-ice` + generated `MumbleServer` slice modules (server login — gitignored, must be generated from the host's `MumbleServer.ice`). `requirements-build.txt` is the authoritative list for the four packaged clients. On macOS both `opus` and `portaudio` have to come from Homebrew (`brew install opus portaudio`) — neither ships with the OS, and PyAudio has no macOS wheel so it is compiled from its sdist against portaudio's headers.
 
 ## Cross-cutting conventions
 
@@ -238,6 +250,53 @@ That kick needs **two** Ice objects registered, which is easy to get wrong: `use
 **Settings files.** Written to the CWD as JSON: `radio_settings.json` for `client/` and `controller/` (gitignored), `xplane_radio_settings.json` for `xplane_client/`. The pilot clients persist the Mumble username and password in plaintext; the controller persists `last_username` plus the whole radio stack under `radios`, so a session comes back with the same frequencies and their RX/TX/XC state.
 
 **ATIS text processing.** `server/ATIS/process.py` expands digits into radio readback (Chinese `幺两拐洞`, English `niner`/`zero`) and turns a lone uppercase letter into its NATO word. Server ATIS splits the upstream `text_atis` on `|` into English|Chinese. Broadcasters check the channel for other speakers and pause rather than talk over traffic. ATIS lives **only** on the server side now — the controller client's ATIS was removed.
+
+## macOS
+
+`controller`, `atis` and `xpc` ship macOS builds; `msfs` does not, because Microsoft Flight Simulator has no macOS version and SimConnect is Windows-only. The release workflow builds each of the three twice, **arm64 and x86_64** — an Apple-silicon `.app` will not start at all on an Intel Mac, so one build cannot serve both.
+
+Everything below was found by actually packaging and running the three apps on a Mac. Each of these fails *silently* — the app starts, the UI looks right, and one thing quietly does not work. That is the whole reason they are written down.
+
+**The current directory is `/`, so nothing may resolve against it.** Double-clicking a `.app` gives the process a working directory of `/`, which is not writable. Every bare filename that used to mean "next to the exe" therefore had to go through the new **`apppaths.py`** (a per-component copy, like `applog.py` and `i18n.py` — the *rule* is shared, the `APP_DIR` name is not). It resolves in three steps, and the order is the design:
+
+1. **`AIRWAYSN_DATA_DIR` wins.** The smoke tests pin it to a temp directory; without that, running `smoke_gui.py` on a Mac reads and then wipes the developer's real settings, because `os.chdir(tempdir)` no longer moves the config with it.
+2. **A file that already exists in the CWD wins next.** This is what keeps existing Windows installs and source runs working — losing it would silently reset every user's configuration on upgrade, with the app looking perfectly healthy.
+3. Otherwise: macOS → `~/Library/Application Support/<app>/`, everything else → the CWD.
+
+Step 3 on Windows and Linux is literally `os.path.abspath(name)`, i.e. the behaviour that existed before the module. **That is deliberate** — this work is about macOS, and quietly relocating Windows users' configuration is the kind of change that breaks silently. `test_apppaths.py` pins both halves. Note that `atis/profile.py` exposes `default_profile_path()` as a *function* and `ProfileSet(path=None)` fills it in at call time: a module-level constant or a default argument would freeze the path at import and make `AIRWAYSN_DATA_DIR` a no-op — the same import-time-evaluation trap the i18n section describes.
+
+**`os.startfile` does not exist off Windows.** `applog.open_log_folder()` used it unconditionally, so on macOS the "打开日志" button went straight into the `except`, logged a warning and did nothing. It now branches to `open` / `xdg-open`. This matters more on macOS than on Windows, because the log is no longer next to the app and no user is going to find `~/Library/Application Support` on their own.
+
+**A bundled `libopus.dylib` is not a found `libopus.dylib`, and this one shipped a dead app.** `opuslib/api/__init__.py` is `find_library('opus')` followed by an immediate `raise` — it never reaches `ctypes.CDLL`, so PyInstaller's ctypes hook cannot help. And on macOS `ctypes.util.find_library` **does not look in the application's own directory**: it checks `DYLD_LIBRARY_PATH`, `@executable_path/../lib`, then `~/lib` `/usr/local/lib` `/lib` `/usr/lib`. Dropping `opus.dll` into `_internal/` works on Windows; dropping `libopus.dylib` into `Contents/Frameworks` does nothing on macOS.
+
+What makes this genuinely nasty is that **it works on the build machine**: Homebrew patches its own Python to add `/opt/homebrew/lib` to `ctypes.macholib.dyld.DEFAULT_LIBRARY_FALLBACK`, and that patched `dyld.py` gets bundled into the app. So the package runs fine everywhere Homebrew is installed and dies on every user's Mac with `Could not find Opus library` — while the dylib is provably inside the bundle. `rthook_opus.py` (a PyInstaller `runtime_hooks` entry in all three specs) fixes it by prepending `sys._MEIPASS` to `os.environ["DYLD_LIBRARY_PATH"]`; `find_library` re-reads the environment on every call, so setting it after process start is enough.
+
+**It has to be a runtime hook, not `mumblecompat.install()`.** `import pymumble_py3` pulls in opuslib, and in `controller/voice.py` the pymumble import sits *above* `import mumblecompat` — by the time any application code runs, opus has already raised. Runtime hooks run before all application code and are the only place early enough. To reproduce the failure without a clean Mac: `DYLD_FALLBACK_LIBRARY_PATH=/some/empty/dir` overrides the fallback list, which is exactly what a machine without Homebrew looks like.
+
+Portaudio does **not** need any of this: PyAudio links against it, so PyInstaller's Mach-O analysis sees it, bundles it, and rewrites the reference to `@rpath/libportaudio.2.dylib`. Linked libraries are handled; `ctypes`-loaded ones are invisible. That distinction is the whole story.
+
+**pyttsx3 cannot synthesize anything usable on macOS, so ATIS was silent.** Its `nsss` driver writes **AIFF** from `save_to_file` (`FORM…AIFC`, whatever extension you ask for), so `wave.open` raises `file does not start with RIFF id`, `_render` catches it and logs `speech synthesis failed`, and the station broadcasts nothing. Its `runAndWait()` also wants an `NSRunLoop` on the main thread, while synthesis runs on the broadcast thread. `broadcast.py` therefore branches on `_MACOS` to the system `say` binary — one subprocess per segment, writing WAVE directly. Everything around it is unchanged: the same `_segments()` split, the same per-language rate, the same gap, the same cache. Three details worth keeping:
+
+- The script goes in through `say -f <file>` (UTF-8), not as an argument. An ATIS is hundreds of characters, and segments beginning with `-` (a runway, a negative dew point) would be parsed as options.
+- `[[volm 0.9]]` is a `say` inline command, interpreted rather than spoken — verified by comparing frame counts with and without it.
+- Voices are matched by **name prefix, then locale prefix**. The same Chinese voice has been called `Ting-Ting` and is now listed as `Tingting (Chinese (China mainland))`, so exact-name comparison rots. `zh_CN` is preferred over bare `zh` because ATIS reads mainland place names and runway numbers.
+
+`SAY_TIMEOUT` exists for the reason the rest of this file keeps repeating: a blocking call with no timeout parks the broadcast thread forever, and the symptom is the *absence* of a log line.
+
+**Two macOS permissions, and only one of them announces itself.**
+
+- **Microphone.** Needs `NSMicrophoneUsageDescription` in `Info.plist`, which is why `BUNDLE()` exists in the specs at all. Without the key macOS does not deny the request — **it kills the process**, so the app vanishes the moment PTT is pressed and the log just stops. `atis` deliberately has no such key: it opens no local audio device, and asking for a permission you never use is worse than not asking.
+- **Accessibility**, for keyboard and mouse PTT. macOS **never prompts for this**. pynput builds the `Listener`, starts it, reports `is_alive()`, and simply receives no events — so PTT does nothing while everything looks fine, which is precisely the failure mode this codebase keeps getting bitten by. `ptt.py` grew `input_permission_ok()` (`HIServices.AXIsProcessTrusted()`, always `True` off macOS) and `open_input_permission_settings()`; `_sync_sources()` logs a warning, and the settings dialogs in `controller` and `xpc` show a hint plus a button straight to the right settings pane. Joystick PTT is unaffected — it does not go through the event tap. Permission is granted **per executable**, so a source run (granted to the terminal) and a packaged `.app` are separate grants, and so is a rebuild.
+
+`ptt.py` remains byte-identical across `controller`, `xpc` and `msfs`; the two new functions live there and are simply unused on Windows. It still produces no UI text — `i18n.py` owns the wording, as `test_i18n.py` enforces.
+
+**Spec details that are macOS-specific.** `upx` must be off: a UPX-compressed Mach-O breaks the code signature, and Apple silicon refuses to run an unsigned binary at all — the symptom is a double-click that does nothing and a `Killed: 9` in Console. The icon has to be `.icns`, generated at build time from the same 64×64 PNG-pretending-to-be-`favicon.ico` via `sips` + `iconutil` (both ship with macOS, so no extra Python dependency); it fails soft, because a bad icon must never break a build. `pynput.keyboard._darwin` / `pynput.mouse._darwin` replace the `_win32` hidden imports, and ATIS drops `pyttsx3.drivers.sapi5` + `comtypes` since it never calls `pyttsx3.init()` there.
+
+**Packaging must use `ditto`, not `zip`.** A `.app` carries symlinks and a code signature; a plain `zip` round-trip invalidates the signature and the user gets *"应用已损坏"*. The workflow uses `ditto -c -k --sequesterRsrc --keepParent`, and verifies `codesign --verify --deep --strict` before uploading. XPC additionally stages the loose `plugin/PI_XpcTraffic.py` next to the `.app` inside one folder — on macOS the bundle is a single unit, so a file "next to the exe" has nowhere to go otherwise, and skipping that leaves the manual-install copy out of the zip entirely.
+
+The builds are **ad-hoc signed only** (no paid Developer ID, so no notarization). A downloaded copy is quarantined and Gatekeeper refuses the first launch; the user has to approve it once under System Settings → Privacy & Security. The release notes say so in as many words. If a Developer ID ever becomes available, `codesign_identity` in the three specs and the reusable `apple-sn.yml` workflow are where that would plug in.
+
+The macOS CI job runs the **same** unit tests and offscreen smoke checks as Windows, which is the point — the platform branches above are unreachable on Windows. The one exclusion is `client/`'s smoke test: the legacy `keyboard` library raises *"Must be run as administrator"* on macOS. That component is unshipped legacy, its unit tests still run, and granting CI root for it is not worth it.
 
 ## The controller's radio stack
 

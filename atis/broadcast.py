@@ -12,6 +12,8 @@ import collections
 import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -275,6 +277,92 @@ def _segments(text):
     return [(chinese, " ".join(words)) for chinese, words in merged]
 
 
+# ---------------------------------------------------------------- macOS 的合成
+#
+# **pyttsx3 在 macOS 上合成不出能用的东西**，两处都致命，而且都是静默的：
+#
+# - 它走 nsss 驱动，`save_to_file` 底下是 NSSpeechSynthesizer 的
+#   `startSpeakingString:toURL:`，写出来的是 **AIFF**（文件头 `FORM…AIFC`），
+#   无视你给的扩展名。下面 `_read_wav` 的 `wave.open` 必然抛
+#   "file does not start with RIFF id"，被 `_render` 的 except 接住记一句
+#   "speech synthesis failed"——通播就此一声不响，日志里看不出是格式问题。
+# - `runAndWait()` 要跑一圈 NSRunLoop，而合成是在播报线程上做的，不是主线程。
+#
+# 所以 macOS 换成系统自带的 `say`：一段一个子进程，直接写 WAVE，中英文音色都
+# 是现成的。顺带也没有了 SAPI 那条"整篇只能进一次 runAndWait"的限制——那条限制
+# 是 Windows 驱动的毛病，不是这段逻辑的。
+_MACOS = sys.platform == "darwin"
+
+SAY = "/usr/bin/say"
+# 22050Hz 单声道 16bit 小端。和 SAPI 出来的一样，`_read_wav` 会重采样到 48k。
+SAY_DATA_FORMAT = "LEI16@22050"
+SAY_VOLUME = 0.9                 # 和 pyttsx3 那边设的 volume 对齐
+# 合成卡住不能让播报线程永远停在那儿——这个仓库已经被"没有超时的阻塞调用"坑过
+# 一次（pymumble 的 new_channel / move_in，见 CLAUDE.md）。一篇 45 秒的通播
+# say 写文件远快于实时，两分钟是很宽的上限。
+SAY_TIMEOUT = 120
+
+# 按顺序试，前缀匹配（大小写无关）。名字是会变的：同一个中文音色早年叫
+# "Ting-Ting"，现在系统里列成 "Tingting (Chinese (China mainland))"，所以不能
+# 拿全名去等值比较。挑不到就交给 say 的默认音色，总比不出声强。
+SAY_PREFERRED_CHINESE = ("tingting", "ting-ting", "meijia", "sinji")
+SAY_PREFERRED_ENGLISH = ("samantha", "alex", "karen", "daniel")
+# 前缀匹配 locale，排在前面的优先。zh_CN 排在 zh_ 前面是因为通播念的是大陆的
+# 地名和跑道号，粤语/台湾音色念出来不是一回事。
+SAY_LOCALES_CHINESE = ("zh_cn", "zh")
+SAY_LOCALES_ENGLISH = ("en_us", "en")
+
+_say_voices_cache = None
+
+
+def _say_voices():
+    """`say -v '?'` 列出来的音色：[(名字, locale)]。取不到就是空表。
+
+    输出长这样，名字里可以有空格和括号，locale 是 `#` 之前的最后一个词：
+
+        Tingting (Chinese (China mainland)) zh_CN    # 你好！我叫婷婷。
+
+    所以只能从右边切，不能 split 完取第二个。
+    """
+    global _say_voices_cache
+    if _say_voices_cache is not None:
+        return _say_voices_cache
+    voices = []
+    try:
+        result = subprocess.run([SAY, "-v", "?"], capture_output=True,
+                                text=True, timeout=15)
+        for line in result.stdout.splitlines():
+            head = line.split("#", 1)[0].strip()
+            if not head:
+                continue
+            parts = head.rsplit(None, 1)
+            if len(parts) == 2 and "_" in parts[1]:
+                voices.append((parts[0].strip(), parts[1].strip()))
+    except Exception as e:
+        log.warning("could not list the macOS voices: %s", e)
+    _say_voices_cache = voices
+    log.info("found %d macOS speech voices", len(voices))
+    return voices
+
+
+def _say_voice(chinese):
+    """挑一个 `say` 的音色名。挑不到返回 None，让 say 用系统默认。"""
+    voices = _say_voices()
+    if not voices:
+        return None
+    preferred = SAY_PREFERRED_CHINESE if chinese else SAY_PREFERRED_ENGLISH
+    locales = SAY_LOCALES_CHINESE if chinese else SAY_LOCALES_ENGLISH
+    for want in preferred:
+        for name, _locale in voices:
+            if name.lower().startswith(want):
+                return name
+    for want in locales:
+        for name, locale in voices:
+            if locale.lower().startswith(want):
+                return name
+    return None
+
+
 def _pick_voice(engine, chinese):
     hints = (("chinese", "zh_", "zh-", "huihui", "yaoyao", "kangkang") if chinese
              else ("english", "en_", "en-", "zira", "david", "mark", "hazel"))
@@ -306,6 +394,7 @@ class Synthesizer:
         self._cache = collections.OrderedDict()
 
     def _ready(self):
+        """SAPI 的引擎。macOS 走 `say`，根本不建引擎，见模块中段的注释。"""
         if self._engine is None:
             try:
                 # SAPI5 走 COM，工作线程要自己初始化
@@ -343,38 +432,13 @@ class Synthesizer:
             return None
 
         try:
-            engine = self._ready()
-
             # cleanup() 会把这个目录整个删掉，而 Broadcaster 停了之后再 start()
             # 是允许的——目录没了的话 save_to_file 会静默失败，只留一句
             # "语音合成失败"，看不出是这个原因
             os.makedirs(self._temp_dir, exist_ok=True)
 
-            # **整篇只能进一次 runAndWait()。** 同一个引擎连着调第二次时
-            # pyttsx3 的 SAPI 驱动会永久卡在里面——实测双语稿（两段）就此挂死，
-            # 日志停在合成之前，"合成完成"和"语音合成失败"两条都不会出现，
-            # 表现出来就是通播一声不响。
-            #
-            # 不过 setProperty 和 save_to_file 都是排进同一个队列、按 FIFO 执行
-            # 的（pyttsx3 driver.py 的 _Proxy._push），所以一次循环里就能把每段
-            # 用各自的音色和语速写成各自的 wav。
-            paths = []
-            for index, (chinese, part) in enumerate(segments):
-                path = os.path.join(self._temp_dir, f"atis{index}.wav")
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except Exception:
-                        pass
-                engine.setProperty('rate',
-                                   RATE_CHINESE if chinese else RATE_ENGLISH)
-                voice_id = _pick_voice(engine, chinese)
-                if voice_id:
-                    engine.setProperty('voice', voice_id)
-                engine.save_to_file(part, path)
-                paths.append(path)
-
-            engine.runAndWait()
+            paths = (self._write_segments_say(segments) if _MACOS
+                     else self._write_segments_sapi(segments))
 
             gap = np.zeros(int(TARGET_RATE * LANGUAGE_GAP), dtype=np.int16)
             pieces = []
@@ -393,6 +457,73 @@ class Synthesizer:
         except Exception as e:
             log.warning(f"speech synthesis failed: {e}")
             return None
+
+    def _segment_path(self, index, suffix):
+        path = os.path.join(self._temp_dir, "atis%d%s" % (index, suffix))
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        return path
+
+    def _write_segments_sapi(self, segments):
+        """Windows：一个 SAPI 引擎把每段写成各自的 wav，返回路径表。
+
+        **整篇只能进一次 runAndWait()。** 同一个引擎连着调第二次时 pyttsx3 的
+        SAPI 驱动会永久卡在里面——实测双语稿（两段）就此挂死，日志停在合成之前，
+        "合成完成"和"语音合成失败"两条都不会出现，表现出来就是通播一声不响。
+
+        不过 setProperty 和 save_to_file 都是排进同一个队列、按 FIFO 执行的
+        （pyttsx3 driver.py 的 _Proxy._push），所以一次循环里就能把每段用各自的
+        音色和语速写成各自的 wav。
+        """
+        engine = self._ready()
+        paths = []
+        for index, (chinese, part) in enumerate(segments):
+            path = self._segment_path(index, ".wav")
+            engine.setProperty('rate', RATE_CHINESE if chinese else RATE_ENGLISH)
+            voice_id = _pick_voice(engine, chinese)
+            if voice_id:
+                engine.setProperty('voice', voice_id)
+            engine.save_to_file(part, path)
+            paths.append(path)
+        engine.runAndWait()
+        return paths
+
+    def _write_segments_say(self, segments):
+        """macOS：一段一个 `say` 子进程，直接写 WAVE，返回路径表。
+
+        稿子走 `-f 文件` 而不是命令行参数：一篇通播是几百个字，而且以数字和
+        `-` 开头的片段（跑道 `36L`、`-08` 的露点）当参数传会被 say 当成选项。
+        文件按 UTF-8 写，中文段落照样对。
+
+        `[[volm …]]` 是 say 的内嵌命令，会被解释掉而不是念出来（实测加与不加
+        的帧数差 7 帧，也就是没被读出来），拿它对齐 SAPI 那边设的 volume。
+
+        每段单独一个进程，所以 SAPI 那条"只能 runAndWait 一次"的限制在这里不
+        存在，超时也能一段一段地卡住而不是整篇。
+        """
+        paths = []
+        for index, (chinese, part) in enumerate(segments):
+            path = self._segment_path(index, ".wav")
+            text_path = self._segment_path(index, ".txt")
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write("[[volm %.2f]]%s" % (SAY_VOLUME, part))
+            command = [SAY, "-r", str(RATE_CHINESE if chinese else RATE_ENGLISH),
+                       "--file-format=WAVE", "--data-format=" + SAY_DATA_FORMAT,
+                       "-o", path, "-f", text_path]
+            voice = _say_voice(chinese)
+            if voice:
+                command += ["-v", voice]
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=SAY_TIMEOUT)
+            if result.returncode != 0:
+                raise RuntimeError("say failed (%d): %s"
+                                   % (result.returncode,
+                                      (result.stderr or "").strip()))
+            paths.append(path)
+        return paths
 
     def _read_wav(self, path):
         """读回一段合成结果，重采样到 48kHz 单声道。出错就抛，由 _render 记账。"""

@@ -12,8 +12,14 @@
 # 和 msfs/ 取代（那两个还会登录 FSD 让飞机出现在网络上），不再出包。但它们的
 # 测试照跑——共享 FREQ_* 频道约定和 Mumble 处理，回归了同样要知道。
 #
-# 只能在 Windows 上打：PyAudio、SimConnect、opus.dll 都是 Windows 的，
-# PyInstaller 也不支持交叉编译。
+# Windows 出四个包，macOS 出三个（controller / atis / xpc）。**msfs 没有 macOS
+# 版是因为 Microsoft Flight Simulator 本身没有** ——SimConnect 是 Windows 的。
+# XPC 有，因为 X-Plane 有 macOS 版。
+#
+# PyInstaller 不支持交叉编译，所以每个平台都得在自己的 runner 上打；macOS 还得
+# 按 CPU 架构各打一份，Apple 芯片的包在 Intel 机器上根本起不来。想省 CI 时间的
+# 话，删掉 build-macos 矩阵里 x86_64 那一行即可——Apple 从 2023 年起就不卖
+# Intel Mac 了，但删了就等于不再给那批用户出包。
 
 name: 打包与发布
 
@@ -119,6 +125,55 @@ jobs:
             Write-Output "::endgroup::"
           }
 
+  test-macos:
+    # 和 Windows 那份跑同样的用例。分开一个 job 是因为**平台差异正是这次要防的
+    # 回归**：apppaths 换目录、applog 打开日志用的 open、broadcast 的 say 合成、
+    # ptt 的辅助功能判定，这几条在 Windows 上永远走不到另一个分支。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # PyAudio 没有 3.13+ 的 wheel
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: 装原生库
+        # macOS 上 PyAudio 没有 wheel，是从 sdist 现编的，要 portaudio 的头文件；
+        # opus 则是 opuslib 运行时用 ctypes 加载的，缺了它 pymumble 一导入就死。
+        run: brew install portaudio opus
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: 单元测试
+        run: |
+          # msfs 也跑：它和 xpc 共享 voice.py / ptt.py / theme.py 等几份逐字节
+          # 相同的副本，SharedCopyTest 就是靠这一遍发现它们分了叉。
+          failed=""
+          for d in atis client controller msfs server server/ATIS xpc xplane_client; do
+            echo "::group::$d"
+            (cd "$d" && python -m unittest discover -p "test_*.py") || failed="$failed $d"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "这些目录的测试没过:$failed"; exit 1; fi
+
+      - name: 离屏 smoke
+        env:
+          QT_QPA_PLATFORM: offscreen   # CI 上没有显示器
+        run: |
+          # **client/ 不在这里**：它用的 keyboard 那个老库在 macOS 上一 listen
+          # 就抛 "Must be run as administrator"。那是个不再出包的遗留客户端，
+          # 为它给 CI 加 root 不值得；它的单元测试上面照跑。
+          failed=""
+          for d in atis controller msfs xpc; do
+            echo "::group::$d smoke"
+            (cd "$d" && python smoke_gui.py) || failed="$failed $d"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "这些目录的 smoke 没过:$failed"; exit 1; fi
+
   build:
     needs: version
     runs-on: windows-latest
@@ -221,10 +276,140 @@ jobs:
           path: ${{ matrix.component }}/dist/*.zip
           if-no-files-found: error
 
+  build-macos:
+    needs: version
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false   # 一个挂了其余的照打，一次看全问题
+      matrix:
+        component: [controller, atis, xpc]
+        # 两个架构各打一份。**Apple 芯片的包在 Intel Mac 上完全起不来**，
+        # 而 Intel 的包在 Apple 芯片上要走 Rosetta。想省 CI 就删掉 x86_64 那行。
+        arch:
+          - { runner: macos-14, name: arm64 }
+          - { runner: macos-13, name: x86_64 }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # version.freeze() 用 git rev-list --count HEAD 当 build 号，
+          # 浅克隆只有一个提交，会得出 build 1
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: 装原生库
+        # portaudio：PyAudio 在 macOS 上没有 wheel，从 sdist 现编要它的头文件。
+        # opus：gui.spec 的 find_opus() 会把它打进包里（macOS 上系统不自带）。
+        run: brew install portaudio opus
+
+      - id: names
+        run: |
+          case "${{ matrix.component }}" in
+            controller) echo "output=audio-for-can" >> "$GITHUB_OUTPUT" ;;
+            atis)       echo "output=atis-for-can"  >> "$GITHUB_OUTPUT" ;;
+            xpc)        echo "output=xpc-for-can"   >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: 打包 ${{ steps.names.outputs.output }}
+        working-directory: ${{ matrix.component }}
+        env:
+          # version.freeze() 读它，写进 buildinfo.json；界面和日志显示的就是它
+          AIRWAYSN_VERSION: ${{ needs.version.outputs.number }}
+        # 必须在组件目录里跑：spec 里 favicon.ico、plugin/ 都是相对路径
+        run: pyinstaller gui.spec --noconfirm --clean
+
+      - name: 把 X-Plane 插件放到包的旁边
+        if: matrix.component == 'xpc'
+        working-directory: ${{ matrix.component }}
+        env:
+          OUT: ${{ steps.names.outputs.output }}
+        # 包里已经有一份（gui.spec 的 datas，落在 .app 内部，设置里"安装插件"
+        # 按钮拷的就是它）。这一份在 .app 外面，是给装不成的人手工拷的。
+        #
+        # macOS 上 .app 是一个整体，插件没法"放在它旁边"还跟着一起压——所以
+        # 另起一个目录把两者装在一起，下面压的就是这个目录。漏了这一步的话
+        # zip 里只有 .app，那份手工插件谁也拿不到。
+        run: |
+          mkdir -p "dist/stage/plugin"
+          cp -R "dist/$OUT.app" "dist/stage/"
+          cp "plugin/PI_XpcTraffic.py" "dist/stage/plugin/"
+
+      - name: 验包
+        working-directory: ${{ matrix.component }}
+        env:
+          OUT: ${{ steps.names.outputs.output }}
+        # opus 是 ctypes 运行时加载的，PyInstaller 的静态分析看不见；Info.plist
+        # 里的麦克风说明少了会被 macOS 直接杀进程。两样都不会让打包失败，只会让
+        # 用户拿到一个装上就用不了的包，所以在这里显式验一遍。
+        run: |
+          set -e
+          APP="dist/$OUT.app"
+          RES="$APP/Contents/Resources"
+          missing=""
+          [ -x "$APP/Contents/MacOS/$OUT" ] || missing="$missing 可执行文件"
+          [ -f "$APP/Contents/Info.plist" ] || missing="$missing Info.plist"
+          [ -f "$RES/buildinfo.json" ] || missing="$missing buildinfo.json"
+          ls "$APP/Contents/Frameworks"/libopus*.dylib >/dev/null 2>&1 \
+            || missing="$missing libopus.dylib"
+          if [ "${{ matrix.component }}" != "atis" ]; then
+            /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' \
+              "$APP/Contents/Info.plist" >/dev/null \
+              || missing="$missing NSMicrophoneUsageDescription"
+          fi
+          if [ "${{ matrix.component }}" = "xpc" ]; then
+            [ -f "$RES/plugin/PI_XpcTraffic.py" ] || missing="$missing 包内的插件"
+            [ -f "dist/stage/plugin/PI_XpcTraffic.py" ] || missing="$missing 包外的插件"
+          fi
+          if [ -n "$missing" ]; then echo "包里缺:$missing"; exit 1; fi
+
+          # 签名必须是完整的。Apple 芯片上签名对不上的二进制根本不给运行，
+          # 症状是双击毫无反应——比明确报错难查得多。
+          codesign --verify --deep --strict "$APP"
+
+          version=$(python -c "import json;print(json.load(open('$RES/buildinfo.json'))['version'])")
+          if [ "$version" != "${{ needs.version.outputs.number }}" ]; then
+            echo "包里的版本号是 $version，应当是 ${{ needs.version.outputs.number }}"
+            exit 1
+          fi
+          echo "原生库齐全、签名有效，版本 $version"
+
+      - name: 压包
+        working-directory: ${{ matrix.component }}/dist
+        env:
+          OUT: ${{ steps.names.outputs.output }}
+        # **必须用 ditto，不能用 zip。** .app 里有符号链接和代码签名，普通 zip
+        # 压完解出来签名就废了，用户双击只会得到"应用已损坏"。
+        #
+        # xpc 压的是 stage/（.app 加上那份手工插件），另外两个直接压 .app——
+        # 解开就是应用本身，少一层目录。
+        run: |
+          name="$OUT-macos-${{ matrix.arch.name }}-${{ needs.version.outputs.tag }}.zip"
+          if [ "${{ matrix.component }}" = "xpc" ]; then
+            mv stage "$OUT"
+            ditto -c -k --sequesterRsrc --keepParent "$OUT" "$name"
+          else
+            ditto -c -k --sequesterRsrc --keepParent "$OUT.app" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.output }}-macos-${{ matrix.arch.name }}
+          path: ${{ matrix.component }}/dist/*.zip
+          if-no-files-found: error
+
   release:
     # 只有推到 main 才发。手动触发只出产物挂在 Actions 里，方便试包而不占版本号。
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [version, test, build]
+    needs: [version, test, test-macos, build, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -254,16 +439,48 @@ jobs:
           body: |
             ## 下载哪个
 
-            | 包 | 给谁用 |
-            |---|---|
-            | `audio-for-can` | 管制员：一栈频率，每个带 RX/TX/XC |
-            | `atis-for-can` | 情报通播：自动取天气、中英双语播出 |
-            | `xpc-for-can` | X-Plane 飞行员：语音 + FSD |
-            | `msfs-for-can` | MSFS 飞行员：语音 + FSD |
+            | 包 | 给谁用 | Windows | macOS |
+            |---|---|---|---|
+            | `audio-for-can` | 管制员：一栈频率，每个带 RX/TX/XC | ✅ | ✅ |
+            | `atis-for-can` | 情报通播：自动取天气、中英双语播出 | ✅ | ✅ |
+            | `xpc-for-can` | X-Plane 飞行员：语音 + FSD | ✅ | ✅ |
+            | `msfs-for-can` | MSFS 飞行员：语音 + FSD | ✅ | — |
+
+            `msfs-for-can` 没有 macOS 版，因为 Microsoft Flight Simulator 本身
+            就没有 macOS 版。
+
+            ### Windows
 
             解压后运行目录里的 exe。**不要**去 `build/` 里找同名的那个——
             那只是引导程序，缺 `_internal/` 里的运行库，双击会报
             "Failed to load Python DLL"。
+
+            ### macOS
+
+            按自己机器的芯片挑：**Apple 芯片（M1/M2/M3/M4）下 `-arm64`，
+            Intel 下 `-x86_64`。** 拿错了打不开。不确定就看 关于本机 → 芯片。
+
+            解压出来是一个 `.app`，拖进「应用程序」即可。
+
+            **第一次打开会被拦下来**，说"无法打开，因为无法验证开发者"。
+            这些包没有花钱买 Apple 开发者签名，所以：
+
+            1. 双击一次（会被拒绝），
+            2. 打开 系统设置 → 隐私与安全性，往下拉找到那条提示，
+            3. 点「仍要打开」。
+
+            只需要做这一次。
+
+            还有两个权限，不给的话表现得像程序坏了而不是像没授权：
+
+            - **麦克风**（管制端 / XPC）：第一次发话时会问，拒绝了就一直发不出声。
+            - **辅助功能**（管制端 / XPC，键盘和鼠标侧键 PTT 要用）：**系统不会
+              主动问**，要自己去 系统设置 → 隐私与安全性 → 辅助功能 里打开。
+              没开的话 PTT 按下去完全没反应——设置里那一页会写明并给一个直达
+              按钮。摇杆 PTT 不需要这个权限。
+
+            配置和日志在 `~/Library/Application Support/<包名>/`，
+            设置里的「打开日志」按钮会直接带你过去。
 
             ### X-Plane 的他机插件
 

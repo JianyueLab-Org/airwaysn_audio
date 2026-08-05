@@ -228,6 +228,15 @@ TEXT = {
                                    "hold any one of them to transmit"},
     "settings.ptt_none":    {"zh": "还没有绑定，PTT 用不了",
                              "en": "No bindings yet — PTT will not work"},
+    # macOS 专用。没授权时监听器照常建出来、照常活着，只是一个事件都收不到——
+    # 不明说的话，用户看到的就是"PTT 按了没反应"，然后去查麦克风。
+    "settings.ptt_untrusted": {
+        "zh": "macOS 还没有授权本程序监听键盘和鼠标，PTT 按下去不会有反应。"
+              "去「系统设置 → 隐私与安全性 → 辅助功能」里打开它（摇杆不受影响）",
+        "en": "macOS has not granted this app permission to monitor the keyboard "
+              "and mouse, so PTT will not respond. Enable it under System Settings "
+              "→ Privacy & Security → Accessibility (joystick PTT still works)"},
+    "settings.ptt_grant":   {"zh": "去授权", "en": "Open Accessibility settings"},
     "settings.ptt_add":     {"zh": "添加绑定", "en": "Add a binding"},
     "settings.ptt_capturing": {"zh": "请按下按键、鼠标侧键或摇杆按钮…（点此取消）",
                                "en": "Press a key, a mouse side button or a joystick "

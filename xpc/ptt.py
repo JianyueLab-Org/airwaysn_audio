@@ -32,6 +32,8 @@ mumblecompat.py 一样——这个仓库每个组件都从自己目录平铺导�
 
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -279,6 +281,49 @@ def _import_pynput():
         return None, None
 
 
+def input_permission_ok():
+    """键盘和鼠标 PTT 现在收得到事件吗。
+
+    **只有 macOS 会返回 False。** 那里的全局输入监听要"辅助功能"授权，而没授权
+    时 pynput 不会抛异常也不会拒绝——`Listener` 照常建出来、照常 start()、
+    `is_alive()` 是真的，只是**一个事件都不会送过来**。于是 PTT 按下去毫无反应，
+    界面上一切正常，用户第一反应是去查麦克风。这正是这个仓库反复栽过的那种故障，
+    所以要能主动问一句。
+
+    授权是**按可执行文件**记的，所以从源码跑（授权给了终端）和双击 .app（要授权
+    给 .app 本身）是两回事，换个版本重新打的包也可能要重新授权。
+
+    问不出来就当是好的：宁可不提示，也不要在 Windows 上凭空弹一条 macOS 的警告。
+    """
+    if sys.platform != "darwin":
+        return True
+    try:
+        import HIServices
+        return bool(HIServices.AXIsProcessTrusted())
+    except Exception as e:
+        log.debug("could not check the accessibility permission: %s", e)
+        return True
+
+
+def open_input_permission_settings():
+    """把"系统设置 → 隐私与安全性 → 辅助功能"打开。
+
+    这条 URL scheme 是 macOS 自己的，直接落到那一页——让用户自己在系统设置里翻
+    到"辅助功能"，十有八九翻不到。非 macOS 上什么都不做。
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security"
+            "?Privacy_Accessibility"])
+        return True
+    except Exception as e:
+        log.warning("could not open the accessibility settings: %s", e)
+        return False
+
+
 class PttWatcher:
     """把三个源合成一个"现在按住了没有"。
 
@@ -408,6 +453,12 @@ class PttWatcher:
         """按当前绑定表决定哪几个源该开着。"""
         with self._lock:
             kinds = {b.kind for b in self._bindings}
+        # macOS 上没授权时监听器建得出来也活着，只是收不到事件——日志里必须留下
+        # 这一句，否则"PTT 按了没反应"的现场看不出任何异常。摇杆不受影响。
+        if (KEYBOARD in kinds or MOUSE in kinds) and not input_permission_ok():
+            log.warning("keyboard and mouse PTT will not receive any events "
+                        "until this application is granted Accessibility "
+                        "permission in System Settings; joystick PTT still works")
         if KEYBOARD in kinds:
             self._start_keyboard()
         else:

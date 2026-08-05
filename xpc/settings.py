@@ -1,4 +1,8 @@
-"""配置，存成当前目录下的 xpc_settings.json。
+"""配置，存成 xpc_settings.json。
+
+放在哪儿由 apppaths 决定：Windows 上是当前目录（和以前一样，就在 exe 边上），
+macOS 上是 ~/Library/Application Support/xpc-for-can/——双击 .app 时当前目录是
+`/`，存不下去，表现出来就是"这软件记不住我的设置"。
 
 密码是明文存的——和这个仓库里其他几个客户端一样。这不是好做法，但网络的
 FSD 密码就是网站密码，改法要三个仓库一起动，先照旧。
@@ -8,6 +12,7 @@ import json
 import logging
 import os
 
+import apppaths
 import ptt
 
 log = logging.getLogger("settings")
@@ -61,8 +66,10 @@ DEFAULTS = {
 
 
 class Settings:
-    def __init__(self, path=SETTINGS_FILE):
-        self.path = path
+    def __init__(self, path=None):
+        # 默认值不能写成 `path=SETTINGS_FILE`：那是个裸文件名，会相对当前目录
+        # 解析。测试里显式传 path 的用法不受影响。
+        self.path = path or apppaths.data_file(SETTINGS_FILE)
         for key, value in DEFAULTS.items():
             setattr(self, key, value)
         self.load()

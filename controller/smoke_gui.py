@@ -20,6 +20,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # gui.resource_path 走的是 __file__，applog 这里也没启动，所以换目录是安全的。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(tempfile.mkdtemp(prefix="airwaysn-smoke-"))
+# 换目录在 macOS 上不够：那里的配置和日志走 apppaths，落在
+# ~/Library/Application Support/ 里，跟当前目录没关系——不钉住的话这个脚本会
+# 读写使用者真实的设置，跑完还给人清空。AIRWAYSN_DATA_DIR 优先级最高。
+os.environ["AIRWAYSN_DATA_DIR"] = os.getcwd()
 
 # pymumble 需要本机的 opus 原生库来编解码音频。这里不碰音频，缺库时放个替身
 # 让导入过去；pymumble 本身仍然是真的。
