@@ -9,8 +9,10 @@ pymumble 1.6.1 还在用它，没有补丁的话连接线程一起来就抛 Attr
 
 import socket
 import ssl
+import sys
 import threading
 import unittest
+from unittest import mock
 
 import mumblecompat
 
@@ -196,6 +198,60 @@ class SendBufferTest(unittest.TestCase):
         self.assertIs(client.control_socket._sock, plain)
         self.assertFalse(mumblecompat.guard_control_socket(client),
                          "已经包过就不该再套一层")
+
+
+class OpusCtlTest(unittest.TestCase):
+    """opuslib 的 ctl 调用在 Apple 芯片上要走可变参数约定。
+
+    **这是"语音在 Mac 上连不上"的病根**，而且它不是 macOS 打包的问题——是
+    ABI 的问题：`opus_encoder_ctl(st, request, ...)` 是可变参数函数，opuslib
+    只设了 restype，没设 argtypes。Apple 的 arm64 ABI 把可变参数放栈上，
+    ctypes 却按普通调用塞进寄存器，libopus 读到垃圾，一律回 OPUS_BAD_ARG。
+
+    下面第一条是**真的建一个编码器、真的设一次码率**。这一点很要紧：任何用
+    替身的写法都验不到这个 bug——问题出在真实的 C 调用上，Mock 一律会"成功"。
+    """
+
+    def encoder(self):
+        try:
+            import opuslib
+        except Exception as e:
+            self.skipTest(f"没有 opus 原生库: {e}")
+        mumblecompat.patch_opus_ctl()
+        try:
+            return opuslib.Encoder(48000, 1, "audio")
+        except Exception as e:
+            self.skipTest(f"建不出编码器: {e}")
+
+    def test_the_bitrate_can_actually_be_set(self):
+        """pymumble 一连上就会做这件事（create_encoder -> _set_bandwidth）。
+
+        失败的话语音线程当场抛未捕获异常，界面只说"连接意外结束"。
+        """
+        encoder = self.encoder()
+        for bitrate in (52400, 32000):
+            encoder.bitrate = bitrate
+            self.assertEqual(encoder.bitrate, bitrate,
+                             "设进去的码率读回来对不上")
+
+    def test_it_only_touches_macos(self):
+        """别的平台本来就是好的，不顺手改 Windows 那条路。"""
+        with mock.patch.object(mumblecompat.sys, "platform", "win32"):
+            self.assertFalse(mumblecompat.patch_opus_ctl())
+
+    def test_a_missing_opus_does_not_raise(self):
+        """补不上顶多是回到原样；import 阶段抛异常会让整个客户端起不来。"""
+        with mock.patch.object(mumblecompat.sys, "platform", "darwin"):
+            with mock.patch.dict(sys.modules, {"opuslib.api.encoder": None}):
+                with mock.patch("builtins.__import__",
+                                side_effect=ImportError("no opus")):
+                    self.assertFalse(mumblecompat.patch_opus_ctl())
+
+    def test_install_applies_it(self):
+        """客户端只调 install()，所以它必须把这一条也带上。"""
+        with mock.patch.object(mumblecompat, "patch_opus_ctl") as patched:
+            mumblecompat.install()
+        patched.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -308,6 +308,28 @@ What makes this genuinely nasty is that **it works on the build machine**: Homeb
 
 Portaudio does **not** need any of this: PyAudio links against it, so PyInstaller's Mach-O analysis sees it, bundles it, and rewrites the reference to `@rpath/libportaudio.2.dylib`. Linked libraries are handled; `ctypes`-loaded ones are invisible. That distinction is the whole story.
 
+**On Apple silicon, voice could not connect at all, and the cause was a calling convention.** A few seconds after logging in, the voice thread died with an uncaught exception and the UI said only *"连接意外结束，没有给出原因"*:
+
+```
+soundoutput.py: create_encoder -> _set_bandwidth
+opuslib/api/ctl.py: inner
+opuslib.exceptions.OpusError: b'invalid argument'
+```
+
+It reads like the server handed out a bad bitrate. It is not about the bitrate — **every** value fails, and it reproduces in three lines with no server at all:
+
+```python
+enc = opuslib.Encoder(48000, 1, 'audio')
+enc.bitrate = 52400          # OpusError: invalid argument, on arm64 only
+```
+
+`opus_encoder_ctl(OpusEncoder *st, int request, ...)` is **variadic**, and opuslib sets only `restype`, never `argtypes`. On most platforms variadic and fixed arguments are passed the same way, which is why this code has always worked on Windows and would work on an Intel Mac. **Apple's arm64 ABI passes variadic arguments on the stack rather than in registers**; ctypes, not knowing the function is variadic, puts them in registers, libopus reads garbage off the stack and returns `OPUS_BAD_ARG` every time. The fix is to declare `argtypes` as the *fixed* parameters only — ctypes then uses the variadic convention for the rest, which is exactly what CPython documents for Apple silicon. It lives in `mumblecompat.patch_opus_ctl()`, gated to darwin, and `install()` calls it, so every component picks it up at import.
+
+Two things this episode should teach:
+
+- **`mumblecompat.py` has seven copies, not four** — the four shipped clients, both legacy pilot clients, and `server/ATIS/`. `server/ATIS/test_mumble.py`'s `CompatPatchTest` compares against *every* one of them and is what catches a partial sync. Do not assume the copy count of a shared file; `find . -name <file>` before editing.
+- **A test that mocks opuslib cannot catch this.** The bug is in the real C call, and any stub returns success. `OpusCtlTest.test_the_bitrate_can_actually_be_set` builds a real encoder and sets a real bitrate, skipping only if the native library is absent. Verified to fail with the production error when the patch is disabled.
+
 **pyttsx3 cannot synthesize anything usable on macOS, so ATIS was silent.** Its `nsss` driver writes **AIFF** from `save_to_file` (`FORM…AIFC`, whatever extension you ask for), so `wave.open` raises `file does not start with RIFF id`, `_render` catches it and logs `speech synthesis failed`, and the station broadcasts nothing. Its `runAndWait()` also wants an `NSRunLoop` on the main thread, while synthesis runs on the broadcast thread. `broadcast.py` therefore branches on `_MACOS` to the system `say` binary — one subprocess per segment, writing WAVE directly. Everything around it is unchanged: the same `_segments()` split, the same per-language rate, the same gap, the same cache. Three details worth keeping:
 
 - The script goes in through `say -f <file>` (UTF-8), not as an argument. An ATIS is hundreds of characters, and segments beginning with `-` (a runway, a negative dew point) would be parsed as options.

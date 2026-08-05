@@ -21,6 +21,7 @@ pymumble 自己的线程里，调用方只看到"线程没了"，界面上就显
 import logging
 import select
 import ssl
+import sys
 import time
 
 log = logging.getLogger("mumblecompat")
@@ -185,14 +186,63 @@ def patch_send():
 
 
 def install():
-    """打上 pymumble 需要的两个补丁。返回值只说 ssl.wrap_socket 补没补。
+    """打上 pymumble 需要的几个补丁。返回值只说 ssl.wrap_socket 补没补。
 
-    发送那个补丁在这里一并打上：所有客户端都在 import pymumble **之前**调
+    另外两个在这里一并打上：所有客户端都在 import pymumble **之前**调
     install()，这是唯一一处四个组件都必经的地方。
     """
     patched_ssl = _install_wrap_socket()
     patch_send()
+    patch_opus_ctl()
     return patched_ssl
+
+
+def patch_opus_ctl():
+    """修 opuslib 在 Apple 芯片上的可变参数调用。返回是否打了补丁。
+
+    **不打这个补丁，语音在 Apple 芯片的 Mac 上根本连不上。** 症状是连上服务器
+    几秒后语音线程里抛一个未捕获异常，界面报"连接意外结束，没有给出原因"：
+
+        soundoutput.py: create_encoder -> _set_bandwidth
+        opuslib/api/ctl.py: inner
+        opuslib.exceptions.OpusError: b'invalid argument'
+
+    看起来像服务器给的码率不对，其实和码率无关——**任何**值都会失败。
+
+    原因是 ABI。`opus_encoder_ctl(OpusEncoder *st, int request, ...)` 是可变参数
+    函数，而 opuslib 只设了 `restype`、没设 `argtypes`。在大多数平台上可变参数
+    和普通参数的传法一样，所以这份代码在 Windows 和 Intel Mac 上都没问题；
+    **Apple 自己的 arm64 ABI 把可变参数放在栈上而不是寄存器里**，ctypes 不知道
+    这个函数是可变参数的，就按普通调用把它们塞进寄存器，libopus 从栈上读到的是
+    垃圾，于是一律回 OPUS_BAD_ARG。
+
+    办法是把 `argtypes` 设成**只有固定参数**那两个。ctypes 见到这种情况就明白
+    后面的实参要走可变参数约定——CPython 的文档专门写了这条，就是给 Apple
+    arm64 用的。
+
+    只在 macOS 上打。别的平台本来就是好的，而这个仓库的规矩是不顺手改动
+    Windows 那条路。失败也不抛：补不上顶多是回到现在这个样子，而在
+    import 阶段抛异常会让整个客户端起不来。
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+
+        import opuslib.api.decoder
+        import opuslib.api.encoder
+
+        opuslib.api.encoder.libopus_ctl.argtypes = [
+            opuslib.api.encoder.EncoderPointer, ctypes.c_int]
+        opuslib.api.decoder.libopus_ctl.argtypes = [
+            opuslib.api.decoder.DecoderPointer, ctypes.c_int]
+    except Exception as e:
+        log.warning("could not fix the opus ctl calling convention, "
+                    "voice may fail to start on Apple silicon: %s", e)
+        return False
+    log.debug("declared the fixed arguments of opus_encoder_ctl/opus_decoder_ctl "
+              "so ctypes uses the variadic convention (needed on Apple silicon)")
+    return True
 
 
 def _install_wrap_socket():
