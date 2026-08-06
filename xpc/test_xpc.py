@@ -168,6 +168,37 @@ class PositionPacketTest(unittest.TestCase):
         self.assertEqual(fields[7], "450")              # 地速
         self.assertEqual(len(fields), 10)
 
+    def test_pressure_correction_defaults_to_zero(self):
+        """取不到修正量就是 0，也就是修正前的行为。"""
+        self.pilot._send_position()
+        self.assertEqual(self.sent[0].split(":")[9], "0")
+
+    def test_pressure_correction_reaches_the_last_field(self):
+        """高度字段是真高，最后这个字段才让管制端算出气压高度。
+
+        写死 0 的时候管制端看到的就是真高，和座舱高度表差一千英尺。
+        """
+        self.pilot.update_position({
+            "latitude": 0, "longitude": 0, "altitude": 34000, "groundspeed": 450,
+            "pitch": 0, "bank": 0, "heading": 0, "squawk": 2000, "xpdr_mode": 2,
+            "pressure_delta": 1000,
+        })
+        self.pilot._send_position()
+        fields = self.sent[0].split(":")
+        self.assertEqual(fields[6], "34000")            # 真高照旧
+        self.assertEqual(fields[9], "1000")
+        # 管制端把两者相加，得到的就是座舱高度表上的数
+        self.assertEqual(int(fields[6]) + int(fields[9]), 35000)
+
+    def test_a_negative_correction_survives(self):
+        self.pilot.update_position({
+            "latitude": 0, "longitude": 0, "altitude": 35000, "groundspeed": 450,
+            "pitch": 0, "bank": 0, "heading": 0, "squawk": 2000, "xpdr_mode": 2,
+            "pressure_delta": -700,
+        })
+        self.pilot._send_position()
+        self.assertEqual(self.sent[0].split(":")[9], "-700")
+
     def test_attitude_survives_the_packet(self):
         self.pilot._send_position()
         pitch, bank, heading = unpack_pbh(int(self.sent[0].split(":")[8]))
@@ -1702,6 +1733,18 @@ class SnapshotTest(unittest.TestCase):
 
     def test_metres_to_feet(self):
         self.assertEqual(self.link.snapshot()["altitude"], 35000)
+
+    def test_pressure_correction_without_the_datarefs(self):
+        """老 X-Plane 不推这两个 dataref 时退回修正前的行为。"""
+        self.assertEqual(self.link.snapshot()["pressure_delta"], 0)
+
+    def test_pressure_correction_from_the_altimeter(self):
+        """高度表读数和真高之差，就是管制端要加的那一千英尺。"""
+        self.link.values["indicated_altitude"] = 36000.0
+        self.link.values["baro_setting"] = 29.92
+        snapshot = self.link.snapshot()
+        self.assertEqual(snapshot["altitude"], 35000)     # 真高照旧
+        self.assertEqual(snapshot["pressure_delta"], 1000)
 
     def test_agl_in_feet(self):
         self.assertEqual(self.link.snapshot()["agl"], 10000)

@@ -173,8 +173,62 @@ class SnapshotTest(unittest.TestCase):
         """和 xpc 共用 fsdpilot/voice，字段名对不上就会静默出错。"""
         required = {"latitude", "longitude", "altitude", "groundspeed",
                     "pitch", "bank", "heading", "squawk", "xpdr_mode",
-                    "com1", "com2", "com1_power", "on_ground"}
+                    "com1", "com2", "com1_power", "on_ground", "pressure_delta"}
         self.assertTrue(required.issubset(self.link.snapshot()))
+
+
+class PressureAltitudeTest(unittest.TestCase):
+    """位置包最后一个字段：气压高度减真高。
+
+    实报的现象是"座舱高度表 35000，服务器上 34000"，差了一千英尺。原因不是
+    单位错了，是两个高度本来就不是一回事：PLANE_ALTITUDE 是真高，高度表读的
+    是按窗口里那个气压算出来的指示高度。以前这个字段写死 0，管制端于是直接
+    拿真高当高度显示。
+    """
+
+    def test_standard_setting_means_indicated_is_pressure_altitude(self):
+        # 拨 29.92 时指示高度就是气压高度，差值只剩指示高度和真高之差
+        self.assertEqual(
+            simlink.pressure_delta(35000.0, 29.92, 34000), 1000)
+
+    def test_no_difference_reports_zero(self):
+        self.assertEqual(simlink.pressure_delta(3000.0, 29.92, 3000), 0)
+
+    def test_low_pressure_day(self):
+        # 拨 28.92（比标准低一寸），气压高度比指示高度高一千英尺
+        self.assertEqual(
+            simlink.pressure_delta(35000.0, 28.92, 35000), 1000)
+
+    def test_high_pressure_day(self):
+        self.assertEqual(
+            simlink.pressure_delta(0.0, 30.92, 0), -1000)
+
+    def test_missing_readings_do_not_correct(self):
+        """读不到就退回修正前的行为，不能瞎猜。"""
+        self.assertEqual(simlink.pressure_delta(None, 29.92, 35000), 0)
+        self.assertEqual(simlink.pressure_delta(35000.0, None, 35000), 0)
+
+    def test_a_nonsense_barometer_does_not_correct(self):
+        """SimVar 读不到时会是 0，(29.92-0)*1000 会把飞机在雷达上挪三万英尺。"""
+        self.assertEqual(simlink.pressure_delta(35000.0, 0.0, 35000), 0)
+        self.assertEqual(simlink.pressure_delta(35000.0, 99.0, 35000), 0)
+
+    def test_snapshot_carries_it(self):
+        link = simlink.SimLink()
+        link.values = {
+            "latitude": 31.0, "longitude": 121.0,
+            "altitude": 34000.0,
+            "indicated_altitude": 35000.0, "baro_setting": 29.92,
+        }
+        self.assertEqual(link.snapshot()["pressure_delta"], 1000)
+
+    def test_snapshot_without_the_new_simvars_still_works(self):
+        """老的 Python-SimConnect 取不到这两个值时不能连整份数据一起丢。"""
+        link = simlink.SimLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "altitude": 34000.0}
+        snapshot = link.snapshot()
+        self.assertEqual(snapshot["altitude"], 34000)
+        self.assertEqual(snapshot["pressure_delta"], 0)
 
 
 class PollResultTest(unittest.TestCase):
