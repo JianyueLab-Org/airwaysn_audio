@@ -11,3 +11,6 @@ release/
 
 # docker compose 读的口令文件，只在服务器上放一份（格式见 .env.example）
 .env
+
+# macOS
+.DS_Store
