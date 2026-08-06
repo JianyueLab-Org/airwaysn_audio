@@ -42,8 +42,13 @@ POLL_INTERVAL = 0.2         # 取数据的间隔，和位置包的 5 Hz 对齐
 SIMVARS = {
     "latitude": "PLANE_LATITUDE",                  # 度（已经是度，不要再转）
     "longitude": "PLANE_LONGITUDE",                # 度（同上）
-    "altitude": "PLANE_ALTITUDE",                  # 英尺
+    "altitude": "PLANE_ALTITUDE",                  # 英尺（真高，不是高度表读数）
     "agl": "PLANE_ALT_ABOVE_GROUND",               # 英尺
+    # 只用来算位置包最后那个气压修正量，见 pressure_delta()。
+    # 别改用 PRESSURE_ALTITUDE：RequestList.py 给它写的单位是 **Meters**，
+    # 这一堆高度里就它一个不是英尺，直接当英尺用会差 3.28 倍。
+    "indicated_altitude": "INDICATED_ALTITUDE",    # 英尺
+    "baro_setting": "KOHLSMAN_SETTING_HG",         # inHg
     "groundspeed": "GROUND_VELOCITY",              # 节
     "pitch": "PLANE_PITCH_DEGREES",                # 弧度（名字骗人）
     "bank": "PLANE_BANK_DEGREES",                  # 弧度（名字同样骗人）
@@ -62,6 +67,37 @@ SIMVARS = {
     "light_strobe": "LIGHT_STROBE",
     "light_nav": "LIGHT_NAV",
 }
+
+
+# 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
+STANDARD_PRESSURE_INHG = 29.92
+# 高度表窗口能拨到的范围。超出这个范围的值一定是没读到（0）或者读错了，
+# 拿它去算修正量会把飞机在雷达上挪三万英尺，所以宁可不修正。
+BARO_RANGE = (25.0, 32.0)
+
+
+def pressure_delta(indicated_ft, baro_inhg, true_altitude_ft):
+    """位置包最后一个字段：气压高度减真高，英尺。
+
+    和 xpc/xplane.py 里那份是同一套算法，只是数据来自 SimConnect。
+
+    应答机报的是**气压高度**（高度表拨 29.92 时读到的数），而位置包第 7 个
+    字段报的是**真高**——两者在巡航高度上能差一千英尺，这就是"座舱里 35000、
+    雷达上 34000"的由来。FSD 协议把差值单独放在最后一个字段里，正是为了让
+    画他机的客户端拿真高摆飞机、让管制端拿真高加修正量当高度显示。
+
+    气压高度 = 指示高度 + (29.92 - 高度表拨的气压) * 1000。温度偏差带来的
+    误差不需要另算：指示高度本身就带着它，真高不带，相减自然就有了。
+
+    读不到就返回 0，也就是退回修正前的行为——宁可不修正，不能瞎修正。
+    """
+    if indicated_ft is None or baro_inhg is None:
+        return 0
+    if not BARO_RANGE[0] <= baro_inhg <= BARO_RANGE[1]:
+        return 0
+    pressure_altitude = (indicated_ft
+                         + (STANDARD_PRESSURE_INHG - baro_inhg) * 1000.0)
+    return int(round(pressure_altitude - true_altitude_ft))
 
 
 def bcd_to_squawk(raw):
@@ -223,13 +259,16 @@ class SimLink:
         if not raw:
             return None
 
+        altitude = int(round(raw.get("altitude", 0.0)))
         return {
             # 经纬度已经是度。以前这里又 math.degrees 了一次，31.14 变成
             # 1784.2，服务端每个位置包都回 "Invalid latitude/longitude"，
             # 90 秒后把连接掐掉。
             "latitude": raw.get("latitude", 0.0),
             "longitude": raw.get("longitude", 0.0),
-            "altitude": int(round(raw.get("altitude", 0.0))),
+            "altitude": altitude,
+            "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
+                                             raw.get("baro_setting"), altitude),
             "agl": int(round(raw.get("agl", 0.0))),
             "groundspeed": int(round(raw.get("groundspeed", 0.0))),
             "pitch": -math.degrees(raw.get("pitch", 0.0)),

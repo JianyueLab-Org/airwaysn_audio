@@ -438,10 +438,14 @@ class FSDPilot:
 
         pbh = pack_pbh(snapshot["pitch"], snapshot["bank"], snapshot["heading"],
                        snapshot.get("on_ground", False))
+        # 最后一个字段是气压修正量：高度字段报的是真高，加上它才是应答机报的
+        # 气压高度。老代码这里写死 0，于是管制端看到的高度就是真高，和座舱
+        # 高度表能差一千英尺。取不到就还是 0，退回原来的行为。
         self._send(
             f"@{mode}:{self.callsign}:{squawk:04d}:{self.rating}:"
             f"{snapshot['latitude']:.5f}:{snapshot['longitude']:.5f}:"
-            f"{snapshot['altitude']}:{snapshot['groundspeed']}:{pbh}:0")
+            f"{snapshot['altitude']}:{snapshot['groundspeed']}:{pbh}:"
+            f"{snapshot.get('pressure_delta', 0)}")
 
         # 停在地面上没动就降频，省得刷屏
         if snapshot.get("on_ground") and snapshot.get("groundspeed", 0) < 1:
