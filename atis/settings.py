@@ -91,7 +91,7 @@ class Settings:
                 self.cid = data.get("cid", "")
                 self.metar_url = data.get("metar_url") or weather.DEFAULT_METAR_URL
                 self.fsd_host = data.get("fsd_host") or DEFAULT_FSD_HOST
-                if self.fsd_host in WRONG_FSD_HOSTS:
+                if (self.fsd_host or "").strip().lower() in WRONG_FSD_HOSTS:
                     log.warning("the FSD host %s in the settings is the voice server, "
                                 "using %s instead", self.fsd_host,
                                 DEFAULT_FSD_HOST)

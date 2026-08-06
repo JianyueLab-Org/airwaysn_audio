@@ -70,7 +70,9 @@ APP_NAME = "MSFS for CAN"
 # `version.version()` 会去读它。用常量的后果是标题栏永远显示回退值：
 # 实测 v2.0.3 的包，日志首行是 v2.0.3，标题栏却写着 v2.0.0，
 # 用户拿标题栏对版本就会以为自己没更新成功。
-VERSION = version.version()
+# 标题栏用 display()：Dev 包要显示成 v2.1.2 (Dev Build 1)，
+# 正式包和以前一样是纯版本号。
+VERSION = version.display()
 
 # 多个包目录在输入框里的分隔符。用中文分号而不是英文的：Windows 的路径里出现
 # 英文分号的概率虽小，但环境变量 PATH 就是用它分隔的，用户很容易照那个习惯粘一串
@@ -164,6 +166,12 @@ class MsfsWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
+        # 他机单独一个更快的节奏：500 ms 推一次的话一架 450 kt 的飞机每半秒
+        # 瞬移 115 米，traffic.py 的插值等于白算。200 ms 是注入开销（每架一次
+        # SimConnect IPC）和平滑度之间的折中；上一轮没做完会自动跳过。
+        self.traffic_timer = QTimer(self)
+        self.traffic_timer.timeout.connect(self.traffic_tick)
+        self.traffic_timer.start(200)
 
         # 起来之后在后台问一次有没有新版。查不到就当没这回事。
         self.check_for_update()
@@ -459,7 +467,11 @@ class MsfsWindow(QMainWindow):
         if self.voice and com1 and snapshot.get("com1_power", True):
             self.voice.set_frequency(com1)
 
-        self._push_traffic(snapshot)
+    def traffic_tick(self):
+        """每 0.2 秒：把他机插值到当下放进模拟器。和 tick() 分开是为了平滑。"""
+        snapshot = self.snapshot
+        if snapshot:
+            self._push_traffic(snapshot)
 
     # ---------- 他机 ----------
     def package_roots(self):
@@ -492,14 +504,29 @@ class MsfsWindow(QMainWindow):
 
     def _push_traffic(self, snapshot):
         """把他机插值到当前时刻，放进模拟器。"""
+        # prune 不受开关控制：关着渲染的话表会涨一整场
+        for callsign in self.traffic.prune():
+            self._model_cache.pop(callsign, None)
         if not self.settings.render_traffic:
+            # 刚关掉开关时把已经放进去的清掉——不清的话飞机全部冻在天上，
+            # 用户本来是嫌掉帧才关的，结果掉帧还在
+            if (self.injector is not None and self.injector.aircraft
+                    and not self._injecting.is_set()):
+                self._injecting.set()
+                threading.Thread(target=self._clear_injected, daemon=True).start()
             return
+        # SimLink 断线重连后句柄是新建的，旧注入器抱着死句柄：创建请求发到
+        # 关掉的连接上、objectID 永远不回来。句柄一换就重建注入器。
+        if (self.injector is not None and self.sim.sim is not None
+                and self.injector.sim is not self.sim.sim):
+            log.info("SimConnect was reopened, rebuilding the traffic injector")
+            self.injector = None
+            self._model_cache.clear()
         # 注入器要等 SimConnect 真的连上才能建
         if self.injector is None and self.sim.sim is not None:
             self.injector = inject.TrafficInjector(self.sim.sim)
             if not self.injector.available:
                 self.add_message(t("msg.inject_unavailable"), theme.ACTIVE_COLOR)
-        self.traffic.prune()
 
         origin = (snapshot["latitude"], snapshot["longitude"])
         entries = self.traffic.snapshot(
@@ -526,6 +553,14 @@ class MsfsWindow(QMainWindow):
         finally:
             self._injecting.clear()
 
+    def _clear_injected(self):
+        try:
+            self.injector.clear()
+        except Exception as e:
+            log.warning("clearing the injected traffic raised: %s", e)
+        finally:
+            self._injecting.clear()
+
     def _model_for(self, entry):
         """给一架飞机挑模型。匹配结果缓存住，别每帧都算。
 
@@ -533,7 +568,9 @@ class MsfsWindow(QMainWindow):
         建不出来的模型，注入端又因为它在黑名单里而跳过，飞机永远出不来。
         """
         callsign = entry["callsign"]
-        rejected = self.injector.bad_titles if self.injector else frozenset()
+        # 拷一份：bad_titles 会被 SimConnect 的回调线程随时更新，直接把活的
+        # set 交给 match() 去迭代会撞上 RuntimeError: Set changed size
+        rejected = set(self.injector.bad_titles) if self.injector else frozenset()
         cached = self._model_cache.get(callsign)
         if (not entry.get("model_dirty") and cached is not None
                 and cached not in rejected):
@@ -546,7 +583,11 @@ class MsfsWindow(QMainWindow):
             exclude=rejected)
         title = model.title if model else ""
         self._model_cache[callsign] = title
-        self.traffic.mark_model_clean(callsign)
+        # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
+        # 之前，无条件清标记会把那次更新吞掉
+        self.traffic.mark_model_clean(callsign,
+                                      equipment=entry.get("equipment", ""),
+                                      airline=entry.get("airline", ""))
         if model:
             # 机型还没问到时先用通用模型顶上，半秒后 #SB 回来会再匹配一次并覆盖
             # 掉它。两行里只有后一行是结论，前一行降到 DEBUG。
@@ -570,7 +611,7 @@ class MsfsWindow(QMainWindow):
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "net.online", 'reconnecting': "net.reconnecting",
-                'offline': "net.offline"}
+                'offline': "net.offline", 'stopped': "net.disconnected"}
         self.fsd_label.setText(t(keys[state]) if state in keys
                                else t("net.other", state=state))
         self.fsd_label.setStyleSheet(f"color: {colour};")
@@ -803,10 +844,12 @@ class MsfsWindow(QMainWindow):
             self.fsd.stop()
         if self.voice:
             self.voice.stop()
-        self.sim.stop()
-        # 放进模拟器的 AI 飞机不会自己消失，不清掉会在天上冻住
+        # 放进模拟器的 AI 飞机不会自己消失，不清掉会在天上冻住。
+        # 必须排在 sim.stop() **之前**：句柄一关，AIRemoveObject 全部发到
+        # 一条死连接上，被静默吞掉——正好造成这段注释想避免的结果。
         if self.injector is not None:
             self.injector.clear()
+        self.sim.stop()
         self.settings.save()
         event.accept()
 

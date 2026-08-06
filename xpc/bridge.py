@@ -17,6 +17,7 @@ X-Plane 自己的 Python 里（XPPython3），装的包和我们客户端那套�
 本机回环 MTU 通常够，但不能赌。
 """
 
+import base64
 import json
 import logging
 import socket
@@ -32,7 +33,10 @@ HOST = "127.0.0.1"
 # 一个 UDP 包里放多少字节的负载。本机回环能扛更大，但 8 KB 是安全线。
 MAX_PAYLOAD = 8000
 
-PROTOCOL_VERSION = 1
+# v2：分片改按**字节**切并用 base64 装进 JSON。v1 是切完字节再按 UTF-8 解回
+# 字符串，切口落在多字节字符中间（呼号、CSL 路径里的中文）时 json.dumps 直接
+# UnicodeEncodeError——从那一帧起插件再也收不到任何数据，整个天空清空。
+PROTOCOL_VERSION = 2
 
 # 一帧最多送多少架飞机。TCAS 数组是 64 个位置，0 号给本机，所以他机 63 架。
 # 客户端按距离排序后截断——超了必须先扔远的，不能随便扔。
@@ -43,20 +47,23 @@ def encode(message, sequence=0, max_payload=MAX_PAYLOAD):
     """把一条消息切成若干个待发的 UDP 包（bytes 列表）。
 
     每个包本身是一行 JSON，带 seq/part/total，插件那边靠这三个字段重组。
+
+    切片按**原始字节**来，负载走 base64——切口可以落在任何位置，不用管字符
+    边界。按字符串切再拼是修不好的：UTF-8 字节流从中间断开后两半各自都不是
+    合法字符串，surrogateescape 能把它们塞进 JSON，拼回来的却不是原文。
     """
-    body = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-    raw = body.encode("utf-8")
-    if len(raw) <= max_payload:
-        chunks = [raw]
-    else:
-        chunks = [raw[i:i + max_payload] for i in range(0, len(raw), max_payload)]
+    raw = json.dumps(message, ensure_ascii=False,
+                     separators=(",", ":")).encode("utf-8")
+    # base64 会膨胀 4/3，切片尺寸要按编码后不超过 max_payload 算
+    step = max(1, max_payload * 3 // 4)
+    chunks = [raw[i:i + step] for i in range(0, len(raw), step)] or [b""]
 
     packets = []
     for index, chunk in enumerate(chunks):
         header = {"v": PROTOCOL_VERSION, "seq": sequence,
                   "part": index, "total": len(chunks),
-                  "data": chunk.decode("utf-8", errors="surrogateescape")}
-        packets.append(json.dumps(header, ensure_ascii=False).encode("utf-8"))
+                  "data": base64.b64encode(chunk).decode("ascii")}
+        packets.append(json.dumps(header).encode("utf-8"))
     return packets
 
 
@@ -83,24 +90,33 @@ class Reassembler:
 
         sequence = header.get("seq", 0)
         if sequence != self.sequence:
-            # 新的一帧，旧的没收齐就不要了
+            # 序号是 16 位环回的。只有**往前走**才算新帧；乱序迟到的旧帧
+            # 必须扔掉——原来"不等于就算新"会让一组迟到的旧分片顶掉刚拼好的
+            # 新帧，飞机往回跳，正是这套设计要防的事。
+            if self.sequence is not None:
+                delta = (sequence - self.sequence) & 0xFFFF
+                if delta == 0 or delta > 0x8000:
+                    return None
             self.sequence = sequence
             self.parts = {}
-            self.total = header.get("total", 1)
+            self.total = max(1, int(header.get("total", 1) or 1))
 
         try:
-            self.parts[int(header["part"])] = header["data"]
+            part = int(header["part"])
+            if not 0 <= part < self.total:
+                return None
+            self.parts[part] = base64.b64decode(header["data"])
         except (KeyError, TypeError, ValueError):
             return None
 
         if len(self.parts) < self.total:
             return None
 
-        body = "".join(self.parts[i] for i in range(self.total))
+        body = b"".join(self.parts[i] for i in range(self.total))
         self.parts = {}
         try:
-            return json.loads(body)
-        except ValueError as e:
+            return json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
             log.debug("still could not parse after reassembly: %s", e)
             return None
 

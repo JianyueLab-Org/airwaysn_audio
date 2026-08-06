@@ -310,12 +310,40 @@ class PacketHandlingTest(unittest.TestCase):
         self.pilot._handle_packet("$CQZSPD_TWR:CCA1501:CAPS")
         self.assertTrue(sent[0].startswith("$CRCCA1501:ZSPD_TWR:CAPS"))
 
-    def test_aircraft_query_is_answered(self):
+    def test_aircraft_query_is_answered_with_config_json(self):
+        """ACC 的回复是配置 JSON（灯光/襟翼/起落架），不是机型码。
+
+        以前回的是机型码，和请求方 set_config 期望的负载完全对不上——结果
+        就是所有他机永远全程关灯、光杆落地。
+        """
         sent = []
-        self.pilot.aircraft = "B738"
+        self.pilot.update_position({
+            "gear_down": False, "flaps": 0.5, "spoilers": True,
+            "lights": {"beacon_on": True, "landing_on": False},
+            "engines_on": True,
+        })
         self.pilot._send = sent.append
         self.pilot._handle_packet("$CQZSPD_TWR:CCA1501:ACC")
-        self.assertIn("B738", sent[0])
+        self.assertTrue(sent[0].startswith("$CRCCA1501:ZSPD_TWR:ACC:"))
+        config = json.loads(sent[0].split(":ACC:", 1)[1])
+        self.assertFalse(config["gear_down"])
+        self.assertEqual(config["flaps_pct"], 50.0)
+        self.assertTrue(config["spoilers_out"])
+        self.assertTrue(config["lights"]["beacon_on"])
+
+    def test_a_config_reply_reaches_the_traffic_table(self):
+        """$CR …:ACC:{json} 要落进 TrafficTable.set_config。"""
+        table = traffic_module.TrafficTable()
+        table.update_position("CES2345", latitude=31, longitude=121,
+                              altitude=1000, pitch=0, bank=0, heading=0)
+        self.pilot.traffic = table
+        payload = json.dumps({"gear_down": True, "flaps_pct": 40,
+                              "lights": {"strobe_on": True}})
+        self.pilot._handle_packet(f"$CRCES2345:CCA1501:ACC:{payload}")
+        aircraft = table.get("CES2345")
+        self.assertTrue(aircraft.gear_down)
+        self.assertAlmostEqual(aircraft.flaps, 0.4)
+        self.assertTrue(aircraft.lights["strobe_on"])
 
     def test_query_for_someone_else_is_ignored(self):
         sent = []
@@ -824,6 +852,51 @@ class VoiceRuntimeTest(unittest.TestCase):
             self.assertIn("根频道", self.voice._skip_reason)
         finally:
             self.voice._channel_lock.release()
+
+
+class ReleaseOrderTest(unittest.TestCase):
+    """_release() 必须先停 Mumble 再收 PyAudio。
+
+    接收回调跑在 pymumble 的线程上，正在 _output.write() 时把 PyAudio
+    terminate 掉是 C 层崩溃，try/except 接不住——正常断开时对面恰好有人
+    说话就中招。
+    """
+
+    def test_mumble_stops_before_audio_terminates(self):
+        import threading as threading_module
+
+        import voice
+
+        order = []
+
+        class FakeMumble:
+            def stop(self):
+                order.append("mumble.stop")
+
+        class FakeStream:
+            def stop_stream(self):
+                pass
+
+            def close(self):
+                order.append("stream.close")
+
+        class FakeAudio:
+            def terminate(self):
+                order.append("audio.terminate")
+
+        client = object.__new__(voice.Voice)
+        client.mumble = FakeMumble()
+        client._input = FakeStream()
+        client._output = FakeStream()
+        client._audio = FakeAudio()
+        client._stream_lock = threading_module.Lock()
+        client._release()
+
+        self.assertEqual(order[0], "mumble.stop",
+                         "必须先停 Mumble：接收回调可能还在往流里写")
+        self.assertIn("audio.terminate", order)
+        self.assertLess(order.index("mumble.stop"),
+                        order.index("audio.terminate"))
 
 
 class VoiceStartupFailureTest(unittest.TestCase):
@@ -1910,6 +1983,20 @@ class PlaneInfoExchangeTest(unittest.TestCase):
         self.pilot._handle_packet("#SBCES2345:CCA1501:PI:GEN:EQUIPMENT=B738")
         self.assertIn("CES2345", self.table)
 
+    def test_info_before_position_survives_a_prune(self):
+        """机型先到、位置未到的那条记录，下一轮 prune 不能立刻清掉。
+
+        以前 prune 对 latest is None 的记录无条件删除，半秒后就没了——
+        PI:GEN 白收，位置到达时机型又得重新问一轮。
+        """
+        self.pilot._handle_packet("#SBCES2345:CCA1501:PI:GEN:EQUIPMENT=B738")
+        self.table.prune()
+        self.assertIn("CES2345", self.table)
+        # 宽限也不是永远：过了 STALE_AFTER 还没等到位置就该清了
+        aircraft = self.table.get("CES2345")
+        self.table.prune(now=aircraft.created + traffic_module.STALE_AFTER + 1)
+        self.assertNotIn("CES2345", self.table)
+
 
 class InterpolationTest(unittest.TestCase):
     """FSD 一秒才 5 个包，不插值飞机会一跳一跳。"""
@@ -1977,6 +2064,18 @@ class InterpolationTest(unittest.TestCase):
         self._add(100.0, 30.0, 120.0, altitude=10000)
         self._add(101.0, 30.0, 120.0, altitude=10010)
         self.assertAlmostEqual(self.table.get("CES2345").vertical_speed, 600.0, places=3)
+
+    def test_longitude_takes_the_short_way_across_the_antimeridian(self):
+        # 179.98°E 到 -179.98° 是往前 0.04°，线性差值会横穿整个地球
+        self._add(100.0, 30.0, 179.98)
+        self._add(101.0, 30.0, -179.98)
+        longitude = self.table.get("CES2345").position_at(100.5)["longitude"]
+        self.assertTrue(abs(longitude) > 179.9,
+                        f"中点应当贴着 180° 经线，算出来是 {longitude}")
+
+    def test_range_across_the_antimeridian_is_short(self):
+        distance = traffic_module.distance_nm(30.0, 179.9, 30.0, -179.9)
+        self.assertLess(distance, 30, "跨 180° 经线的距离算成绕地球一圈了")
 
 
 class TrafficTableTest(unittest.TestCase):
@@ -2321,6 +2420,51 @@ class BridgeTest(unittest.TestCase):
     def test_chinese_survives(self):
         result, _ = self._round_trip({"note": "国航一五零一"})
         self.assertEqual(result["note"], "国航一五零一")
+
+    def test_fragmented_chinese_survives(self):
+        """分片切口落在多字节字符中间也不能出事。
+
+        v1 按字符串切分片，切口落在中文（CSL 路径、备注）中间时 json.dumps
+        直接 UnicodeEncodeError——从那一帧起插件再也收不到任何数据。分片按
+        字节 + base64 之后，任何切口都合法。max_payload 取小值保证每个切口
+        都落在汉字里。
+        """
+        message = {"object": "D:/模型库/Bluebell/波音七三八" * 40}
+        for payload in (37, 41, 43, 100):
+            reassembler = self.bridge.Reassembler()
+            result = None
+            for packet in self.bridge.encode(message, 3, max_payload=payload):
+                result = reassembler.feed(packet) or result
+            self.assertEqual(result, message,
+                             f"max_payload={payload} 时拼不回来")
+
+    def test_a_late_old_frame_does_not_replace_a_newer_one(self):
+        """迟到的旧帧要扔掉，不能顶掉刚拼好的新帧——飞机会往回跳。"""
+        new = self.bridge.encode({"n": 2}, 5)
+        old = self.bridge.encode({"n": 1}, 4, max_payload=100)
+        self.assertEqual(self.reassembler.feed(new[0]), {"n": 2})
+        for packet in old:
+            self.assertIsNone(self.reassembler.feed(packet))
+
+    def test_sequence_wraps_around_16_bits(self):
+        # 序号是 (seq+1)&0xFFFF 环回的，0xFFFF 之后的 0 是新帧不是旧帧
+        self.assertEqual(self.reassembler.feed(
+            self.bridge.encode({"n": 1}, 0xFFFF)[0]), {"n": 1})
+        self.assertEqual(self.reassembler.feed(
+            self.bridge.encode({"n": 2}, 0)[0]), {"n": 2})
+
+    def test_an_out_of_range_part_is_ignored_not_fatal(self):
+        packets = self.bridge.encode({"a": "x" * 500}, 9, max_payload=100)
+        self.assertIsNone(self.reassembler.feed(packets[0]))
+        bad = json.loads(packets[0].decode("utf-8"))
+        bad["part"] = 99
+        self.assertIsNone(self.reassembler.feed(
+            json.dumps(bad).encode("utf-8")))
+        # 剩下的分片照常拼得回来
+        result = None
+        for packet in packets[1:]:
+            result = self.reassembler.feed(packet) or result
+        self.assertEqual(result, {"a": "x" * 500})
 
     def test_plugin_reassembler_matches_the_client_one(self):
         """插件里那份重组器是独立的一份代码，必须和这边行为一致。"""

@@ -49,8 +49,9 @@ class VersionStringTest(unittest.TestCase):
         try:
             version._resource_dir = lambda: folder
             version._cached_version = None
-            self.assertEqual(version.version(), "2.0.99")
-            self.assertNotEqual(version.version(), version.VERSION)
+            # 基线的解析和 DEV 开关无关，所以比的是 release_version()
+            self.assertEqual(version.release_version(), "2.0.99")
+            self.assertNotEqual(version.release_version(), version.VERSION)
         finally:
             version._resource_dir = original_dir
             version._cached_version = original_cache
@@ -62,7 +63,7 @@ class VersionStringTest(unittest.TestCase):
         try:
             version._resource_dir = lambda: tempfile.mkdtemp()
             version._cached_version = None
-            self.assertEqual(version.version(), version.VERSION)
+            self.assertEqual(version.release_version(), version.VERSION)
         finally:
             version._resource_dir = original_dir
             version._cached_version = original_cache
@@ -126,6 +127,60 @@ class DisplayedVersionTest(unittest.TestCase):
             offenders, [],
             "这些地方把回退常量当成版本号显示了，打包之后会一直显示旧版本号："
             + "；".join(offenders))
+
+
+class DevBuildTest(unittest.TestCase):
+    """Dev 测试版：DEV 置 True 时报下一个补丁号加 (Dev Build N)。
+
+    最新正式版是 v2.1.1 时，第一个 Dev 包是 v2.1.2 (Dev Build 1)；同一个
+    版本再出一个测试包 DEV_BUILD 加一。取"下一个补丁号"是为了让测试包在
+    排序上永远新于它基于的正式版。
+    """
+
+    def setUp(self):
+        self._dev = version.DEV
+        self._build = version.DEV_BUILD
+        self._cache = version._cached_version
+
+    def tearDown(self):
+        version.DEV = self._dev
+        version.DEV_BUILD = self._build
+        version._cached_version = self._cache
+
+    def test_the_dev_flag_is_a_plain_bool(self):
+        # 开发分支上 DEV 可以是 True（当前就是）；这里只钉住类型和 build 号
+        # 从 1 起——正式发布的分支把 DEV 关回 False、DEV_BUILD 归 1
+        self.assertIsInstance(version.DEV, bool)
+        self.assertGreaterEqual(version.DEV_BUILD, 1)
+
+    def test_bump_patch(self):
+        self.assertEqual(version._bump_patch("2.1.1"), "2.1.2")
+        self.assertEqual(version._bump_patch("2.1.9"), "2.1.10")
+        self.assertEqual(version._bump_patch("2.0.99"), "2.0.100")
+
+    def test_dev_version_is_the_next_patch(self):
+        version._cached_version = "2.1.1"
+        version.DEV = True
+        self.assertEqual(version.version(), "2.1.2")
+        self.assertEqual(version.display(), "2.1.2 (Dev Build 1)")
+
+    def test_second_dev_build_bumps_the_build_number_not_the_version(self):
+        version._cached_version = "2.1.1"
+        version.DEV = True
+        version.DEV_BUILD = 2
+        self.assertEqual(version.version(), "2.1.2")
+        self.assertEqual(version.display(), "2.1.2 (Dev Build 2)")
+
+    def test_full_carries_the_dev_label(self):
+        version._cached_version = "2.1.1"
+        version.DEV = True
+        self.assertIn("Dev Build 1", version.full())
+        self.assertIn("v2.1.2", version.full())
+
+    def test_release_display_is_the_plain_version(self):
+        version._cached_version = "2.1.1"
+        version.DEV = False
+        self.assertEqual(version.display(), "2.1.1")
 
 
 class CopiesAgreeTest(unittest.TestCase):

@@ -618,7 +618,38 @@ class InjectorTest(unittest.TestCase):
 
     def test_position_definition_field_count(self):
         # 写进去的结构体字段数必须和数据定义一致，错位飞机会跑到地球另一边
-        self.assertEqual(len(self.inject._Definition.FIELDS), 8)
+        self.assertEqual(len(self.inject._Definition.FIELDS), 7)
+
+    def test_no_unsettable_simvar_in_the_definition(self):
+        """SIM ON GROUND 不可写，混进定义会让整条 SetDataOnSimObject 失败。
+
+        后果和跳板没换一样：飞机建在初始位置之后再也不动，日志一片干净。
+        """
+        names = [name for name, _ in self.inject._Definition.FIELDS]
+        self.assertNotIn(b"SIM ON GROUND", names)
+
+    def test_move_negates_pitch_and_bank(self):
+        """写回模拟器时俯仰和滚转要取负。
+
+        FSD 抬头为正，MSFS 的 PLANE PITCH DEGREES 低头为正（simlink 读的时候
+        就取了负）。不翻回来的话，进近的飞机在别人模拟器里全程俯冲。
+        """
+        written = []
+
+        class Dll:
+            @staticmethod
+            def SetDataOnSimObject(handle, definition, object_id, a, b, size, values):
+                written.append(list(values))
+                return 0
+
+        injector = self.inject.TrafficInjector(sim=None)
+        injector.sim = type("S", (), {"dll": Dll, "hSimConnect": None})()
+        injector._move(1, {"latitude": 30.0, "longitude": 120.0,
+                           "altitude": 5000, "pitch": 10.0, "bank": 25.0,
+                           "heading": 90.0, "groundspeed": 140})
+        self.assertEqual(written[0][3], -10.0, "俯仰没有取负")
+        self.assertEqual(written[0][4], -25.0, "滚转没有取负")
+        self.assertEqual(written[0][5], 90.0, "航向不该动")
 
     def test_definition_fields_are_bytes(self):
         # ctypes 的 c_char_p 只吃 bytes，写成 str 会在运行时才炸
@@ -813,6 +844,97 @@ class InjectorTest(unittest.TestCase):
         # 每架都是完整的飞机模型，放太多会掉帧
         self.assertLessEqual(self.inject.MAX_AIRCRAFT, 64)
         self.assertGreater(self.inject.MAX_AIRCRAFT, 0)
+
+    def _exception_enums(self):
+        return type("E", (), {
+            "SIMCONNECT_EXCEPTION": type("X", (), {
+                "SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED": 22,
+                "SIMCONNECT_EXCEPTION_OBJECT_OUTSIDE_REALITY_BUBBLE": 30,
+                "SIMCONNECT_EXCEPTION_OBJECT_CONTAINER": 31,
+            })(),
+        })()
+
+    def _exception_body(self, code):
+        return type("B", (), {"dwException": code})()
+
+    def test_one_failure_does_not_blacklist_the_whole_fleet(self):
+        """EXCEPTION 对不上是哪次请求，一次失败不能把同一轮的模型全拉黑。
+
+        实测场景：15 架同时创建，其中一架的第三方涂装坏了——原来的写法把
+        15 个模型全部永久拉黑，一分钟内整个机队被错杀，只能重启客户端。
+        """
+        injector = self.inject.TrafficInjector(sim=None)
+        injector._enums = self._exception_enums()
+        injector._requested_titles = {1: "好模型A", 2: "坏模型", 3: "好模型B"}
+        injector._pending = {}
+        injector._note_exception(self._exception_body(22))
+        self.assertEqual(injector.bad_titles, set(),
+                         "多个模型在场时一次失败不该拉黑任何一个")
+        # 连着失败 BLACKLIST_AFTER 次才算数
+        for _ in range(self.inject.BLACKLIST_AFTER - 1):
+            injector._requested_titles = {9: "坏模型", 10: "好模型A"}
+            injector._note_exception(self._exception_body(22))
+        self.assertIn("坏模型", injector.bad_titles)
+
+    def test_a_lone_failure_is_blacklisted_immediately(self):
+        # 同一轮里只有一个模型时可以直接指认
+        injector = self.inject.TrafficInjector(sim=None)
+        injector._enums = self._exception_enums()
+        injector._requested_titles = {1: "坏模型"}
+        injector._pending = {}
+        injector._note_exception(self._exception_body(22))
+        self.assertIn("坏模型", injector.bad_titles)
+
+    def test_a_success_clears_the_suspicion(self):
+        # 失败计数只数连续的：建成过一次就洗清
+        injector = self.inject.TrafficInjector(sim=None)
+        injector._enums = self._exception_enums()
+        injector._requested_titles = {1: "模型甲", 2: "模型乙"}
+        injector._pending = {}
+        injector._note_exception(self._exception_body(22))
+        injector.aircraft["CCA101"] = {"object_id": None, "title": "模型甲",
+                                       "request_id": 5}
+        injector._pending[5] = "CCA101"
+        injector._assigned[5] = 42
+        injector.sim = type("S", (), {
+            "dll": type("D", (), {"AIRemoveObject":
+                                  staticmethod(lambda *a: 0)}),
+            "hSimConnect": None})()
+        injector._collect_assigned()
+        self.assertNotIn("模型甲", injector._title_failures)
+
+    def test_reality_bubble_does_not_tear_down_pending_creations(self):
+        """位置太远只是暂时的，不能把同一轮里正在建的别的飞机全丢掉。
+
+        原来的写法每次 OUTSIDE_REALITY_BUBBLE 都清空 _pending 并删掉所有还
+        没拿到号的记录——traffic_range_nm 默认 60 nm 远超加载气泡，这条异常
+        是常态，附近真正要看的飞机被拖着反复拆了又建。
+        """
+        injector = self.inject.TrafficInjector(sim=None)
+        injector._enums = self._exception_enums()
+        injector._requested_titles = {1: "模型甲"}
+        injector._pending = {1: "CES2345"}
+        injector.aircraft["CES2345"] = {"object_id": None, "title": "模型甲",
+                                        "request_id": 1}
+        injector._note_exception(self._exception_body(30))
+        self.assertIn("CES2345", injector.aircraft)
+        self.assertIn(1, injector._pending)
+        self.assertEqual(injector.bad_titles, set())
+
+    def test_a_creation_that_never_answers_times_out_and_retries(self):
+        """objectID 等太久不回来的记录要放弃重来，不能永远停在"还在等"。"""
+        import time as time_module
+        removed = []
+        injector = self._fake_injector(removed)
+        injector.aircraft["CES2345"] = {
+            "object_id": None, "title": "738", "request_id": 10001,
+            "requested_at": time_module.time() - self.inject.PENDING_TIMEOUT - 1}
+        injector._pending[10001] = "CES2345"
+        injector._collect_assigned()
+        self.assertNotIn("CES2345", injector.aircraft,
+                         "超时的记录该丢掉，让下一轮重建")
+        self.assertIn(10001, injector._orphaned,
+                      "万一模拟器其实建出来了，号码回来时要补删")
 
 
 class VoiceHostTest(unittest.TestCase):

@@ -87,7 +87,7 @@ def frequency_khz(entry):
         # int(round(inf * 1000)) 抛的正是它，只接 ValueError 会让它一路
         # 冒到 Qt 槽函数里去
         log.warning("could not parse the frequency %r of position %s, skipping it",
-                    entry.get("callsign", "?"), raw)
+                    raw, entry.get("callsign", "?"))
         return None
     if khz == NO_FREQUENCY_KHZ:
         return None

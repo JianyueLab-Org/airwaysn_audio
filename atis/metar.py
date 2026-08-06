@@ -311,8 +311,9 @@ class Metar:
                 continue
 
             if re.match(r'^Q\d{4}$', token):
-                value = int(token[1:])
-                self.pressure = Element(token, f"QNH {spell(value)} hectopascals")
+                # 保持字符串：int() 会把 Q0995 的前导零吃掉，念出来少一位
+                self.pressure = Element(
+                    token, f"QNH {spell(token[1:])} hectopascals")
                 continue
             if re.match(r'^A\d{4}$', token):
                 value = token[1:]

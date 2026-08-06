@@ -69,6 +69,12 @@ TEXT = {
     # 模拟器、FSD、语音各自独立，一条断了不影响另外两条，所以状态也分三行显示。
     "sim.waiting":          {"zh": "X-Plane：等待中", "en": "X-Plane: waiting"},
     "sim.connected":        {"zh": "X-Plane：已连接", "en": "X-Plane: connected"},
+    "sim.link_up":          {"zh": "已连接 X-Plane @ {address}",
+                             "en": "Connected to X-Plane @ {address}"},
+    "sim.no_data":          {"zh": "X-Plane 没有数据（是否已进入飞行？）",
+                             "en": "No data from X-Plane (are you in a flight?)"},
+    "sim.port_error":       {"zh": "打不开 UDP 端口: {error}",
+                             "en": "Could not open the UDP port: {error}"},
     "net.disconnected":     {"zh": "网络：未连接", "en": "Network: not connected"},
     "net.online":           {"zh": "网络：已上线", "en": "Network: online"},
     "net.reconnecting":     {"zh": "网络：重连中", "en": "Network: reconnecting"},

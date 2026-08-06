@@ -26,6 +26,7 @@ from pymumble_py3.constants import (
     PYMUMBLE_CLBK_DISCONNECTED,
     PYMUMBLE_CLBK_PERMISSIONDENIED,
     PYMUMBLE_CLBK_SOUNDRECEIVED,
+    PYMUMBLE_CONN_STATE_CONNECTED,
     PYMUMBLE_CONN_STATE_FAILED,
     PYMUMBLE_MSG_TYPES_REJECT,
     PYMUMBLE_MSG_TYPES_USERSTATE,
@@ -265,6 +266,7 @@ class VoiceClient:
         self._tx_channels = []
         self._xc_channels = []
         self._sent_target = None         # 上次发出去的发话目标，避免重复发
+        self._force_target = False       # 重连后强制重发一次发话目标
         self._xc_targets = {}            # 频道 id -> 交叉耦合用的 VoiceTarget 编号
         # sound_output.target 是全局的一个字段，PTT 和交叉耦合都要改，
         # 不串起来的话话音会发到错误的频率上
@@ -323,6 +325,7 @@ class VoiceClient:
                                                self._on_permission_denied)
             self.mumble.start()
         except Exception as e:
+            self._abort_connect()
             self._state('error', t("voice.connect_failed", error=e))
             return False
 
@@ -331,6 +334,7 @@ class VoiceClient:
             if not self.mumble.is_alive():
                 # 线程死了说明服务器主动拒绝了，把真实原因说出来
                 reason = self.mumble.rejection()
+                self._abort_connect()
                 self._state('error',
                             t("voice.rejected", cid=self.cid, reason=reason) if reason
                             else t("voice.rejected_plain", server=self.server))
@@ -339,6 +343,10 @@ class VoiceClient:
 
         if not self.connected:
             reason = self.mumble.rejection()
+            # 超时这条最危险：pymumble 线程还活着、reconnect=True、又从没
+            # 建立过会话，BoundedReconnect 根本管不到它——不停掉就是一个
+            # 顶着账号限流无限重试的僵尸，麦克风也一直被占着。
+            self._abort_connect()
             self._state('error',
                         t("voice.timeout_reason", server=self.server, reason=reason)
                         if reason else t("voice.no_response", server=self.server))
@@ -347,6 +355,7 @@ class VoiceClient:
         try:
             self.setup_audio()
         except Exception as e:
+            self._abort_connect()
             self._state('error', t("voice.audio_failed", error=e))
             return False
 
@@ -364,6 +373,28 @@ class VoiceClient:
         if self.on_connection_change:
             self.on_connection_change(True)
         return True
+
+    def _abort_connect(self):
+        """connect() 半路失败时把已经拿到手的资源放掉。
+
+        依赖调用方（gui.py 目前失败后会调 disconnect()）不保险，这条不变量
+        属于 connect() 自己：PyAudio 不放，下次重连在"打不开音频设备"上失败，
+        指向完全错误的方向；reconnect=True 的 Mumble 不停，就是一个顶着
+        login.py 按账号限流无限重试的僵尸。
+        """
+        self._close_streams()
+        if self.audio:
+            try:
+                self.audio.terminate()
+            except Exception:
+                pass
+            self.audio = None
+        if self.mumble:
+            try:
+                self.mumble.stop()
+            except Exception:
+                pass
+            self.mumble = None
 
     def _on_connected(self):
         self.connected = True
@@ -416,7 +447,12 @@ class VoiceClient:
                 except Exception:
                     pass
 
-                alive = bool(self.mumble and self.mumble.connected)
+                # mumble.connected 是状态码不是布尔：0 未连接、1 认证中、
+                # 2 已连接、3 失败。bool() 会把"正在重连（1）"和"失败（3）"
+                # 都当成活的——掉线后 pymumble 一开始重连，这里就误报"已重连"
+                # 并把整个电台栈推进一条还没认证的半开连接里。
+                alive = bool(self.mumble) and (
+                    self.mumble.connected == PYMUMBLE_CONN_STATE_CONNECTED)
                 if alive and time.time() - self._last_ping_rcv > PING_TIMEOUT:
                     alive = False
                     log.info(f"no ping reply for {time.time() - self._last_ping_rcv:.1f}s, "
@@ -462,6 +498,10 @@ class VoiceClient:
         self._listening = set()
         self._sent_target = None
         self._xc_targets = {}
+        # 光清 _sent_target 不够：断线**前**启动的一轮 sync 可能还卡在
+        # _sync_lock 里，等它跑完会把 _sent_target 写回旧值，随后重连的这一轮
+        # 算出同一组频道就被去重吞掉。挂一个"下一轮必须强制重发"的标记。
+        self._force_target = True
         stack = self._stack
         if stack is None:
             return
@@ -772,19 +812,29 @@ class VoiceClient:
         primary = stack.selected_khz if stack.selected_khz in rx_channels else None
         if primary is None and rx_channels:
             primary = next(iter(rx_channels))
-        if primary is not None:
-            self._join_frequency(primary, rx_channels[primary])
+        joined = (primary is not None
+                  and self._join_frequency(primary, rx_channels[primary]))
 
         # 其余频率用频道监听
         wanted = {cid for khz, cid in rx_channels.items() if khz != primary}
+        if primary is not None and not joined:
+            # 主频道没进去（临时频道死了、服务器没回话……）：至少把它挂上
+            # 监听，别让管制员**唯一在用的那个频率**成了唯一听不到的
+            wanted.add(rx_channels[primary])
+            log.warning("could not join the primary channel, falling back to a "
+                        "channel listener so RX still works")
         self._set_listening(wanted)
 
-        # 发话目标
+        # 发话目标。重连后的那一轮必须强制重发：断线前启动的一轮 sync 可能
+        # 刚把 _sent_target 写回旧值，去重逻辑就会把重发吞掉——频道全对、
+        # 听得见，PTT 发出去的帧却被服务器丢在地上。
+        force_target = self._force_target
+        self._force_target = False
         self._tx_channels = [resolved[khz] for khz in stack.tx_frequencies()
                              if khz in resolved]
         self._xc_channels = [resolved[khz] for khz in stack.xc_frequencies()
                              if khz in resolved]
-        self._set_voice_target(self._tx_channels)
+        self._set_voice_target(self._tx_channels, force=force_target)
         self._program_cross_couple_targets()
         log.debug("syncing the radio stack: primary %s, RX %s, TX %s, XC %s",
                   radiostack.format_frequency(primary) if primary else "none",
@@ -927,6 +977,16 @@ class VoiceClient:
         khz = self._channel_to_khz.get(channel_id)
         if khz is None:
             return                      # 不是我们关心的频率
+        # 号可能已经被服务器回收给**别的**频率了：临时频道空了就销毁，Murmur
+        # 发号又是复用的。名字对不上就把这条旧映射拆掉——不校验的话，B 频率
+        # 的话音会点亮 A 的灯、按 A 的音量播、还转发到 A 的交叉耦合上。
+        try:
+            channel = self.mumble.channels[channel_id]
+            if channel.get("name") != radiostack.channel_name(khz):
+                self._forget_channel(khz, radiostack.channel_name(khz))
+                return
+        except Exception:
+            return
 
         if channel_id != self.mumble.users.myself.get("channel_id"):
             self.listeners_confirmed = True   # 收到了监听频道的话音，服务端确实支持

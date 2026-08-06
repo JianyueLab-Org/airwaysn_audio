@@ -66,6 +66,14 @@ DEFAULTS = {
 }
 
 
+def _clamp_volume(value, default=100):
+    """夹到 0-200。0 是合法的（静音），None 和坏值才回默认。"""
+    try:
+        return max(0, min(200, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 class Settings:
     def __init__(self, path=SETTINGS_FILE):
         self.path = path
@@ -89,13 +97,15 @@ class Settings:
         for key in DEFAULTS:
             if key in data:
                 setattr(self, key, data[key])
-        if self.mumble_host in OLD_MUMBLE_HOSTS:
+        if (self.mumble_host or "").strip().lower() in OLD_MUMBLE_HOSTS:
             log.info("the voice server was renamed, using %s instead of %s",
                      MUMBLE_HOST, self.mumble_host)
             self.mumble_host = MUMBLE_HOST
         # 音量存坏了会让整条音频链路失灵，夹一下
-        self.mic_volume = max(0, min(200, int(self.mic_volume or 100)))
-        self.speaker_volume = max(0, min(200, int(self.speaker_volume or 100)))
+        # `or 100` 会把用户特意拉到 0 的静音在重启后悄悄变回 100（麦克风
+        # 开着而用户不知道）；0 是滑条上真实可取的值，只有 None/坏值才回默认
+        self.mic_volume = _clamp_volume(self.mic_volume)
+        self.speaker_volume = _clamp_volume(self.speaker_volume)
         # 绑定表从 JSON 变成 ptt.Binding。老配置里没有 ptt_bindings，就拿
         # ptt_key + joystick_ptt 升上来——升不上来的话，用户原来设的 PTT 会在
         # 升级之后悄悄失效，而界面上一切正常，只是没人听得见。

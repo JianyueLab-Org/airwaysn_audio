@@ -103,7 +103,18 @@ def _wind(token):
     """09004MPS / VRB02MPS / 27010G18MPS / 09004MPS 350V050"""
     if not token:
         return ""
-    match = re.match(r"^(VRB|\d{3})(\d{2,3})(?:G(\d{2,3}))?(MPS|KT)$", token.strip())
+    # metar._wind() 会把风向变化组拼在后面（"09004MPS 350V050"）。这里按空格
+    # 拆开分别念——原来整串去匹配一个单段的正则，匹配不上就整组静默丢掉，
+    # 带变化组的 METAR 播出来的中文通播**完全没有风**。
+    pieces = token.strip().split()
+    token = pieces[0]
+    variation = ""
+    for extra in pieces[1:]:
+        varied = re.match(r"^(\d{3})V(\d{3})$", extra)
+        if varied:
+            variation = (f" 风向在 {spell(varied.group(1))} 度 和 "
+                         f"{spell(varied.group(2))} 度 之间变化")
+    match = re.match(r"^(VRB|\d{3})(\d{2,3})(?:G(\d{2,3}))?(MPS|KT)$", token)
     if not match:
         return ""
     direction, speed, gust, unit = match.groups()
@@ -121,7 +132,7 @@ def _wind(token):
     parts = [f"{head} 风速 {spell_count(int(speed))} {measure}"]
     if gust:
         parts.append(f"阵风 {spell_count(int(gust))} {measure}")
-    return " ".join(parts)
+    return " ".join(parts) + variation
 
 
 def _visibility(token):

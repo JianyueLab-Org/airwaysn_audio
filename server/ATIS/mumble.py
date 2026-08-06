@@ -27,7 +27,9 @@ import threading
 import numpy as np
 import time
 import wave
+import shutil
 import subprocess
+import tempfile
 import io
 import asyncio
 import edge_tts
@@ -87,12 +89,26 @@ class ATISBroadcaster(threading.Thread):
 
             if not self._wait_until_connected():
                 self._report_login_failure()
+                # reconnect=True 的连接不停掉就是个僵尸：登录被拒它也一直
+                # 重试，而 login.py 对认证失败按账号限流，整队机器人共用一个
+                # ATIS_CID——一个僵尸就能把整个账号的语音锁死。
+                self._stop_mumble()
                 return False
 
             return self._join_channel()
         except Exception as e:
             print(f"连接错误: {e}")
+            self._stop_mumble()
             return False
+
+    def _stop_mumble(self):
+        if getattr(self, "mumble", None) is None:
+            return
+        try:
+            self.mumble.stop()
+        except Exception:
+            pass
+        self.mumble = None
 
     def _wait_until_connected(self, timeout=CONNECT_TIMEOUT):
         """等服务器把这次登录认下来，认下来才算连上。
@@ -256,10 +272,15 @@ class ATISBroadcaster(threading.Thread):
         # 打印转换的文本内容
         # print (f"正在转换ATIS: {text.strip()}")
         communicate = edge_tts.Communicate(text, voice)
-        temp_file = "temp_edge.mp3"
+        # 临时文件必须每次唯一：每个席位一条广播线程，全都往 CWD 写同两个
+        # 定名文件的话，两个席位同时合成时 ffmpeg 会去读半截 mp3、甚至把
+        # A 机场的音频当成 B 机场的播出去——还一条错都不报。
+        temp_dir = tempfile.mkdtemp(prefix="atis_tts_")
+        temp_file = os.path.join(temp_dir, "edge.mp3")
+        wav_file = os.path.join(temp_dir, "processed.wav")
         try:
             await communicate.save(temp_file)
-            
+
             # 使用ffmpeg将MP3转换为WAV格式
             subprocess.run([
                 'ffmpeg', '-y',
@@ -267,19 +288,16 @@ class ATISBroadcaster(threading.Thread):
                 '-ar', '48000',
                 '-ac', '1',
                 '-acodec', 'pcm_s16le',
-                'temp_processed.wav'
+                wav_file
             ], capture_output=True)
-            
-            with wave.open('temp_processed.wav', 'rb') as wf:
+
+            with wave.open(wav_file, 'rb') as wf:
                 audio_data = wf.readframes(wf.getnframes())
-            
+
             return audio_data
         finally:
             # 清理临时文件
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            if os.path.exists('temp_processed.wav'):
-                os.remove('temp_processed.wav')
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def text_to_audio(self, text):
         """将文本转换为音频数据"""
@@ -455,6 +473,13 @@ class ATISManager:
                             continue
                             
                         text = ' '.join(atis.get('text_atis', []))
+                        # 线程死了（启动那次登录失败、频道被拒……）等于没有：
+                        # 只查"在不在字典里"的话，一次瞬时故障就让这个席位
+                        # 永远停播，而管理器还以为它好好的、每 30 秒给它更新文本
+                        stale = self.broadcasters.get(callsign)
+                        if stale is not None and not stale.is_alive():
+                            print(f"{callsign} 的通播线程已经死了，重新拉起")
+                            self.broadcasters.pop(callsign, None)
                         if callsign not in self.broadcasters:
                             # 新的ATIS
                             broadcaster = ATISBroadcaster(

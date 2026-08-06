@@ -184,6 +184,12 @@ class Voice:
         self._skip_reason = ""          # 明明按着 PTT 却没发的原因
         self._stuck_reason = ""         # 迟迟进不了频率频道的原因
         self._lock = threading.Lock()      # 一条连接一个发送队列，串行化
+        # 护住 PyAudio 流的开、关、读、写。重开设备（设置里换了声卡）跑在
+        # Qt 线程上，而发送线程可能正卡在 stream.read()、pymumble 的回调线程
+        # 可能正在 stream.write()——C 层的流被另一条线程 close/terminate 是
+        # 直接崩进程，Python 的 try/except 接不住。管制端一直有这把锁
+        # （controller/voice.py 的 _stream_lock），这份原来没有。
+        self._stream_lock = threading.Lock()
         self._channel_lock = threading.Lock()   # 频道切换不能并发
         self._channel_wanted = threading.Event()  # 有新频率要切
         self._channel_thread = None
@@ -200,6 +206,7 @@ class Voice:
         # 掉线掉没了，而不是用户自己点的断开。
         self.gave_up = False
         self._was_dropped = False          # 掉过线，用来在连回来时报一句"已重连"
+        self._denial = None                # 最近一次 PermissionDenied 的原因
         # 给 _health() 用的累计量：上一份健康报告以来收发了多少帧
         self._sent_total = 0
         self._received_total = 0
@@ -304,21 +311,26 @@ class Voice:
         return 48000
 
     def reopen_audio(self):
-        """换了设备之后重开音频流。"""
-        for stream in (self._input, self._output):
+        """换了设备之后重开音频流。
+
+        全程握着 _stream_lock：发送线程可能正在 read()、接收回调可能正在
+        write()，不挡住它们就 close/terminate 是 C 层崩溃。
+        """
+        with self._stream_lock:
+            for stream in (self._input, self._output):
+                try:
+                    if stream:
+                        stream.stop_stream()
+                        stream.close()
+                except Exception:
+                    pass
+            self._input = self._output = None
             try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
+                if self._audio:
+                    self._audio.terminate()
             except Exception:
                 pass
-        self._input = self._output = None
-        try:
-            if self._audio:
-                self._audio.terminate()
-        except Exception:
-            pass
-        self._open_audio()
+            self._open_audio()
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -532,28 +544,33 @@ class Voice:
         - pymumble 是 reconnect=True 建的。扔着不管，它会在后台一直重连下去，
           而服务端 login.py 对认证失败按账号限流，一个不停重试的僵尸连接足以
           把这个账号的语音锁死，之后怎么连都连不上。
-        """
-        for stream in (self._input, self._output):
-            try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            except Exception:
-                pass
-        self._input = self._output = None
-        try:
-            if self._audio:
-                self._audio.terminate()
-        except Exception:
-            pass
-        self._audio = None
 
+        顺序必须是先停 Mumble 再收音频：接收回调跑在 pymumble 的线程上，正在
+        _output.write() 的时候把 PyAudio terminate 掉是 C 层崩溃——正常断开
+        时对面恰好有人说话就中招。stop() 里"先收发送线程再走这里"的理由相同。
+        """
         if self.mumble:
             try:
                 self.mumble.stop()
             except Exception:
                 pass
             self.mumble = None
+
+        with self._stream_lock:
+            for stream in (self._input, self._output):
+                try:
+                    if stream:
+                        stream.stop_stream()
+                        stream.close()
+                except Exception:
+                    pass
+            self._input = self._output = None
+            try:
+                if self._audio:
+                    self._audio.terminate()
+            except Exception:
+                pass
+            self._audio = None
 
     def stop(self, state='stopped', message=None):
         """收掉整条连接。
@@ -688,7 +705,14 @@ class Voice:
         deadline = time.time() + CHANNEL_TIMEOUT
         started = time.time()
         reported = 0
+        self._denial = None
         while time.time() < deadline and self.running:
+            if self._denial:
+                # 服务器已经明说不行了（权限、重名……），等满超时纯属浪费：
+                # 管制端和 ATIS 一直有这条短路，这份原来没有
+                log.warning("the server refused while waiting for %s: %s",
+                            name, self._denial)
+                return None
             channel = self._find_channel(name)
             if channel is not None:
                 log.info("channel %s appeared after %.1f s (id=%s)", name,
@@ -851,6 +875,7 @@ class Voice:
         if getattr(event, "reason", ""):
             reason = t("denied.with_note", reason=reason, note=event.reason)
         # 走已有的"卡住原因"这条路，界面和日志都已经在看它了
+        self._denial = reason
         self._note_stuck(reason)
         self._status("denied", reason)
 
@@ -985,12 +1010,13 @@ class Voice:
             volume = getattr(self.settings, "speaker_volume", 100) / 100.0
             samples = np.frombuffer(chunk.pcm, dtype=np.int16)
             samples = (samples * volume).astype(np.int16)
-            if not self._output:
-                # 收到了但扬声器没开——"听不到别人"和"根本没人说话"是两回事
-                log.warning("audio received but the speaker is not open, nothing "
-                            "will be heard")
-                return
-            self._output.write(samples.tobytes())
+            with self._stream_lock:
+                if not self._output:
+                    # 收到了但扬声器没开——"听不到别人"和"根本没人说话"是两回事
+                    log.warning("audio received but the speaker is not open, "
+                                "nothing will be heard")
+                    return
+                self._output.write(samples.tobytes())
             self._received_frames += 1
             self._received_total += 1
         except Exception as e:
@@ -1042,7 +1068,11 @@ class Voice:
                     continue
 
                 try:
-                    data = self._input.read(self._chunk, exception_on_overflow=False)
+                    with self._stream_lock:
+                        if not self._input:
+                            raise RuntimeError("stream closed")
+                        data = self._input.read(self._chunk,
+                                                exception_on_overflow=False)
                 except Exception as e:
                     self._skip(f"读麦克风出错: {e}")
                     time.sleep(0.05)

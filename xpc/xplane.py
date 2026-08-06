@@ -18,6 +18,8 @@ import struct
 import threading
 import time
 
+from i18n import t
+
 log = logging.getLogger("sim")
 
 MCAST_GROUP = "239.255.1.1"
@@ -260,7 +262,7 @@ class XPlaneLink:
                 self._socket.bind(("0.0.0.0", 0))
                 self._socket.settimeout(1.0)
             except OSError as e:
-                self._state(False, f"打不开 UDP 端口: {e}")
+                self._state(False, t("sim.port_error", error=e))
                 time.sleep(2)
                 continue
 
@@ -298,7 +300,7 @@ class XPlaneLink:
                         # 这个地址真的有数据回来，记住它——以后信标收不到时
                         # 优先用它，不要退回本机瞎试
                         self._known_good = address
-                        self._state(True, f"已连接 X-Plane @ {address[0]}")
+                        self._state(True, t("sim.link_up", address=address[0]))
 
             self._close()
             if self.running:
@@ -308,7 +310,7 @@ class XPlaneLink:
         """一直没数据的时候该继续等还是换个地址重来。"""
         silent = time.time() - silent_since
         if silent > STALE_AFTER:
-            self._state(False, "X-Plane 没有数据（是否已进入飞行？）")
+            self._state(False, t("sim.no_data"))
         if silent > REDISCOVER_AFTER:
             self.address = None          # 重新发现一次
             return False

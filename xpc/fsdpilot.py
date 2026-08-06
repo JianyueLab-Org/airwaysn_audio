@@ -20,6 +20,7 @@ $ID 的第 9 个字段（challenge）留空，服务端就不会发起 VATSIM �
 错了会让别人看到飞机以奇怪的姿态飞行。
 """
 
+import json
 import logging
 import socket
 import threading
@@ -142,8 +143,13 @@ class FSDPilot:
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = (callsign or "").strip().upper()
-        self.cid = str(cid).strip()
-        self.password = password
+        self.cid = sanitize(str(cid))
+        # 密码也要过 sanitize：带冒号的密码会让 #AP 后面的字段全部错位（服务器
+        # 直接拒收），而 _redact() 按固定下标打码，错位后冒号后那一截密码会
+        # **原样进日志**——用户贴日志求助时把自己的网站密码贴出去了。
+        # 冒号在 FSD 协议里本来就带不动，这里换成空格不会让一个本来能登录的
+        # 密码登不上。
+        self.password = sanitize(password)
         self.real_name = sanitize(real_name) or self.cid
         self.rating = int(rating)
         self.aircraft = sanitize(aircraft).upper()
@@ -156,6 +162,8 @@ class FSDPilot:
         self.traffic = traffic
         if traffic is not None and traffic.on_request_info is None:
             traffic.on_request_info = self.request_plane_info
+        if traffic is not None and getattr(traffic, "on_request_config", None) is None:
+            traffic.on_request_config = self.request_config
         # 航司码取呼号前三位字母，CCA1501 -> CCA。用于模型匹配的涂装选择。
         prefix = self.callsign[:3]
         self.airline = prefix if prefix.isalpha() else ""
@@ -527,6 +535,15 @@ class FSDPilot:
         if head.startswith("$CR") and len(fields) >= 3:
             if fields[1] == self.callsign and fields[2] == "CAPS":
                 self._logged_in = True
+            elif (fields[2] == "ACC" and len(fields) > 3
+                    and self.traffic is not None):
+                # 对方回的配置 JSON。正文里有冒号，得把后面的段拼回去。
+                try:
+                    config = json.loads(":".join(fields[3:]))
+                except ValueError:
+                    config = None
+                if isinstance(config, dict):
+                    self.traffic.set_config(head[3:], config)
             return True
 
         if head.startswith("$CQ") and len(fields) >= 3:
@@ -537,7 +554,10 @@ class FSDPilot:
                 elif query == "RN":
                     self._send(f"$CR{self.callsign}:{sender}:RN:{self.real_name}::{self.rating}")
                 elif query == "ACC":
-                    self._send(f"$CR{self.callsign}:{sender}:ACC:{self.aircraft}")
+                    # 回配置 JSON（灯光/襟翼/起落架），对面拿去驱动动画。
+                    # 以前这里回的是机型码——和请求方期望的负载完全对不上，
+                    # 结果就是所有他机永远全程关灯。
+                    self._send(f"$CR{self.callsign}:{sender}:ACC:{self._config_json()}")
             return True
 
         if head.startswith("$PI") and len(fields) >= 3:
@@ -570,7 +590,9 @@ class FSDPilot:
             self.traffic.update_position(
                 callsign,
                 latitude=float(fields[4]), longitude=float(fields[5]),
-                altitude=int(fields[6]), groundspeed=int(fields[7]),
+                # int(float(...))：有的客户端把高度/地速写成带小数点的，
+                # 直接 int() 会抛 ValueError，整个包被丢，那架飞机就是隐形的
+                altitude=int(float(fields[6])), groundspeed=int(float(fields[7])),
                 pitch=attitude["pitch"], bank=attitude["bank"],
                 heading=attitude["heading"], on_ground=attitude["on_ground"],
                 squawk=int(fields[2]), mode=fields[0][1:] or "S")
@@ -580,6 +602,23 @@ class FSDPilot:
     def request_plane_info(self, callsign):
         """问对方的机型，用于模型匹配。"""
         return self._send(f"#SB{self.callsign}:{callsign}:PIR")
+
+    def request_config(self, callsign):
+        """问对方的配置（灯光/襟翼/起落架），用于动画。TrafficTable 定期触发。"""
+        return self._send(f"$CQ{self.callsign}:{callsign}:ACC")
+
+    def _config_json(self):
+        """把自己的快照攒成 ACC 回复的 JSON，键名和 TrafficTable.set_config 对齐。"""
+        with self._lock:
+            snapshot = dict(self._position) if self._position else {}
+        lights = snapshot.get("lights") or {}
+        return json.dumps({
+            "gear_down": bool(snapshot.get("gear_down", True)),
+            "flaps_pct": round(float(snapshot.get("flaps", 0.0)) * 100.0, 1),
+            "spoilers_out": bool(snapshot.get("spoilers", False)),
+            "lights": {key: bool(value) for key, value in lights.items()},
+            "engines": {"1": {"on": bool(snapshot.get("engines_on", True))}},
+        }, separators=(",", ":"))
 
     def _handle_plane_info(self, sender, fields):
         """#SB。别人问我们机型要答，别人报机型要记下来。"""

@@ -1198,6 +1198,31 @@ class ProfileSetTest(unittest.TestCase):
         self.assertEqual(len(store), 1)
         self.assertIsNotNone(store.active())
 
+    def test_single_profile_save_keeps_the_sibling_profiles(self):
+        """gui 用单份 Profile 直读直写；多 profile 的文件不能被它压扁。
+
+        load() 认得 {"profiles": [...]} 并只取当前那份，save() 原来却把整个
+        文件重写成 {"stations": [...]}——改一次跑道构型，其余 profile 全部
+        无声消失。
+        """
+        self.write({
+            "active": "华东",
+            "profiles": [
+                {"name": "华东",
+                 "stations": [Station("ZSPD", frequency="127.850").to_dict()]},
+                {"name": "华北",
+                 "stations": [Station("ZBAA", frequency="127.600").to_dict()]},
+            ]})
+        single = profile_module.Profile(path=self.path)
+        single.load()
+        self.assertEqual(single.name, "华东")
+        single.save()
+        data = self.read()
+        self.assertIn("profiles", data, "文件被压扁回单份形状了")
+        names = [p.get("name") for p in data["profiles"]]
+        self.assertIn("华北", names, "另一份 profile 被吞了")
+        self.assertEqual(data.get("active"), "华东")
+
     # ---------- 增删改 ----------
     def test_add_select_and_round_trip(self):
         store = profile_module.ProfileSet(self.path)
@@ -1748,6 +1773,17 @@ class ChineseVoiceTest(unittest.TestCase):
 
     def test_wind_gusts(self):
         self.assertIn("阵风", chinese._wind("27010G18MPS"))
+
+    def test_wind_with_a_variation_group_still_reports_the_wind(self):
+        """metar._wind() 会把变化组拼在文本形式后面（"09004MPS 350V050"）。
+
+        原来整串去匹配单段的正则，匹配不上就整组静默丢掉——带变化组的 METAR
+        播出来的中文通播**完全没有风**，能见度紧跟在时间后面。
+        """
+        spoken = chinese._wind("09004MPS 350V050")
+        self.assertIn("风向 洞 九 洞 度", spoken)
+        self.assertIn("风速 四 米每秒", spoken)
+        self.assertIn("之间变化", spoken)
 
     def test_visibility(self):
         self.assertEqual(chinese._visibility("9999"), "能见度 幺洞 公里 以上")
