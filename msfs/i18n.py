@@ -70,6 +70,12 @@ TEXT = {
     # 模拟器、FSD、语音各自独立，一条断了不影响另外两条，所以状态也分三行显示。
     "sim.waiting":          {"zh": "MSFS：等待中", "en": "MSFS: waiting"},
     "sim.connected":        {"zh": "MSFS：已连接", "en": "MSFS: connected"},
+    "sim.link_up":          {"zh": "已连接 MSFS", "en": "Connected to MSFS"},
+    "sim.not_running":      {"zh": "连不上 MSFS（模拟器是否已启动？）",
+                             "en": "Cannot reach MSFS (is the simulator running?)"},
+    "sim.link_lost":        {"zh": "MSFS 连接中断", "en": "The MSFS link was lost"},
+    "sim.no_data":          {"zh": "MSFS 没有数据（是否已进入飞行？）",
+                             "en": "No data from MSFS (are you in a flight?)"},
     "net.disconnected":     {"zh": "网络：未连接", "en": "Network: not connected"},
     "net.online":           {"zh": "网络：已上线", "en": "Network: online"},
     "net.reconnecting":     {"zh": "网络：重连中", "en": "Network: reconnecting"},

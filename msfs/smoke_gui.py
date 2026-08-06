@@ -190,6 +190,9 @@ def main():
             self.synced = []
             # 匹配时要排除模拟器拒绝生成过的模型，真的注入器有这个字段
             self.bad_titles = set()
+            # 关掉渲染时要看还有没有已经放进去的，真的注入器有这个表
+            self.aircraft = {}
+            self.sim = None
 
         def sync(self, entries):
             self.synced.append(entries)
@@ -215,6 +218,7 @@ def main():
     def traffic_reaches_the_injector():
         window.injector = FakeInjector()
         window.tick()
+        window.traffic_tick()      # 他机现在走自己的快节奏定时器
         # 注入走后台线程了，等它跑完
         for _ in range(50):
             if window.injector.synced:
@@ -246,6 +250,7 @@ def main():
         window.injector = SlowInjector()
         started = time.time()
         window.tick()
+        window.traffic_tick()
         elapsed = time.time() - started
         assert elapsed < 0.2, f"tick() 被注入拖了 {elapsed:.2f} 秒"
         time.sleep(1.2)                  # 让后台线程收尾，别泄漏到下一项
@@ -266,6 +271,7 @@ def main():
         window._model_cache.clear()
         window.traffic.set_plane_info("CES2345", equipment="B738", airline="CCA")
         window.tick()
+        window.traffic_tick()
         time.sleep(0.15)
         first = window.injector.synced[-1][0]["model"]
         assert first == "坏模型", first
@@ -273,6 +279,7 @@ def main():
         # 模拟器拒绝了它
         window.injector.bad_titles.add("坏模型")
         window.tick()
+        window.traffic_tick()
         time.sleep(0.15)
         second = window.injector.synced[-1][0]["model"]
         assert second == "好模型", f"被拒之后还在用 {second}"
@@ -282,8 +289,10 @@ def main():
         window.injector = FakeInjector()
         window.settings.render_traffic = False
         window.tick()
+        window.traffic_tick()
         window.settings.render_traffic = True
-        assert not window.injector.synced, "关掉之后不该再放飞机进去"
+        assert not [s for s in window.injector.synced if s != "cleared"], \
+            "关掉之后不该再放飞机进去"
     check("可以关掉他机注入", render_can_be_turned_off)
 
     def survives_without_models():
@@ -292,7 +301,8 @@ def main():
         window.models = aimatch.ModelSet()
         window._model_cache.clear()
         window.traffic.set_plane_info("CES2345", equipment="B738")
-        window.tick()      # 一架飞机都没装的机器上也不该炸
+        window.tick()
+        window.traffic_tick()      # 一架飞机都没装的机器上也不该炸
     check("没装任何飞机也能跑", survives_without_models)
 
     def disconnect_clears_injected_traffic():

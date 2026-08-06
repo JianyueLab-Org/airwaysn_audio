@@ -80,6 +80,11 @@ def user_id_for(name):
     matched = ATIS_NAME.match(name)
     if matched:
         return int(matched.group("freq"))
+    # 不能直接 int(name)：int() 还认下划线、正负号、前后空白、甚至全角数字
+    # （int("１０００") == 1000）。名字"１０００"和"1000"是两个不同的账号，
+    # 同名踢人踢不到对方，却会拿到同一个用户 id——继承对方的全部 ACL。
+    if not (name.isascii() and name.isdigit()):
+        raise ValueError(f"not a plain numeric name: {name!r}")
     return int(name)
 
 
@@ -123,12 +128,19 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
         try:
             print(f"认证用户: {name}")
+            # 名字既不是纯数字也不是通播格式的（SuperUser、Murmur 本地账号）
+            # 要**放行**给 Murmur 自己的账号库，不是拒绝。原来这一步是在
+            # try 里靠 int(name) 抛异常兜到 AUTH_FAILED 的——SuperUser 从此
+            # 永远登不进来，服务器自己的管理入口被这只认证器锁死。
+            try:
+                user_id = user_id_for(name)
+            except ValueError:
+                return (AUTH_FALLTHROUGH, "", [])
             if is_atis_name(name):
                 print(f"匹配到ATIS登录: {name}")
                 result = login_ATIS(name, pw)
             else:
                 result = login(name, pw)
-            user_id = user_id_for(name)
 
             if result == VERIFY_OK:
                 self.kick_previous_session(name)
@@ -250,7 +262,17 @@ def verify(cid, password):
         if response.status_code == 200:
             print(f"登录成功: cid={cid}")
             return VERIFY_OK
-        # 接口明确说了不行就不再试——重试只会把这个账号推向限流
+        if response.status_code >= 500:
+            # 5xx 是 can-web 那边坏了（部署、网关重启），不是密码错。报
+            # REJECTED 的话全网用户在那两分钟里都看到"密码错误"，改密码、
+            # 反复重连，每次都计进按账号的限流——等上游恢复了人也被锁死了。
+            last_error = f"HTTP {response.status_code}"
+            print(f"上游出错（第 {attempt + 1}/{HTTP_RETRIES + 1} 次）: "
+                  f"{response.status_code}")
+            if attempt < HTTP_RETRIES:
+                time.sleep(HTTP_RETRY_DELAY)
+            continue
+        # 接口明确说了不行（4xx）就不再试——重试只会把这个账号推向限流
         print(f"登录失败: cid={cid}, {response.status_code}, {response.text}")
         return VERIFY_REJECTED
 

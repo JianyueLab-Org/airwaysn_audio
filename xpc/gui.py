@@ -68,7 +68,9 @@ APP_NAME = "XPC for CAN"
 # `version.version()` 会去读它。用常量的后果是标题栏永远显示回退值：
 # 实测 v2.0.3 的包，日志首行是 v2.0.3，标题栏却写着 v2.0.0，
 # 用户拿标题栏对版本就会以为自己没更新成功。
-VERSION = version.version()
+# 标题栏用 display()：Dev 包要显示成 v2.1.2 (Dev Build 1)，
+# 正式包和以前一样是纯版本号。
+VERSION = version.display()
 
 
 class Signals(QObject):
@@ -156,6 +158,12 @@ class XpcWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
+        # 他机单独一个更快的节奏。插值是按时刻算的，500 ms 推一次的话一架
+        # 450 kt 的飞机每半秒瞬移 115 米，中间全程冻住——traffic.py 里的插值
+        # 等于白算。100 ms 推一次窗外才是连续的。
+        self.traffic_timer = QTimer(self)
+        self.traffic_timer.timeout.connect(self.traffic_tick)
+        self.traffic_timer.start(100)
 
         # 起来之后在后台问一次有没有新版。查不到就当没这回事。
         self.check_for_update()
@@ -418,6 +426,15 @@ class XpcWindow(QMainWindow):
         self.connect_button.setText(t("connect.connect"))
         self.ident_button.setEnabled(False)
         self.controller_list.clear()
+        # 他机表一起清，并给插件推一帧空的：不清的话断开后 15 秒里天上还
+        # 挂着一批冻住的飞机，重连时又会和新会话的混在一起。
+        for callsign in list(self.traffic.aircraft):
+            self.traffic.remove(callsign)
+        self._model_cache.clear()
+        try:
+            self.bridge.send_traffic([], own=None)
+        except Exception:
+            pass
         self.fsd_label.setText(t("net.disconnected"))
         self.voice_label.setText(t("voicebar.disconnected"))
         self.channel_label.setText("")
@@ -446,7 +463,11 @@ class XpcWindow(QMainWindow):
         if self.voice and com1 and snapshot.get("com1_power", True):
             self.voice.set_frequency(com1)
 
-        self._push_traffic(snapshot)
+    def traffic_tick(self):
+        """每 0.1 秒：把他机插值到当下推给插件。和 tick() 分开是为了帧率。"""
+        snapshot = self.snapshot
+        if snapshot:
+            self._push_traffic(snapshot)
 
     # ---------- 他机 ----------
     def _load_models(self):
@@ -468,9 +489,11 @@ class XpcWindow(QMainWindow):
 
     def _push_traffic(self, snapshot):
         """把他机插值到当前时刻，推给插件去画。"""
+        # prune 不受开关控制：关着渲染的话表会涨一整场
+        for callsign in self.traffic.prune():
+            self._model_cache.pop(callsign, None)
         if not self.settings.render_traffic:
             return
-        self.traffic.prune()
 
         origin = (snapshot["latitude"], snapshot["longitude"])
         entries = self.traffic.snapshot(
@@ -495,7 +518,11 @@ class XpcWindow(QMainWindow):
             csl=entry.get("csl", ""))
         path = model.path if model else ""
         self._model_cache[callsign] = path
-        self.traffic.mark_model_clean(callsign)
+        # 带上这次匹配用的机型/航司：#SB 的回复如果恰好落在快照之后、这里
+        # 之前，无条件清标记会把那次更新吞掉
+        self.traffic.mark_model_clean(callsign,
+                                      equipment=entry.get("equipment", ""),
+                                      airline=entry.get("airline", ""))
         if model:
             # 机型还没问到时先用通用模型顶上，半秒后 #SB 回来会再匹配一次并覆盖
             # 掉它。两行里只有后一行是结论，前一行降到 DEBUG。
@@ -519,7 +546,7 @@ class XpcWindow(QMainWindow):
         colour = {'online': theme.ON_COLOR, 'error': theme.MUTED_COLOR,
                   'offline': theme.MUTED_COLOR}.get(state, theme.ACTIVE_COLOR)
         keys = {'online': "net.online", 'reconnecting': "net.reconnecting",
-                'offline': "net.offline"}
+                'offline': "net.offline", 'stopped': "net.disconnected"}
         self.fsd_label.setText(t(keys[state]) if state in keys
                                else t("net.other", state=state))
         self.fsd_label.setStyleSheet(f"color: {colour};")

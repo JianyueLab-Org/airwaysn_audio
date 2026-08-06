@@ -26,6 +26,9 @@ STALE_AFTER = 15.0
 MAX_EXTRAPOLATE = 2.0
 # 机型问不到就别一直问，隔这么久重试一次
 PLANE_INFO_RETRY = 30.0
+# 隔这么久重新要一次对方的配置（灯光/襟翼/起落架）。协议里没有"变了推一条"，
+# 只能轮询；不问的话所有他机永远全程关灯、光杆落地。
+CONFIG_REFRESH = 10.0
 
 FEET_PER_METRE = 3.280839895
 NM_PER_DEGREE = 60.0
@@ -65,6 +68,9 @@ class Aircraft:
         self.transponder_mode = "S"
         self.previous = None
         self.latest = None
+        # 建表时刻。机型先于位置到达的那些 latest 是 None，prune 按这个给
+        # 它们留一段宽限，不然半秒后就被当成"太久没消息"清掉了。
+        self.created = time.time()
 
         # 机型匹配信息，来自 #SB PI:GEN
         self.equipment = ""          # ICAO 机型码，如 B738
@@ -73,6 +79,7 @@ class Aircraft:
         self.csl = ""                # 对方直接指定的 CSL 名
         self.model_dirty = True      # 渲染端该（重新）匹配模型了
         self.info_requested = 0.0    # 上次发 PIR 的时刻
+        self.config_requested = 0.0  # 上次要 ACC 配置的时刻
 
         # 来自 $CQ … ACC 的配置，用来驱动动画
         self.gear_down = None
@@ -140,9 +147,18 @@ class Aircraft:
         limit = 1.0 + min(MAX_EXTRAPOLATE, span * 2) / span
         ratio = max(0.0, min(limit, ratio))
 
+        # 经度也要按最短弧走：179.98°E 到 -179.98° 是往前 0.04°，
+        # 线性差值会让飞机横穿整个地球再回来
+        lon_step = (latest.longitude - previous.longitude + 180.0) % 360.0 - 180.0
+        longitude = previous.longitude + lon_step * ratio
+        if longitude > 180.0:
+            longitude -= 360.0
+        elif longitude < -180.0:
+            longitude += 360.0
+
         return {
             "latitude": previous.latitude + (latest.latitude - previous.latitude) * ratio,
-            "longitude": previous.longitude + (latest.longitude - previous.longitude) * ratio,
+            "longitude": longitude,
             "altitude": previous.altitude + (latest.altitude - previous.altitude) * ratio,
             "pitch": previous.pitch + (latest.pitch - previous.pitch) * ratio,
             "bank": previous.bank + (latest.bank - previous.bank) * ratio,
@@ -164,9 +180,11 @@ class Aircraft:
 class TrafficTable:
     """所有他机。FSD 线程写，渲染线程读，所以整体上锁。"""
 
-    def __init__(self, on_request_info=None):
+    def __init__(self, on_request_info=None, on_request_config=None):
         # on_request_info(callsign) —— 需要向对方要机型时调用
+        # on_request_config(callsign) —— 需要向对方要配置（灯光等）时调用
         self.on_request_info = on_request_info
+        self.on_request_config = on_request_config
         self.aircraft = {}
         self._lock = threading.Lock()
 
@@ -202,6 +220,9 @@ class TrafficTable:
                           and now - aircraft.info_requested > PLANE_INFO_RETRY)
             if needs_info:
                 aircraft.info_requested = now
+            needs_config = now - aircraft.config_requested > CONFIG_REFRESH
+            if needs_config:
+                aircraft.config_requested = now
 
         # 回调放在锁外面：它会去发包，别把网络 IO 圈进锁里
         if needs_info and self.on_request_info:
@@ -209,6 +230,11 @@ class TrafficTable:
                 self.on_request_info(callsign)
             except Exception as e:
                 log.warning("could not ask %s for its aircraft type: %s", callsign, e)
+        if needs_config and self.on_request_config:
+            try:
+                self.on_request_config(callsign)
+            except Exception as e:
+                log.warning("could not ask %s for its configuration: %s", callsign, e)
         return aircraft
 
     def set_plane_info(self, callsign, **info):
@@ -257,11 +283,17 @@ class TrafficTable:
             return False
 
     def prune(self, now=None):
-        """清掉太久没消息的。返回被清掉的呼号。"""
+        """清掉太久没消息的。返回被清掉的呼号。
+
+        latest 还是 None 的是"机型先到、位置未到"的（set_plane_info 特意留住
+        它们），按建表时刻给同样的宽限——立刻清掉的话，PI:GEN 白收了，等位置
+        到达时机型又得重新问一轮。
+        """
         now = now if now is not None else time.time()
         with self._lock:
             gone = [callsign for callsign, aircraft in self.aircraft.items()
-                    if not aircraft.latest or now - aircraft.latest.time > STALE_AFTER]
+                    if now - ((aircraft.latest.time if aircraft.latest
+                               else aircraft.created)) > STALE_AFTER]
             for callsign in gone:
                 del self.aircraft[callsign]
         for callsign in gone:
@@ -275,35 +307,38 @@ class TrafficTable:
         个位置，飞机比这多的时候必须先扔远的，不能随便扔。
         """
         now = now if now is not None else time.time()
+        # 整个快照都在锁里做：全是字典和算术，没有 IO。原来只锁着取列表，
+        # 后面读 lights 时 FSD 线程一条 set_config 更新进来就是
+        # RuntimeError: dictionary changed size during iteration，丢一帧。
+        entries = []
         with self._lock:
             aircraft = list(self.aircraft.values())
-
-        entries = []
-        for one in aircraft:
-            position = one.position_at(now)
-            if not position:
-                continue
-            entry = {
-                "callsign": one.callsign,
-                "squawk": one.squawk,
-                "mode": one.transponder_mode,
-                "equipment": one.equipment,
-                "airline": one.airline,
-                "livery": one.livery,
-                "csl": one.csl,
-                "model_dirty": one.model_dirty,
-                "vertical_speed": one.vertical_speed,
-                "gear_down": one.gear_down,
-                "flaps": one.flaps,
-                "spoilers": one.spoilers,
-                "lights": dict(one.lights),
-                "engines_on": one.engines_on,
-            }
-            entry.update(position)
-            if origin:
-                entry["range_nm"] = distance_nm(
-                    origin[0], origin[1], position["latitude"], position["longitude"])
-            entries.append(entry)
+            for one in aircraft:
+                position = one.position_at(now)
+                if not position:
+                    continue
+                entry = {
+                    "callsign": one.callsign,
+                    "squawk": one.squawk,
+                    "mode": one.transponder_mode,
+                    "equipment": one.equipment,
+                    "airline": one.airline,
+                    "livery": one.livery,
+                    "csl": one.csl,
+                    "model_dirty": one.model_dirty,
+                    "vertical_speed": one.vertical_speed,
+                    "gear_down": one.gear_down,
+                    "flaps": one.flaps,
+                    "spoilers": one.spoilers,
+                    "lights": dict(one.lights),
+                    "engines_on": one.engines_on,
+                }
+                entry.update(position)
+                if origin:
+                    entry["range_nm"] = distance_nm(
+                        origin[0], origin[1],
+                        position["latitude"], position["longitude"])
+                entries.append(entry)
 
         if origin:
             entries.sort(key=lambda e: e["range_nm"])
@@ -313,17 +348,29 @@ class TrafficTable:
             entries = entries[:limit]
         return entries
 
-    def mark_model_clean(self, callsign):
-        """渲染端匹配过模型之后回来清标记。"""
+    def mark_model_clean(self, callsign, equipment=None, airline=None):
+        """渲染端匹配过模型之后回来清标记。
+
+        带上匹配时用的机型/航司：如果 #SB 的回复恰好在快照和这里之间落地，
+        无条件清标记会把那次更新吞掉——飞机从此停在通用模型上，再也不重新
+        匹配。对不上就把标记留着，下一帧再匹配一次。
+        """
         with self._lock:
             aircraft = self.aircraft.get(callsign)
-            if aircraft:
-                aircraft.model_dirty = False
+            if aircraft is None:
+                return
+            if equipment is not None and aircraft.equipment != equipment:
+                return
+            if airline is not None and aircraft.airline != airline:
+                return
+            aircraft.model_dirty = False
 
 
 def distance_nm(lat1, lon1, lat2, lon2):
     """两点距离（海里）。平面近似，几百海里内够用，比 haversine 便宜。"""
     mean_lat = math.radians((lat1 + lat2) / 2.0)
     dy = (lat2 - lat1) * NM_PER_DEGREE
-    dx = (lon2 - lon1) * NM_PER_DEGREE * math.cos(mean_lat)
+    # 经度差按最短弧算，跨 180° 经线时才不会得出"绕地球一圈"的距离
+    dlon = (lon2 - lon1 + 180.0) % 360.0 - 180.0
+    dx = dlon * NM_PER_DEGREE * math.cos(mean_lat)
     return math.hypot(dx, dy)

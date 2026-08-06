@@ -337,10 +337,34 @@ class Profile:
             log.warning(f"could not read the profile file: {e}")
 
     def save(self):
+        """写回去。多 profile 的文件只改自己那一份，别的原样保留。
+
+        load() 认得 {"profiles": [...]} 并只取当前那份，save() 原来却整个
+        文件重写成 {"stations": [...]}——改一次跑道构型，其余 profile 全部
+        无声消失。
+        """
+        payload = {"stations": [s.to_dict() for s in self.stations]}
         try:
+            existing = None
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                except Exception:
+                    existing = None
+            if isinstance(existing, dict) and "profiles" in existing:
+                active = existing.get("active")
+                profiles = existing.get("profiles") or []
+                chosen = next(
+                    (p for p in profiles if p.get("name") == active),
+                    profiles[0] if profiles else None)
+                if chosen is None:
+                    profiles.append({"name": self.name, **payload})
+                else:
+                    chosen["stations"] = payload["stations"]
+                payload = existing
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({"stations": [s.to_dict() for s in self.stations]},
-                          f, ensure_ascii=False, indent=2)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.warning(f"could not save the profile file: {e}")
 

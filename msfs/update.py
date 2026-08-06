@@ -23,6 +23,7 @@
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 
 log = logging.getLogger("update")
@@ -85,8 +86,11 @@ def check(client, current, url=None, timeout=10):
     `client` 是包名（`xpc-for-can` 这种），`current` 是本地版本号。
     """
     target = (url or DEFAULT_UPDATE_URL)
-    query = f"?client={client}&version={current}"
-    request = urllib.request.Request(target + query,
+    # urlencode 编码参数值；自建源的 update_url 可能已经带了 ?token=…，
+    # 那时要接 & 而不是再来一个 ?（否则每次检查都静默 400）
+    query = urllib.parse.urlencode({"client": client, "version": current})
+    joiner = "&" if "?" in target else "?"
+    request = urllib.request.Request(target + joiner + query,
                                      headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

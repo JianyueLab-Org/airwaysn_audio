@@ -33,6 +33,13 @@ REQUEST_BASE = 10000
 # 放太多会掉帧——按距离排序后截断，远的先扔。
 MAX_AIRCRAFT = 40
 
+# objectID 等这么久还不回来就放弃这条记录（补删挂账，下一轮重建）。
+# 位置太远之类的失败没有逐条回执，不设时限的话记录会永远停在"还在等"。
+PENDING_TIMEOUT = 15.0
+# 同一个模型连着建败几次才拉黑。EXCEPTION 消息对不上是哪次请求，一次失败
+# 就拉黑会把同一轮里无辜的模型全部错杀（一分钟内能把整个机队拉黑）。
+BLACKLIST_AFTER = 3
+
 
 class _Definition:
     """SetDataOnSimObject 用的数据定义。
@@ -48,7 +55,10 @@ class _Definition:
         (b"PLANE BANK DEGREES", b"degrees"),
         (b"PLANE HEADING DEGREES TRUE", b"degrees"),
         (b"AIRSPEED TRUE", b"knots"),
-        (b"SIM ON GROUND", b"Bool"),
+        # 这里不能放 SIM ON GROUND：它不是可写的 SimVar，而定义里混进一个
+        # 不可写的字段会让**整条** SetDataOnSimObject 以 SET_DATA_FAILED
+        # 收场——飞机建在初始位置之后就再也不动，日志还一片干净。
+        # 在地面与否只在创建时通过 INITPOSITION.OnGround 告诉模拟器。
     ]
 
 
@@ -69,8 +79,12 @@ class TrafficInjector:
         # 出来**的，等号码回来必须补一刀删掉，否则它会以最后的位置永久停在天上。
         self._orphaned = set()
         self.bad_titles = set()     # 模拟器拒绝生成过的模型；匹配时要排除掉
+        self._title_failures = {}   # 模型名 -> 连续建败次数
         self._next_request = REQUEST_BASE
         self._enums = None
+        # sync() 和 clear() 各自会发一串 DLL 调用，一个在注入线程、一个在
+        # Qt 线程（断开/退出时）。不串行化的话断开那一刻两串请求交错着发。
+        self._op_lock = threading.Lock()
 
         try:
             self._setup()
@@ -169,6 +183,11 @@ class TrafficInjector:
             int(exceptions.SIMCONNECT_EXCEPTION_OBJECT_CONTAINER):
                 "模型容器有问题（装得不完整？）",
         }
+        # 老版本的枚举里不一定有，缺了就不认这一条，别把整个处理炸掉
+        data_error = getattr(exceptions, "SIMCONNECT_EXCEPTION_DATA_ERROR", None)
+        if data_error is not None:
+            interesting[int(data_error)] = \
+                "SetDataOnSimObject 被拒（数据定义里混进了不可写的 SimVar？）"
         try:
             code = int(body.dwException)
         except Exception:
@@ -183,12 +202,22 @@ class TrafficInjector:
         log.warning("the simulator refused to create traffic: %s. waiting: %s, "
                     "models in use: %s", reason, waiting or "none",
                     titles or "none")
-        # 模型建不出来才拉黑；位置太远是暂时的，换个地方就好了，别把好模型
-        # 永久排除掉
-        blacklist = code == int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED)
+        # 位置太远（reality bubble）是暂时的、也不指认任何模型——什么都不用
+        # 收拾：建败的那条记录等 PENDING_TIMEOUT 超时自己重来，把同一轮里
+        # 正在建的**别的**飞机一起丢掉只会造成拆了又建的抖动。
+        if code != int(exceptions.SIMCONNECT_EXCEPTION_CREATE_OBJECT_FAILED):
+            return
         with self._lock:
-            if blacklist:
-                self.bad_titles.update(titles)
+            # EXCEPTION 对不上是哪次请求。只有同一轮里就一个模型才能指认；
+            # 多个模型在场时给每个记一次嫌疑，连续 BLACKLIST_AFTER 次才拉黑
+            # ——一次失败全体拉黑的话，一分钟就能把整个机队错杀干净。
+            distinct = set(titles)
+            for title in distinct:
+                self._title_failures[title] = self._title_failures.get(title, 0) + 1
+                if (len(distinct) == 1
+                        or self._title_failures[title] >= BLACKLIST_AFTER):
+                    self.bad_titles.add(title)
+                    log.warning("model %r is now blacklisted", title)
             self._requested_titles.clear()
             for callsign in waiting:
                 record = self.aircraft.get(callsign)
@@ -223,22 +252,23 @@ class TrafficInjector:
         """
         if not self.available:
             return
-        self._collect_assigned()
+        with self._op_lock:
+            self._collect_assigned()
 
-        entries = entries[:MAX_AIRCRAFT]
-        seen = set()
-        for entry in entries:
-            callsign = entry.get("callsign")
-            if not callsign:
-                continue
-            seen.add(callsign)
-            try:
-                self._sync_one(callsign, entry)
-            except Exception as e:
-                log.debug("updating %s raised: %s", callsign, e)
+            entries = entries[:MAX_AIRCRAFT]
+            seen = set()
+            for entry in entries:
+                callsign = entry.get("callsign")
+                if not callsign:
+                    continue
+                seen.add(callsign)
+                try:
+                    self._sync_one(callsign, entry)
+                except Exception as e:
+                    log.debug("updating %s raised: %s", callsign, e)
 
-        for callsign in [c for c in self.aircraft if c not in seen]:
-            self.remove(callsign)
+            for callsign in [c for c in list(self.aircraft) if c not in seen]:
+                self.remove(callsign)
 
     def _collect_assigned(self):
         """把已经回来的 objectID 认领到对应的飞机上。
@@ -248,6 +278,7 @@ class TrafficInjector:
         模拟器那边是真的建出来了。不在这里补删的话，它会以最后的位置永远停在
         天上，而我们连它的号码都不再记得。
         """
+        now = time.time()
         with self._lock:
             ready = [(rid, oid) for rid, oid in self._assigned.items()
                      if rid in self._pending]
@@ -258,6 +289,8 @@ class TrafficInjector:
                 record = self.aircraft.get(callsign)
                 if record is not None:
                     record["object_id"] = oid
+                    # 建成了就洗清嫌疑——失败计数只数**连续**的
+                    self._title_failures.pop(record.get("title"), None)
                     log.info("%s is in the simulator (object %d, model %s)",
                              callsign, oid, record.get("title", "?"))
             strays = [(rid, self._assigned.pop(rid))
@@ -265,6 +298,21 @@ class TrafficInjector:
             for rid, _ in strays:
                 self._orphaned.discard(rid)
                 self._requested_titles.pop(rid, None)
+
+            # 等了太久还没等到 objectID 的：多半是那次创建静默失败了（比如
+            # 位置太远）。把记录丢掉、请求挂账补删，下一轮该重建的自然重建。
+            # 不设时限的话这条记录永远停在"还在等"，飞机永远出不来。
+            for callsign in list(self.aircraft):
+                record = self.aircraft[callsign]
+                if (record.get("object_id") is None
+                        and now - record.get("requested_at", now) > PENDING_TIMEOUT):
+                    rid = record.get("request_id")
+                    if self._pending.pop(rid, None) is not None:
+                        self._orphaned.add(rid)
+                    self._requested_titles.pop(rid, None)
+                    self.aircraft.pop(callsign, None)
+                    log.debug("gave up waiting for %s's objectID, will recreate",
+                              callsign)
 
         # DLL 调用放到锁外面：_request_id() 自己也要拿这把锁
         for _, object_id in strays:
@@ -305,8 +353,11 @@ class TrafficInjector:
         init.Latitude = entry["latitude"]
         init.Longitude = entry["longitude"]
         init.Altitude = entry["altitude"]
-        init.Pitch = entry.get("pitch", 0.0)
-        init.Bank = entry.get("bank", 0.0)
+        # FSD 的姿态是抬头为正、右滚为正；MSFS 的 PLANE PITCH/BANK 正好反过来
+        # （simlink 读的时候取了负，写回去也要取负）。不翻的话进近的飞机在
+        # 别人模拟器里全程俯冲。
+        init.Pitch = -entry.get("pitch", 0.0)
+        init.Bank = -entry.get("bank", 0.0)
         init.Heading = entry.get("heading", 0.0)
         init.OnGround = 1 if entry.get("on_ground") else 0
         init.Airspeed = int(entry.get("groundspeed", 0))
@@ -316,8 +367,9 @@ class TrafficInjector:
             self.sim.hSimConnect, title.encode("utf-8"),
             callsign.encode("utf-8")[:12], init, request_id)
         if hr != 0:
+            # HRESULT 直接非零是连接/参数层面的失败（句柄坏了、连接掉了），
+            # 不是这个模型的错——拉黑它会把当时恰好在用的模型全部错杀
             log.warning("creating %s failed (model %r): HRESULT %s", callsign, title, hr)
-            self.bad_titles.add(title)
             return
 
         with self._lock:
@@ -333,11 +385,11 @@ class TrafficInjector:
               callsign, title, request_id)
 
     def _move(self, object_id, entry):
+        # 姿态取负：见 _create 里的注释
         values = (ctypes.c_double * len(_Definition.FIELDS))(
             entry["latitude"], entry["longitude"], entry["altitude"],
-            entry.get("pitch", 0.0), entry.get("bank", 0.0),
-            entry.get("heading", 0.0), float(entry.get("groundspeed", 0)),
-            1.0 if entry.get("on_ground") else 0.0)
+            -entry.get("pitch", 0.0), -entry.get("bank", 0.0),
+            entry.get("heading", 0.0), float(entry.get("groundspeed", 0)))
         self.sim.dll.SetDataOnSimObject(
             self.sim.hSimConnect, self.definition_id, object_id,
             0, 0, ctypes.sizeof(values), values)
@@ -364,6 +416,11 @@ class TrafficInjector:
             log.debug("removing %s raised: %s", callsign, e)
 
     def clear(self):
-        """全部清掉。断开连接和退出时都要调，否则飞机会留在天上不动。"""
-        for callsign in list(self.aircraft):
-            self.remove(callsign)
+        """全部清掉。断开连接和退出时都要调，否则飞机会留在天上不动。
+
+        和 sync() 串行化：clear 多从 Qt 线程来（断开/退出），一轮 sync 正在
+        注入线程上跑的话，两串 SimConnect 请求会交错着发。
+        """
+        with self._op_lock:
+            for callsign in list(self.aircraft):
+                self.remove(callsign)

@@ -22,6 +22,8 @@ import math
 import threading
 import time
 
+from i18n import t
+
 log = logging.getLogger("sim")
 
 # _poll 的三种结果。"没进飞行"和"连接断了"要分开——前者是常态，重开连接
@@ -54,6 +56,8 @@ SIMVARS = {
     "bank": "PLANE_BANK_DEGREES",                  # 弧度（名字同样骗人）
     "heading": "PLANE_HEADING_DEGREES_TRUE",       # 弧度
     "squawk": "TRANSPONDER_CODE:1",                # BCD
+    # 0 关 1 待机 2 测试 3 开 4 高度(C) 5 地面。读不到就当在线（老行为）。
+    "xpdr_state": "TRANSPONDER_STATE:1",
     "com1": "COM_ACTIVE_FREQUENCY:1",              # MHz
     "com2": "COM_ACTIVE_FREQUENCY:2",              # MHz
     "on_ground": "SIM_ON_GROUND",
@@ -113,7 +117,11 @@ def bcd_to_squawk(raw):
     for shift in (12, 8, 4, 0):
         digit = (value >> shift) & 0xF
         if digit > 7:            # 应答机是八进制，出现 8/9 说明这不是 BCD
-            return value if 0 <= value <= 7777 else 2000
+            # 当十进制收，但每一位也得是八进制的——4608 或 1290 这种
+            # 根本不是应答机码，上了网管制端会看到一个不存在的号
+            if 0 <= value <= 7777 and all(c in "01234567" for c in f"{value:04d}"):
+                return value
+            return 2000
         digits = digits * 10 + digit
     return digits
 
@@ -196,7 +204,7 @@ class SimLink:
                 try:
                     self._open()
                 except Exception as e:
-                    self._state(False, "连不上 MSFS（模拟器是否已启动？）")
+                    self._state(False, t("sim.not_running"))
                     log.debug("opening SimConnect failed: %s", e)
                     self._sleep(RETRY_INTERVAL)
                     continue
@@ -205,7 +213,7 @@ class SimLink:
             result = self._poll()
             if result is FAILED:
                 # SimConnect 本身出错了，连接多半没了，重开
-                self._state(False, "MSFS 连接中断")
+                self._state(False, t("sim.link_lost"))
                 self._close()
                 self._sleep(RETRY_INTERVAL)
                 continue
@@ -213,11 +221,11 @@ class SimLink:
             if result is NO_DATA:
                 # 连接好好的，只是还没进飞行（在菜单里就是这样）。以前这里
                 # 也走重开，日志里每隔几秒一条 "SIM OPEN"，白白反复建连接。
-                self._state(False, "MSFS 没有数据（是否已进入飞行？）")
+                self._state(False, t("sim.no_data"))
                 self._sleep(POLL_INTERVAL)
                 continue
 
-            self._state(True, "已连接 MSFS")
+            self._state(True, t("sim.link_up"))
             self._sleep(POLL_INTERVAL)
 
     def _sleep(self, seconds):
@@ -233,13 +241,20 @@ class SimLink:
         完全正常的，不该把整条 SimConnect 连接推倒重来。
         """
         values = {}
-        try:
-            for name, simvar in SIMVARS.items():
+        failures = 0
+        for name, simvar in SIMVARS.items():
+            # 逐个兜底：个别机模上某个 SimVar 会抛（包对不认识的名字也抛），
+            # 让它把整轮拖垮的话，连接每 3 秒推倒重来一次，位置包一停一停
+            try:
                 value = self._requests.get(simvar)
-                if value is not None:
-                    values[name] = value
-        except Exception as e:
-            log.debug("reading a SimVar raised: %s", e)
+            except Exception as e:
+                failures += 1
+                log.debug("reading %s raised: %s", simvar, e)
+                continue
+            if value is not None:
+                values[name] = value
+        if failures and failures >= len(SIMVARS):
+            # 全军覆没才是连接真的没了
             return FAILED
 
         # 经纬度是判断"有没有真的在飞"的最低要求
@@ -247,7 +262,10 @@ class SimLink:
             return NO_DATA
 
         with self._lock:
-            self.values = values
+            # 合并而不是整体替换：偶尔一轮里某个值没读到（换机、加载卡顿）
+            # 时沿用上一轮的，不然下一个位置包里航向/姿态全变成 0，别人屏幕
+            # 上这架飞机猛拽一下。整体新旧由 last_update 把关。
+            self.values.update(values)
             self.last_update = time.time()
         return OK
 
@@ -275,7 +293,11 @@ class SimLink:
             "bank": -math.degrees(raw.get("bank", 0.0)),
             "heading": math.degrees(raw.get("heading", 0.0)) % 360.0,
             "squawk": bcd_to_squawk(raw.get("squawk", 0x2000)),
-            "xpdr_mode": 2,          # MSFS 没有直接可读的模式，按"正常"报
+            # TRANSPONDER STATE >= 3（开/高度/地面）按在线报，其余按待机；
+            # 读不到（老机模）沿用旧行为当在线。冷舱的飞机不该在雷达上是个
+            # 亮着的 C 模式目标。
+            "xpdr_mode": (2 if raw.get("xpdr_state") is None
+                          or raw.get("xpdr_state", 4) >= 3 else 1),
             "com1": self._frequency(raw.get("com1")),
             "com2": self._frequency(raw.get("com2")),
             "com1_power": True,

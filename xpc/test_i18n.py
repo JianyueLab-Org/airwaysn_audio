@@ -119,6 +119,10 @@ class NoHardcodedUiStringTest(unittest.TestCase):
         """fsdpilot.py 同理，还包括本地先查一遍的呼号错误。"""
         self.assertEqual(self.offenders("fsdpilot.py"), [])
 
+    def test_sim_link_status_messages_are_translated(self):
+        """xplane.py 的 _state 消息经 on_sim_state 直接进消息区。"""
+        self.assertEqual(self.offenders("xplane.py"), [])
+
 
 class LookupTest(unittest.TestCase):
 

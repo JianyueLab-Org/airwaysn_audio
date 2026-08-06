@@ -237,6 +237,20 @@ class AuthenticateTest(UpstreamTestCase):
         user_id, _, _ = self.authenticate("1000", "pw")
         self.assertEqual(user_id, login_module.AUTH_FAILED)
 
+    def test_an_upstream_5xx_is_not_reported_as_a_bad_password(self):
+        """can-web 部署中的 502 不是密码错误。
+
+        报 AUTH_FAILED 的话，全网用户在那两分钟里都看到"密码错误"，反复改
+        密码重连，每次都计进按账号的限流——上游恢复了人也被锁死了。
+        """
+        self.upstream(Response(502))
+        user_id, _, _ = self.authenticate("1000", "pw")
+        self.assertEqual(user_id, login_module.AUTH_TEMPORARY_FAILURE)
+
+    def test_a_transient_5xx_recovers_within_the_retries(self):
+        self.upstream(Response(503), Response(200))
+        self.assertEqual(self.authenticate("1000", "pw"), (1000, "1000", []))
+
     def test_an_unreachable_upstream_is_not_reported_as_a_bad_password(self):
         """上游连不上时报 -1，用户看到的是"密码错误"，会一直去改密码。
 
@@ -288,21 +302,45 @@ class AuthenticateTest(UpstreamTestCase):
         self.authenticate("1000", "pw")
         self.assertEqual(self.kicked, [], "登录失败不该把在线的自己踢下去")
 
-    def test_a_non_numeric_name_does_not_blow_up(self):
-        self.upstream(Response(200))
-        user_id, _, _ = self.authenticate("不是数字", "pw")
-        self.assertEqual(user_id, login_module.AUTH_FAILED)
+    def test_a_non_numeric_name_falls_through_to_murmur(self):
+        """既不是纯数字也不是通播格式的名字要**放行**，不是拒绝。
 
-    def test_a_malformed_atis_name_is_refused_rather_than_given_a_bogus_id(self):
+        -2（fallthrough）是 Murmur 约定的"交回内部账号库"：SuperUser 走的就是
+        这条路，回 -1 会把服务器自己的管理入口锁死。内部库不认识的名字最终
+        照样登不进来，所以放行不等于放水。也不该在放行前先去问上游——那是
+        白付一次 HTTP 往返。
+        """
+        fake = self.upstream(Response(200))
+        user_id, _, _ = self.authenticate("不是数字", "pw")
+        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+        self.assertEqual(fake.calls, [], "非本认证器的名字不该拿去问 can-web")
+
+    def test_superuser_can_still_log_in(self):
+        self.upstream(Response(200))
+        user_id, _, _ = self.authenticate("SuperUser", "pw")
+        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+
+    def test_a_malformed_atis_name_is_not_given_a_bogus_id(self):
         """`_atis` 后面不是正好 6 位的，不能当通播账号放行。
 
         旧正则不卡结尾，1000_atis1180001 也算匹配，取 id 时 split 拿到 7 位的
         1180001——凭空造出一个谁也不认识的用户 id，而且它和任何真实频率都对不上。
-        现在这种名字落回普通用户那条路，int() 抛错，认证失败。
+        现在这种名字既不匹配通播格式、也不是纯数字，交回 Murmur 内部账号库
+        （那边不认识它，最终照样被拒），**绝不会**拿到任何用户 id。
         """
         self.upstream(Response(200))
         user_id, _, _ = self.authenticate("1000_atis1180001", "pw")
-        self.assertEqual(user_id, login_module.AUTH_FAILED)
+        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
+
+    def test_a_fullwidth_numeric_name_is_not_the_same_account(self):
+        """int("１０００") == 1000——全角数字的名字绝不能拿到 1000 的用户 id。
+
+        名字不同踢不掉对方的会话，id 相同却继承对方的全部 ACL。
+        """
+        self.upstream(Response(200))
+        user_id, _, _ = self.authenticate("１０００", "pw")
+        self.assertNotEqual(user_id, 1000)
+        self.assertEqual(user_id, login_module.AUTH_FALLTHROUGH)
 
 
 class UserIdAgreementTest(unittest.TestCase):

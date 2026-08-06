@@ -37,9 +37,11 @@ sim/multiplayer/position/plane#_* dataref，所以还在读那套的老插件照
    acquirePlanes()，否则 override_TCAS 写不进去。
 """
 
+import base64
 import json
 import socket
 import traceback
+import zlib
 
 try:
     import xp
@@ -47,7 +49,8 @@ except ImportError:      # 在 X-Plane 之外被导入（比如跑测试）时�
     xp = None
 
 PLUGIN_PORT = 49900
-PROTOCOL_VERSION = 1
+# v2：分片按字节切、负载 base64。和 bridge.py 保持一致（有测试钉着）。
+PROTOCOL_VERSION = 2
 
 # TCAS 目标数组是 64 个位置（sim/cockpit2/tcas/targets/*，float[64]）。
 # 第 0 位是本机，所以他机最多 63 架。
@@ -96,21 +99,29 @@ class Reassembler:
 
         sequence = header.get("seq", 0)
         if sequence != self.sequence:
+            # 16 位环回序号：只认往前走的新帧，迟到的旧分片直接扔
+            if self.sequence is not None:
+                delta = (sequence - self.sequence) & 0xFFFF
+                if delta == 0 or delta > 0x8000:
+                    return None
             self.sequence = sequence
             self.parts = {}
-            self.total = header.get("total", 1)
+            self.total = max(1, int(header.get("total", 1) or 1))
         try:
-            self.parts[int(header["part"])] = header["data"]
+            part = int(header["part"])
+            if not 0 <= part < self.total:
+                return None
+            self.parts[part] = base64.b64decode(header["data"])
         except (KeyError, TypeError, ValueError):
             return None
         if len(self.parts) < self.total:
             return None
 
-        body = "".join(self.parts[i] for i in range(self.total))
+        body = b"".join(self.parts[i] for i in range(self.total))
         self.parts = {}
         try:
-            return json.loads(body)
-        except ValueError:
+            return json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
             return None
 
 
@@ -123,6 +134,10 @@ class RenderedAircraft:
         self.object_ref = None
         self.instance = None
         self.loading = False
+        # 每发起一次异步加载加一。回调带着发起时的号回来，对不上就说明这次
+        # 加载已经被更新的一次顶掉了——直接卸掉，别覆盖 instance（否则旧
+        # instance 没人销毁，一架冻住的重影永远挂在天上）。
+        self.load_generation = 0
 
     def destroy(self):
         if self.instance is not None and xp:
@@ -149,6 +164,7 @@ class PythonInterface:
         self.reassembler = Reassembler()
         self.aircraft = {}          # 呼号 -> RenderedAircraft
         self.last_message = 0.0
+        self.tcas_written = 0       # 上一帧写了多少个 TCAS 槽位
         self.have_planes = False
         self.accessors = []
         self.own_callsign = ""
@@ -346,7 +362,9 @@ class PythonInterface:
             aircraft.destroy()
             aircraft.object_path = wanted
             aircraft.loading = True
-            xp.loadObjectAsync(wanted, self._object_loaded, callsign)
+            aircraft.load_generation += 1
+            xp.loadObjectAsync(self._object_path(wanted), self._object_loaded,
+                               (callsign, aircraft.load_generation))
 
         if aircraft.instance is None:
             return
@@ -360,12 +378,37 @@ class PythonInterface:
              entry.get("bank", 0.0)),
             self._animation_values(entry))
 
-    def _object_loaded(self, object_ref, callsign):
-        """loadObjectAsync 的回调。加载期间飞机可能已经走了。"""
+    @staticmethod
+    def _object_path(path):
+        """把客户端给的路径整理成 XPLM 能吃的样子。
+
+        客户端发来的是绝对路径（用户选的 CSL 目录），Windows 上还带反斜杠。
+        XPLM 的对象加载习惯 X-System 根目录的相对路径（XPMP2 专门有个
+        RemoveXPSysDir 干这个）——在 X-Plane 树里的就转成相对的，不在的原样
+        交上去碰运气，失败会在 _object_loaded 里说清楚。
+        """
+        clean = (path or "").replace("\\", "/")
+        try:
+            system = xp.getSystemPath().replace("\\", "/")
+            if system and clean.lower().startswith(system.lower()):
+                clean = clean[len(system):].lstrip("/")
+        except Exception:
+            pass
+        return clean
+
+    def _object_loaded(self, object_ref, refcon):
+        """loadObjectAsync 的回调。加载期间飞机可能已经走了，或又换过模型。"""
+        callsign, generation = refcon
         aircraft = self.aircraft.get(callsign)
-        if aircraft is None or object_ref is None:
+        if (aircraft is None or object_ref is None
+                or generation != aircraft.load_generation):
             if object_ref is not None:
                 xp.unloadObject(object_ref)
+            if object_ref is None and aircraft is not None:
+                # 不留这行日志的话，"TCAS 有目标、窗外没飞机"完全没法查
+                xp.log(f"could not load the CSL object for {callsign}: "
+                       f"{aircraft.object_path}")
+                aircraft.loading = False
             return
         aircraft.loading = False
         aircraft.object_ref = object_ref
@@ -409,6 +452,17 @@ class PythonInterface:
             return
 
         count = len(entries)
+        # 数量变少时要把多出来的槽位清掉。X-Plane 靠 modeS_id 非零判断目标
+        # 存在，不清的话走掉的飞机会以最后的位置永远留在 ND/TCAS 上。
+        if count < self.tcas_written:
+            stale = self.tcas_written - count
+            try:
+                xp.setDatavi(self.tcas["modeS"], [0] * stale, 1 + count, stale)
+            except Exception:
+                pass
+        self.tcas_written = count
+        if count == 0:
+            return
         xs, ys, zs, psis, thes, phis, vss, wows = [], [], [], [], [], [], [], []
         modes, ids = [], []
         flight_ids, icao_types = bytearray(), bytearray()
@@ -425,8 +479,11 @@ class PythonInterface:
             vss.append(entry.get("vertical_speed", 0.0))
             wows.append(1 if entry.get("on_ground") else 0)
             modes.append(int(entry.get("squawk", 0)))
-            # modeS_id 要求 1..0xFFFFFF 唯一，用呼号哈希凑一个稳定的
-            ids.append((hash(entry["callsign"]) & 0xFFFFFF) or 1)
+            # modeS_id 要求 1..0xFFFFFF 唯一，用呼号哈希凑一个稳定的。
+            # 不能用 hash()：它按进程随机加盐，重启一次 X-Plane 同一架飞机
+            # 就换了个 id。
+            ids.append((zlib.crc32(entry["callsign"].encode("utf-8"))
+                        & 0xFFFFFF) or 1)
             flight_ids.extend(self._fixed_string(entry["callsign"], 8))
             icao_types.extend(self._fixed_string(entry.get("equipment", ""), 8))
 
@@ -454,6 +511,7 @@ class PythonInterface:
         for aircraft in self.aircraft.values():
             aircraft.destroy()
         self.aircraft.clear()
+        self.tcas_written = 0
         if self.tcas_available and self.have_planes:
             try:
                 # 目标数清零，否则 ND 上会留下一圈不动的光点

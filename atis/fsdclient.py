@@ -110,8 +110,11 @@ class FSDClient:
         self.host = host
         self.port = int(port or DEFAULT_PORT)
         self.callsign = callsign.strip().upper()
-        self.cid = str(cid).strip()
-        self.password = password
+        self.cid = sanitize_line(str(cid))
+        # 密码也要过 sanitize_line：带冒号的密码让 #AA 后面的字段全部错位
+        # （服务器拒收），而 _redact() 按固定下标打码，错位后冒号后那截密码
+        # 会原样进日志。冒号在 FSD 协议里本来就带不动。
+        self.password = sanitize_line(password or "")
         self.real_name = sanitize_line(real_name or "ATIS") or "ATIS"
         # rating 为 None 表示"自动"：登录前用 rating_lookup 查本人此刻的等级，
         # 查不到就退回观察员。查询放在连接线程里做，不卡界面。

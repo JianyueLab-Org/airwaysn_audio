@@ -203,6 +203,7 @@ def main():
         sent = []
         window.bridge.send_traffic = lambda entries, own=None: sent.append(entries)
         window.tick()
+        window.traffic_tick()      # 他机现在走自己的快节奏定时器
         assert sent and sent[0], "他机没有推给插件"
         entry = sent[0][0]
         assert entry["callsign"] == "CES2345", entry
@@ -219,6 +220,7 @@ def main():
         window.bridge.send_traffic = lambda entries, own=None: sent.append(entries)
         window.settings.render_traffic = False
         window.tick()
+        window.traffic_tick()
         window.settings.render_traffic = True
         assert not sent, "关掉之后不该再推"
     check("可以关掉他机渲染", render_can_be_turned_off)
@@ -228,7 +230,8 @@ def main():
         window.models = cslmatch.ModelSet()
         window._model_cache.clear()
         window.traffic.set_plane_info("CES2345", equipment="B738")
-        window.tick()      # 没有模型也不该炸，TCAS 还是要送
+        window.tick()
+        window.traffic_tick()      # 没有模型也不该炸，TCAS 还是要送
     check("没装模型也能跑", survives_without_models)
 
     print("对话框：")

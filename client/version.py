@@ -34,6 +34,17 @@ log = logging.getLogger("version")
 # 的人看到的是新系列——同一份代码报两个版本号，还没有任何地方会报错。
 VERSION = "2.1.0"
 
+# ---- Dev 测试版 ----
+# 测试版把 DEV 置 True：版本号显示成**下一个补丁号**加 (Dev Build N)。
+# 最新正式版是 v2.1.1 时，第一个 Dev 包就是 v2.1.2 (Dev Build 1)；同一个
+# 版本再出一个测试包，把 DEV_BUILD 加一（v2.1.2 (Dev Build 2)）。正式发布
+# 那个补丁号时，把 DEV 关回 False、DEV_BUILD 归 1。
+#
+# 取"下一个补丁号"而不是照抄最新版，是为了让测试包在排序上永远新于它基于
+# 的正式版——用户拿版本号对话时（"我这个比他新"）不会把测试包错认成旧版。
+DEV = True
+DEV_BUILD = 1
+
 # CI 用它把算出来的版本号传进打包过程（gui.spec 会调 freeze()）。
 VERSION_ENV = "AIRWAYSN_VERSION"
 
@@ -95,8 +106,8 @@ def _from_file():
     return (_buildinfo().get("build") or "").strip() or None
 
 
-def version():
-    """版本号。打包的读固化值，从源码跑就用上面那个回退值。
+def release_version():
+    """最新正式版的版本号。打包的读固化值，从源码跑就用上面那个回退值。
 
     固化值优先是关键：CI 每次推到 main 都会算一个新的补丁号，而 VERSION 这个
     常量不会跟着动——只信常量的话，所有自动发出去的包都会显示同一个版本号。
@@ -105,6 +116,33 @@ def version():
     if _cached_version is None:
         _cached_version = (_buildinfo().get("version") or "").strip() or VERSION
     return _cached_version
+
+
+def _bump_patch(number):
+    """2.1.1 → 2.1.2。从后往前找到第一段纯数字加一。"""
+    pieces = str(number).split(".")
+    for index in range(len(pieces) - 1, -1, -1):
+        if pieces[index].isdigit():
+            pieces[index] = str(int(pieces[index]) + 1)
+            break
+    return ".".join(pieces)
+
+
+def version():
+    """对外报告的版本号。Dev 包报下一个补丁号，正式包就是正式号。"""
+    base = release_version()
+    return _bump_patch(base) if DEV else base
+
+
+def display():
+    """标题栏用的版本串（不带 v 前缀）。
+
+    正式版就是 "2.1.1"；Dev 版是 "2.1.2 (Dev Build 1)"——用户一眼能看出
+    自己跑的是测试包，报问题时也能说清是第几个测试包。
+    """
+    if DEV:
+        return f"{version()} (Dev Build {DEV_BUILD})"
+    return version()
 
 
 def build():
@@ -116,7 +154,10 @@ def build():
 
 
 def full():
-    """给界面和日志用的完整版本串。"""
+    """给界面和日志用的完整版本串。Dev 包把两种号都带上：Dev Build 号给
+    用户对话用，git build 号给排查定位用。"""
+    if DEV:
+        return f"v{version()} (Dev Build {DEV_BUILD}; build {build()})"
     return f"v{version()} (build {build()})"
 
 

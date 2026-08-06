@@ -1085,6 +1085,10 @@ class ControllerWindow(QMainWindow):
         if self.voice:
             self.voice.disconnect()
             self.voice = None
+        # 值班锁和发话许可来自数据源，而数据源定时器刚停了：不复位的话，
+        # 上一班锁住的频率断开后还是删不掉，提示写着"你正在扇区里管它"。
+        self.stack.set_locked(None)
+        self.stack.set_transmit_allowed(True)
         for radio in self.stack:
             radio.currently_rx = False
             radio.currently_tx = False
