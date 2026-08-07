@@ -421,3 +421,110 @@ class WatchConnectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class KickTest(unittest.TestCase):
+    """真的去踢人的那一半。
+
+    上面那组测试把 kick_previous_session 整个换成了一个 list.append，所以它从
+    来没碰过 Ice —— 踢人代码用 oneway 代理调一个带 throws 子句的操作、每一次
+    都抛 TwowayOnlyException、功能一次都没工作过，而测试全绿。这一组盯的就是
+    那一层。
+    """
+
+    class TwowayOnlyException(Exception):
+        pass
+
+    class InvalidSessionException(Exception):
+        pass
+
+    class FakeFuture:
+        def __init__(self, error=None):
+            self.error = error
+            self.callback = None
+
+        def add_done_callback(self, fn):
+            self.callback = fn
+            fn(self)
+
+        def result(self):
+            if self.error:
+                raise self.error
+
+    class FakeServer:
+        """照 Ice 的规则办事的假服务器。
+
+        kickUser 的 slice 带 throws 子句，所以 Ice 不允许单向调用它。这个假货
+        因此在 oneway 代理上遇到 kickUser 就抛 TwowayOnlyException，和真的
+        Murmur 一模一样 —— 换句话说，重新引入那个「优化」会让这里变红。
+        """
+
+        def __init__(self, oneway=False, error=None):
+            self.oneway = oneway
+            self.error = error
+            self.sync_calls = []
+            self.async_calls = []
+
+        def ice_oneway(self):
+            return type(self)(oneway=True, error=self.error)
+
+        def kickUser(self, session, reason, context=None):
+            if self.oneway:
+                raise KickTest.TwowayOnlyException(
+                    "exception ::Ice::TwowayOnlyException")
+            self.sync_calls.append(session)
+
+        def kickUserAsync(self, session, reason, context=None):
+            self.async_calls.append((session, reason, context))
+            return KickTest.FakeFuture(self.error)
+
+    def make(self, server):
+        auth = login_module.AuthenticatorI.__new__(login_module.AuthenticatorI)
+        auth.server = server
+        auth.adapter = None
+        auth.context = {"secret": "s"}
+        auth.online_users = {"1000": 111}
+        return auth
+
+    def capture(self, fn):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            fn()
+        return buffer.getvalue()
+
+    def test_the_kick_goes_out_asynchronously(self):
+        """异步而不是同步：Murmur 正卡在 authenticate 上等我们回话，同步的
+        kickUser 要它处理完才返回，而它要我们返回才能处理 —— 真死锁。"""
+        server = self.FakeServer()
+        self.make(server).kick_previous_session("1000")
+
+        self.assertEqual([call[0] for call in server.async_calls], [111])
+        self.assertEqual(server.sync_calls, [],
+                         "同步调用会和 Murmur 互等")
+
+    def test_the_secret_context_is_carried(self):
+        """少了它 Murmur 抛 InvalidSecretException，踢人静默失效。"""
+        server = self.FakeServer()
+        self.make(server).kick_previous_session("1000")
+        self.assertEqual(server.async_calls[0][2], {"secret": "s"})
+
+    def test_nobody_online_means_no_call_at_all(self):
+        server = self.FakeServer()
+        auth = self.make(server)
+        auth.online_users = {}
+        auth.kick_previous_session("1000")
+        self.assertEqual(server.async_calls, [])
+
+    def test_a_failed_kick_is_logged_rather_than_swallowed(self):
+        """future 不看结果的话，踢人失败就退回成静默失效，而且连日志都没有。"""
+        server = self.FakeServer(error=RuntimeError("boom"))
+        output = self.capture(
+            lambda: self.make(server).kick_previous_session("1000"))
+        self.assertIn("踢出用户失败", output)
+
+    def test_a_session_that_is_already_gone_is_not_an_error(self):
+        """Murmur 自己也认同名会话（Disconnecting ghost），旧会话可能在我们的
+        踢人到达之前就没了。那不是故障，不该每次登录都往日志里写一行。"""
+        server = self.FakeServer(error=self.InvalidSessionException("gone"))
+        output = self.capture(
+            lambda: self.make(server).kick_previous_session("1000"))
+        self.assertEqual(output, "")

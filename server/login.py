@@ -95,22 +95,34 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
         self.context = context or {}
         self.online_users = {}  # 用户名 -> session，由 ServerCallbackI 维护
 
-        # oneway 代理用于 kickUser —— 在 Ice 分发线程中做同步 Ice 调用
-        # 可能因线程池耗尽而死锁，oneway 发完即返，不等待响应
-        try:
-            self._kick_proxy = MumbleIce.ServerPrx.uncheckedCast(
-                server.ice_oneway())
-        except Exception:
-            self._kick_proxy = None
-
     def kick_previous_session(self, name):
         """同名账号已经在线就把旧会话踢掉。
 
         踢人要带上 secret context，否则服务端会抛 InvalidSecretException。
 
-        注意：authenticate 在 Ice 服务端分发线程中运行，如果再发起同步
-        Ice 调用（kickUser）可能导致线程池耗尽而死锁。这里优先使用 oneway
-        代理，发送即返回，不等待响应。
+        **不能同步调**，而且是真的会死锁，不是理论风险：authenticate 跑在 Ice
+        的服务端分发线程上，Murmur 这时正卡在那次调用上等我们回话。同步的
+        kickUser 要 Murmur 处理完才返回，而 Murmur 要等我们返回才能去处理它。
+
+        **也不能走 oneway**，虽然这里原来就是这么写的。kickUser 的 slice 声明
+        带 throws 子句：
+
+            void kickUser(int session, string reason)
+                throws ServerBootedException, InvalidSessionException,
+                       InvalidSecretException;
+
+        而 Ice 只允许无返回值、无出参、**无用户异常**的操作单向调用，所以用
+        oneway 代理调它每一次都抛 TwowayOnlyException —— 这个「优化」对这个操
+        作从来没成立过，踢人功能一次都没工作过。日志里那行
+
+            踢出用户失败: exception ::Ice::TwowayOnlyException
+
+        就是它，每次登录一条。
+
+        异步调用两个性质都占：立刻返回，不占分发线程；同时是 twoway，所以用户
+        异常有地方可去。结果不 join —— 等它就等于把死锁又装回来了 —— 但要挂个
+        回调，否则失败会变成一个没人看的 future，我们就又回到了「踢人静默失效」
+        的状态，只是这次连日志都没有。
         """
         if _shutting_down:
             return
@@ -118,11 +130,28 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
         if old_session is None:
             return
         try:
-            kicker = self._kick_proxy or self.server
-            kicker.kickUser(old_session, "您的账号在其他位置登录", self.context)
+            future = self.server.kickUserAsync(
+                old_session, "您的账号在其他位置登录", self.context)
         except Ice.ConnectionTimeoutException:
-            pass  # 关闭时连接的 Ice 已断，忽略
+            return  # 关闭时连接的 Ice 已断，忽略
         except Exception as e:
+            print(f"踢出用户失败: {e}")
+            return
+
+        future.add_done_callback(self._kick_finished)
+
+    @staticmethod
+    def _kick_finished(future):
+        """异步踢人的结局。跑在 Ice 的线程上，所以只许打日志。
+
+        InvalidSessionException 是正常的：Murmur 自己也认同名会话（日志里的
+        Disconnecting ghost），旧会话可能在我们的踢人到达之前就已经没了。
+        """
+        try:
+            future.result()
+        except Exception as e:
+            if type(e).__name__ == "InvalidSessionException":
+                return
             print(f"踢出用户失败: {e}")
 
     def authenticate(self, name, pw, certificates, certhash, certstrong, current=None):
