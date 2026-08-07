@@ -30,10 +30,35 @@ from pymumble_py3.constants import (PYMUMBLE_CLBK_CONNECTED,
                                     PYMUMBLE_CLBK_DISCONNECTED,
                                     PYMUMBLE_CLBK_PERMISSIONDENIED,
                                     PYMUMBLE_CLBK_SOUNDRECEIVED,
+                                    PYMUMBLE_CLBK_USERREMOVED,
                                     PYMUMBLE_CONN_STATE_CONNECTED,
                                     PYMUMBLE_CONN_STATE_FAILED)
 
 log = logging.getLogger("voice")
+
+
+def _event_has(event, field):
+    """UserRemove 里这个字段到底填了没有。
+
+    Mumble.proto 是 proto2，字段是 optional，所以"没填"和"填了空值"是两件事 ——
+    被踢时 reason 可以是空串，但 actor 一定在。protobuf 用 HasField 判，而测试
+    里用 dict 当替身更省事，所以两种都认。
+    """
+    try:
+        return event.HasField(field)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return field in event
+    except TypeError:
+        return getattr(event, field, None) is not None
+
+
+def _event_get(event, field):
+    try:
+        return event[field]
+    except (TypeError, KeyError, IndexError):
+        return getattr(event, field, None)
 
 SAMPLE_RATES = [48000, 44100, 32000, 24000, 16000]
 FORMAT = pyaudio.paInt16
@@ -96,13 +121,40 @@ class BoundedReconnect:
     gave_up = False
     on_reconnect = None            # 回调 (第几次, 上限)，用来更新界面
     _established = False
+    kicked = False                 # 被服务端踢下来了，不要连回去
+    kick_reason = ""
 
     def _session_established(self):
         """真的建立过一次会话（收到 ServerSync）。计数从这里清零。"""
         self._established = True
         self.reconnect_attempts = 0
 
+    def mark_kicked(self, reason=""):
+        """服务端把我们踢了，这条连接不许再连回去。
+
+        次数上限拦不住这种情况，因为它数的是**失败**的重连：被踢之前的那次登录
+        是成功的，`_session_established()` 已经把计数清零了。同一个账号在两台机
+        器上登录时，两边就这样互相顶掉、各自重连、各自又把对方顶掉，每一轮都是
+        成功的，所以三次的预算永远用不完 —— 这是构造上的死循环，不是上限没生效。
+        Murmur 那边看到的是同一个 IP 一直在连，最后按 autoban 把它整个封掉。
+
+        所以这里不是"再试几次"的问题，是"根本不该再试"：新的会话是用户在别处主
+        动建立的，旧的这一端连回去只会把新的顶掉。
+        """
+        self.kicked = True
+        self.kick_reason = reason or ""
+        self.reconnect = False
+
     def connect(self):
+        # 被踢优先判：它和次数无关，而且是唯一一种"重连本身就是错的"情形。
+        if self.kicked:
+            self.gave_up = True
+            self.reconnect = False
+            self.connected = PYMUMBLE_CONN_STATE_FAILED
+            log.warning("kicked by the server (%s), not reconnecting",
+                        self.kick_reason or "no reason given")
+            return self.connected
+
         # 判定放在发起连接之前：这样两种失败（连不上服务器、服务器拒绝认证）
         # 都被同一处挡住，也不会多试出第四次。
         if self._established and self.reconnect_attempts >= self.reconnect_limit:
@@ -367,6 +419,11 @@ class Voice:
                                                self._on_connected)
             self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_DISCONNECTED,
                                                self._on_disconnected)
+            # 被踢和普通掉线要分开，否则谁也说不清该不该连回去 —— 见
+            # _on_user_removed。DISCONNECTED 是不带理由的，所以只听它的话
+            # 两种情况长得一模一样。
+            self.mumble.callbacks.set_callback(PYMUMBLE_CLBK_USERREMOVED,
+                                               self._on_user_removed)
 
             # ---- pymumble 的主循环挂在"创建它的那个线程"上 ----
             #
@@ -971,6 +1028,55 @@ class Voice:
         if self.running and getattr(self, "_was_dropped", False):
             self._was_dropped = False
             self._status('online', t("voice.reconnected", username=self.username))
+
+    def _on_user_removed(self, user, event=None):
+        """有人离开了。只关心一种：**我们自己被踢了**。
+
+        pymumble 把这条回调的两种情形分得很清楚（见 client/API.md）：用户自己走
+        的话 event 里只有 `session`；被踢或被封才会多出 `actor`、`reason` 和
+        `ban`。所以"是不是被踢"是可以判的，而 DISCONNECTED 回调判不了 —— 它不
+        带任何理由，被顶下线和网络抖动在那儿长得一模一样，于是客户端一律重连。
+
+        这就是同一个账号在两台机器上登录时那场循环的成因：A 登录顶掉 B，B 重连
+        顶掉 A，A 再重连……每一轮登录都是**成功**的，所以三次上限那套预算永远用
+        不完（它数的是失败的重连，而成功的会话会把计数清零）。Murmur 那边看到同
+        一个 IP 每隔几秒连一次，最后按 autoban 整个封掉，于是那台机器连不上了。
+
+        被踢之后不连回去是唯一正确的选择：新的会话是用户在别处主动建立的，这一
+        端连回去只会把它顶掉，然后对方再顶回来。
+        """
+        if not self.mumble:
+            return
+
+        # 只认自己。别人被踢与我们无关。
+        try:
+            myself = self.mumble.users.myself_session
+        except Exception:
+            myself = None
+        session = None
+        try:
+            session = user["session"]
+        except Exception:
+            session = getattr(user, "session", None)
+        if myself is None or session is None or session != myself:
+            return
+
+        # event 里带 actor / reason / ban 才是被踢；只有 session 是自己走的。
+        reason = ""
+        kicked = False
+        if event is not None:
+            for field in ("actor", "reason", "ban"):
+                if _event_has(event, field):
+                    kicked = True
+            reason = _event_get(event, "reason") or ""
+        if not kicked:
+            return
+
+        self.mumble.mark_kicked(reason)
+        log.warning("kicked by the server: %s", reason or "no reason given")
+        # 这条状态是给人看的，所以走 i18n；理由是服务端给的中文原文。
+        self._status('offline',
+                     t("voice.kicked", reason=reason or t("voice.kicked_plain")))
 
     def _on_disconnected(self):
         """一条已经建立的连接断掉了。

@@ -341,6 +341,12 @@ TEXT = {
                                    "reason given (see the log)"},
     "voice.reconnecting":   {"zh": "语音掉线，正在重连（{attempt}/{limit}）",
                              "en": "Voice connection lost — reconnecting ({attempt}/{limit})"},
+    # 被服务端踢下线。通播的每个席位各有一条连接，所以停的是这个席位。
+    "voice.kicked":         {"zh": "{callsign} 被语音服务器断开：{reason}。不会自动重连。",
+                             "en": "{callsign} was disconnected by the voice server: "
+                                   "{reason}. Not reconnecting."},
+    "voice.kicked_plain":   {"zh": "账号可能在其他位置登录了",
+                             "en": "the account may have signed in elsewhere"},
     "voice.give_up":        {"zh": "语音掉线后重连 {limit} 次都没成功，{callsign} 已停播",
                              "en": "Reconnected {limit} times without success — {callsign} "
                                    "went off air"},

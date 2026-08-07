@@ -1352,6 +1352,121 @@ class ReconnectLimitTest(unittest.TestCase):
         self.assertIsNone(v.mumble, "失败路径也必须放掉音频设备和连接")
 
 
+class KickedTest(unittest.TestCase):
+    """被服务端踢下线之后**不许**连回去。
+
+    次数上限拦不住这种情况，而这正是问题所在：它数的是失败的重连，而被踢之前的
+    那次登录是成功的，计数已经被清零了。同一个账号在两台机器上登录时，两端就这
+    样互相顶掉、各自重连、各自又把对方顶掉，每一轮都成功，三次的预算永远用不
+    完 —— 构造上的死循环。Murmur 那边看到同一个 IP 每几秒连一次，最后 autoban
+    把它整个封掉，于是那台机器彻底连不上。
+
+    能判出"被踢"是因为 pymumble 把两种情形分开了（client/API.md）：自己走的话
+    UserRemove 里只有 session，被踢才会多出 actor / reason / ban。DISCONNECTED
+    回调判不了这个 —— 它不带任何理由，被顶下线和网络抖动在那儿一模一样。
+    """
+
+    def setUp(self):
+        for name in ("pyaudio", "pymumble_py3", "pymumble_py3.constants",
+                     "pymumble_py3.errors", "numpy"):
+            sys.modules.setdefault(name, mock.MagicMock())
+        import voice
+        self.voice = voice
+
+    # ---------- 混入本身 ----------
+    def make_bounded(self):
+        """一个只记录 super().connect() 被调了几次的基类。"""
+        calls = []
+
+        class FakeBase:
+            def __init__(self):
+                self.reconnect = True
+                self.connected = 0
+
+            def connect(self):
+                calls.append(1)
+                return "dialled"
+
+        bounded = type("Bounded", (self.voice.BoundedReconnect, FakeBase), {})
+        instance = bounded()
+        return instance, calls
+
+    def test_a_kicked_connection_never_dials_again(self):
+        instance, calls = self.make_bounded()
+        instance._session_established()          # 被踢之前是连上过的
+        instance.mark_kicked("您的账号在其他位置登录")
+
+        result = instance.connect()
+
+        self.assertEqual(calls, [], "被踢之后还去连，就是那场循环本身")
+        self.assertTrue(instance.gave_up)
+        self.assertFalse(instance.reconnect)
+        self.assertEqual(result, self.voice.PYMUMBLE_CONN_STATE_FAILED)
+
+    def test_a_successful_session_does_not_clear_the_kick(self):
+        """先踢再收到 ServerSync 也不该复活 —— 计数清零管的是重连预算，
+        不是"要不要重连"这个决定。"""
+        instance, calls = self.make_bounded()
+        instance.mark_kicked("挤下线了")
+        instance._session_established()
+        instance.connect()
+        self.assertEqual(calls, [])
+
+    def test_the_limit_alone_cannot_stop_a_kick_loop(self):
+        """把 mark_kicked 拿掉，只靠三次上限：每一轮成功的会话都会把计数清零，
+        所以永远到不了上限。这一条钉的是"为什么需要 mark_kicked"。"""
+        instance, calls = self.make_bounded()
+        for _ in range(10):
+            instance._session_established()      # 每轮登录都成功
+            instance.connect()                   # 然后被顶掉，重连
+        self.assertEqual(len(calls), 10,
+                         "十轮全都真的去连了 —— 上限拦不住这种循环")
+        self.assertFalse(instance.gave_up)
+
+    # ---------- Voice 的回调 ----------
+    def make_voice(self):
+        v = self.voice.Voice("h", "u", "p")
+        v.mumble = mock.MagicMock()
+        v.mumble.users.myself_session = 42
+        v.mumble.mark_kicked = mock.MagicMock()
+        self.states = []
+        v._status = lambda state, message: self.states.append((state, message))
+        return v
+
+    def test_being_kicked_marks_the_connection(self):
+        v = self.make_voice()
+        v._on_user_removed({"session": 42},
+                           {"session": 42, "actor": 1,
+                            "reason": "您的账号在其他位置登录", "ban": False})
+
+        v.mumble.mark_kicked.assert_called_once()
+        self.assertEqual(self.states[-1][0], 'offline')
+        self.assertIn("您的账号在其他位置登录", self.states[-1][1],
+                      "服务端给的理由要原样告诉用户")
+
+    def test_leaving_voluntarily_is_not_a_kick(self):
+        """只有 session 的 UserRemove 是用户自己走的。当成被踢的话，一次正常
+        退出就会把重连永久关掉。"""
+        v = self.make_voice()
+        v._on_user_removed({"session": 42}, {"session": 42})
+        v.mumble.mark_kicked.assert_not_called()
+        self.assertEqual(self.states, [])
+
+    def test_somebody_else_being_kicked_is_ignored(self):
+        v = self.make_voice()
+        v._on_user_removed({"session": 7},
+                           {"session": 7, "actor": 1, "reason": "x"})
+        v.mumble.mark_kicked.assert_not_called()
+
+    def test_a_kick_with_no_reason_still_counts(self):
+        """Murmur 自己踢 ghost 时 reason 可以是空的 —— actor 在就够了。"""
+        v = self.make_voice()
+        v._on_user_removed({"session": 42},
+                           {"session": 42, "actor": 1, "reason": ""})
+        v.mumble.mark_kicked.assert_called_once()
+        self.assertEqual(self.states[-1][0], 'offline')
+
+
 class FsdReconnectLimitTest(unittest.TestCase):
     """FSD 链路同一条策略：掉线重连三次，用尽就整个下线。
 

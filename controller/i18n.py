@@ -167,6 +167,13 @@ TEXT = {
                              "en": "Reconnecting to the voice server ({attempt}/{limit})"},
     "voice.reconnected":    {"zh": "语音服务器已重连",
                              "en": "Reconnected to the voice server"},
+    # 被服务端踢下线。和 reconnect_failed 分开：它不是"连不上"，是账号在别处
+    # 登录了，连回去只会把那一端顶掉，所以要说明不再重连。
+    "voice.kicked":         {"zh": "被语音服务器断开：{reason}。不会自动重连。",
+                             "en": "Disconnected by the voice server: {reason}. "
+                                   "Not reconnecting."},
+    "voice.kicked_plain":   {"zh": "账号可能在其他位置登录了",
+                             "en": "the account may have signed in elsewhere"},
     "voice.reconnect_failed": {"zh": "掉线后重连 {limit} 次都没成功，已下线",
                                "en": "Reconnected {limit} times without success — "
                                      "went offline"},

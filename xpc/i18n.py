@@ -380,6 +380,13 @@ TEXT = {
     "voice.give_up":        {"zh": "掉线后重连 {limit} 次都没成功，语音已下线",
                              "en": "Reconnected {limit} times without success — voice "
                                    "went offline"},
+    # 被服务端踢下线。和 give_up 分开，因为它不是"连不上"：账号在别处登录了，
+    # 连回去只会把那一端顶掉，所以文案要说清楚不再重连。
+    "voice.kicked":         {"zh": "被服务器断开：{reason}。不会自动重连。",
+                             "en": "Disconnected by the server: {reason}. "
+                                   "Not reconnecting."},
+    "voice.kicked_plain":   {"zh": "账号可能在其他位置登录了",
+                             "en": "the account may have signed in elsewhere"},
 
     # 服务器拒绝了某个动作。笼统说成"操作失败"会把人引到错误的方向——
     # 缺 MakeTempChannel 时用户会一直去查频率填得对不对。
