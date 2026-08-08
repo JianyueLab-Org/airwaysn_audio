@@ -499,6 +499,17 @@ class MsfsWindow(QMainWindow):
             self._model_cache.clear()
             log.info("loaded %d liveries covering %d aircraft types",
                      len(models), len(models.types))
+            # 一种机型都没有，匹配链的每一级都会落空，天上每架飞机都会退到
+            # 兜底的那个模型——而兜底挑中的多半是个附加件配置，模拟器建不出来，
+            # 结果是他机一架都不显示。这不是正常结果，要说清楚，否则日志里
+            # 只留下一个"0"，没人知道该去改哪。
+            if not models.types:
+                log.warning(
+                    "no aircraft type was recognised in %s; other aircraft "
+                    "cannot be model-matched. If that path is wrong, set the "
+                    "package directory in the traffic settings to the folder "
+                    "that contains Official and Community",
+                    ", ".join(roots))
 
         threading.Thread(target=scan, daemon=True).start()
 

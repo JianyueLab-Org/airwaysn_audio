@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -265,6 +266,60 @@ class PollResultTest(unittest.TestCase):
         self.assertNotIn("_close()", no_data_block)
 
 
+class NoDataGraceTest(unittest.TestCase):
+    """一轮读不到位置不等于断了。
+
+    实飞日志（msfs-for-can.log，2026-08-08）里刷出 21 次「MSFS 没有数据（是否已
+    进入飞行？）」，每次 0～2 秒就恢复，而那段时间飞机一直挂在 FSD 上——读的是
+    二十几个 SimVar，其中一次超时就足够把状态翻掉。
+    """
+
+    def setUp(self):
+        self.link = simlink.SimLink()
+        self.states = []
+        self.link.on_state = lambda c, m: self.states.append(c)
+        # 装成"刚刚读到过位置"的样子
+        self.link._connected = True
+        self.link.last_update = time.time()
+
+    def test_a_single_missed_round_does_not_report_a_disconnect(self):
+        self.link._report_no_data()
+        self.assertEqual(self.states, [])
+        self.assertTrue(self.link._connected)
+
+    def test_a_gap_longer_than_stale_after_does_report(self):
+        self.link.last_update = time.time() - simlink.STALE_AFTER - 0.1
+        self.link._report_no_data()
+        self.assertEqual(self.states, [False])
+
+    def test_reading_a_position_again_clears_the_grace(self):
+        # 连着几轮没读到，但每次都在宽限内；中间真读到一次就重新计时
+        for _ in range(5):
+            self.link._report_no_data()
+        self.link._requests = type("R", (), {"get": lambda s, v: 1.0})()
+        self.assertIs(self.link._poll(), simlink.OK)
+        self.link._report_no_data()
+        self.assertEqual(self.states, [])
+
+    def test_never_having_had_a_position_reports_immediately(self):
+        # 在主菜单里从没读到过位置，不该让人对着假的"已连接"等三秒
+        self.link.last_update = 0.0
+        self.link._report_no_data()
+        self.assertEqual(self.states, [False])
+
+    def test_the_grace_matches_the_connected_property(self):
+        # 两处判据必须是同一条，否则 connected 说断了而状态还是绿的
+        import inspect
+        self.assertIn("STALE_AFTER",
+                      inspect.getsource(simlink.SimLink._report_no_data))
+
+    def test_position_packets_keep_flowing_during_the_grace(self):
+        # 宽限期里 snapshot() 照常给出上一轮的值，网上看不出空档
+        self.link.values = {"latitude": 31.1, "longitude": 121.8}
+        self.link._report_no_data()
+        self.assertEqual(self.link.snapshot()["latitude"], 31.1)
+
+
 class AircraftCfgTest(unittest.TestCase):
     """aircraft.cfg 是人手写的，格式相当随意。"""
 
@@ -365,6 +420,66 @@ class RealWorldLayoutTest(unittest.TestCase):
             f.write('SomeOther "x"\n')
             f.write(f'InstalledPackagesPath "{packages}"\n')
         self.assertEqual(aimatch._packages_from_usercfg(cfg), packages)
+
+    def test_a_junctioned_package_folder_is_still_scanned(self):
+        # os.walk 默认不进符号链接，而 Windows 的目录联接在 Python 3.8 之后就是
+        # 符号链接——商店版常把 Official 做成 junction，"搬到别的盘再留个
+        # junction"也是社区里最普遍的做法。跳过它 = 整个官方机库都扫不到，
+        # 只剩 Community 里几个附加件，正是实飞日志里那个 4 涂装 / 0 机型。
+        real = os.path.join(self.directory, "elsewhere", "SimObjects",
+                            "Airplanes", "A320")
+        os.makedirs(real)
+        with open(os.path.join(real, "aircraft.cfg"), "w") as f:
+            f.write('[GENERAL]\nicao_type_designator = "A20N"\n\n'
+                    '[FLTSIM.0]\ntitle = "Airbus A320neo"\n')
+
+        packages = os.path.join(self.directory, "Packages")
+        os.makedirs(packages)
+        link = os.path.join(packages, "Official")
+        try:
+            os.symlink(os.path.join(self.directory, "elsewhere"), link,
+                       target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这个环境不让建符号链接")
+
+        found = aimatch.find_aircraft_cfgs(packages)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(aimatch.ModelSet.load(packages).types, {"A20N"})
+
+    def test_a_symlink_loop_does_not_hang_the_scan(self):
+        # 跟着链接走就得自己防环，否则扫盘永远回不来，界面上是"一直在加载"
+        tree = os.path.join(self.directory, "pkg")
+        os.makedirs(tree)
+        try:
+            os.symlink(self.directory, os.path.join(tree, "back"),
+                       target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这个环境不让建符号链接")
+        self.assertEqual(aimatch.find_aircraft_cfgs(self.directory), [])
+
+    def test_usercfg_separated_by_a_tab(self):
+        # 只按单个空格切的话，制表符分隔的写法什么都切不出来，整个安装被漏掉
+        packages = os.path.join(self.directory, "MSFS2024")
+        os.makedirs(packages)
+        cfg = os.path.join(self.directory, "UserCfg.opt")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(f'InstalledPackagesPath\t"{packages}"\n')
+        self.assertEqual(aimatch._packages_from_usercfg(cfg), packages)
+
+    def test_usercfg_path_containing_spaces(self):
+        packages = os.path.join(self.directory, "Flight Sim Packages")
+        os.makedirs(packages)
+        cfg = os.path.join(self.directory, "UserCfg.opt")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write(f'InstalledPackagesPath "{packages}"\n')
+        self.assertEqual(aimatch._packages_from_usercfg(cfg), packages)
+
+    def test_store_2024_package_family_is_looked_at(self):
+        # 商店版 2024 的包名是 Limitless 不是 FlightSimulator
+        import inspect
+        source = inspect.getsource(aimatch.default_roots)
+        self.assertIn("Microsoft.Limitless_8wekyb3d8bbwe", source)
+        self.assertIn("Microsoft.FlightSimulator_8wekyb3d8bbwe", source)
 
     def test_usercfg_pointing_nowhere_is_ignored(self):
         cfg = os.path.join(self.directory, "UserCfg.opt")

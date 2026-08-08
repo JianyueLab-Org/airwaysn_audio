@@ -167,11 +167,28 @@ def find_aircraft_cfgs(root):
 
     MSFS 的布局是 <包>/SimObjects/Airplanes/<飞机>/aircraft.cfg。不写死这个路径
     ——用户装的第三方包目录层级五花八门，直接走一遍更省事。
+
+    **必须 followlinks=True。** Windows 的目录联接（junction）在 Python 3.8 以后
+    被 `os.path.islink()` 认成符号链接，而 `os.walk` 默认不进符号链接——于是整个
+    `Official` 会被安静地跳过。这不是边角情况：商店版就常把 `Official` 做成
+    junction，而"把包目录搬到另一块盘、原地留个 junction"是社区里最普遍的做法
+    之一。实飞日志里那次只扫到 4 个涂装、0 种机型，形态正是"只剩 Community 里
+    几个零星附加件"。
+
+    代价是要自己防环：跟着链接走可能绕回上层目录。按 realpath 记账，进过的
+    目录不再进。
     """
     found = []
     if not os.path.isdir(root):
         return found
-    for directory, subdirs, files in os.walk(root):
+    seen = set()
+    for directory, subdirs, files in os.walk(root, followlinks=True):
+        real = os.path.realpath(directory)
+        if real in seen:
+            # 绕回来了，这一枝不用再往下走
+            subdirs[:] = []
+            continue
+        seen.add(real)
         for name in files:
             if name.lower() == "aircraft.cfg":
                 found.append(os.path.join(directory, name))
@@ -241,14 +258,25 @@ class ModelSet:
 
     @classmethod
     def load(cls, *roots):
-        """扫若干个目录（Community、Official 等），把飞机都读进来。"""
+        """扫若干个目录（Community、Official 等），把飞机都读进来。
+
+        每个目录单独记一行。扫出来的数目不对时，光有一个总数是查不动的——
+        「目录根本没找对」和「目录对、但里面的 aircraft.cfg 都没有机型码」写进
+        日志长得一模一样，而两者要做的事完全相反。带上机型数尤其重要：涂装有
+        几百个而机型是 0，说明读到的全是附加件那类没有机型码的配置。
+        """
         models = []
         for root in roots:
             if not root:
                 continue
-            for path in find_aircraft_cfgs(root):
-                models.extend(parse_aircraft_cfg(path))
-        log.info("loaded %d liveries", len(models))
+            paths = find_aircraft_cfgs(root)
+            found = []
+            for path in paths:
+                found.extend(parse_aircraft_cfg(path))
+            models.extend(found)
+            log.info("scanned %s: %d aircraft.cfg, %d liveries, %d types",
+                     root, len(paths), len(found),
+                     len({m.icao for m in found if m.icao}))
         return cls(models)
 
     def by_title(self, title):
@@ -351,16 +379,25 @@ def _packages_from_usercfg(path):
     ——只猜路径会安静地漏掉整个安装。
 
     格式是一行 `InstalledPackagesPath "D:\\MSFS2022"`。
+
+    键和值之间按空白切，不能只按单个空格切：见过用制表符分隔的写法，那样
+    `partition(" ")` 什么都切不出来，整个安装就被安静地漏掉了。路径本身带空格
+    没问题——只切第一段。
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 if not line.strip().lower().startswith("installedpackagespath"):
                     continue
-                _, _, value = line.partition(" ")
-                value = value.strip().strip('"').strip()
+                parts = line.strip().split(None, 1)
+                if len(parts) < 2:
+                    continue
+                value = parts[1].strip().strip('"').strip()
                 if value and os.path.isdir(value):
                     return value
+                if value:
+                    log.warning("UserCfg.opt points at %s, which does not exist",
+                                value)
     except OSError:
         pass
     return None
@@ -385,11 +422,13 @@ def default_roots():
         if os.path.isdir(fallback) and fallback not in roots:
             roots.append(fallback)
 
-    # Microsoft Store 版把 UserCfg.opt 放在 LocalCache 下
-    store = os.path.join(local, "Packages",
-                         "Microsoft.FlightSimulator_8wekyb3d8bbwe", "LocalCache")
-    configured = _packages_from_usercfg(os.path.join(store, "UserCfg.opt"))
-    if configured and configured not in roots:
-        roots.append(configured)
+    # Microsoft Store 版把 UserCfg.opt 放在 LocalCache 下。2024 版在商店里的
+    # 包名不是 FlightSimulator 而是 Limitless，只认前者会整个漏掉商店版 2024。
+    for family in ("Microsoft.FlightSimulator_8wekyb3d8bbwe",
+                   "Microsoft.Limitless_8wekyb3d8bbwe"):
+        store = os.path.join(local, "Packages", family, "LocalCache")
+        configured = _packages_from_usercfg(os.path.join(store, "UserCfg.opt"))
+        if configured and configured not in roots:
+            roots.append(configured)
 
     return roots

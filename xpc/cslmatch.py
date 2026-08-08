@@ -159,11 +159,27 @@ def parse_package(directory):
 
 
 def find_packages(root):
-    """在一个目录树里找所有 CSL 包（含 xsb_aircraft.txt 的目录）。"""
+    """在一个目录树里找所有 CSL 包（含 xsb_aircraft.txt 的目录）。
+
+    **必须 followlinks=True**，和 msfs/aimatch.py 的 find_aircraft_cfgs 同一个
+    理由：`os.walk` 默认不进符号链接，而 Windows 的目录联接（junction）从
+    Python 3.8 起就被 `os.path.islink()` 认成符号链接。CSL 包动辄几个 GB，
+    "放在另一块盘、在 Resources/plugins 下留个链接"是 X-Plane 这边最常见的
+    安置方式——跳过它，整套 CSL 就一个包都扫不到，而现象只是他机不显示。
+
+    代价是要自己防环：跟着链接走可能绕回上层目录。按 realpath 记账，进过的
+    目录不再进。
+    """
     packages = []
     if not os.path.isdir(root):
         return packages
-    for directory, subdirs, files in os.walk(root):
+    seen = set()
+    for directory, subdirs, files in os.walk(root, followlinks=True):
+        real = os.path.realpath(directory)
+        if real in seen:
+            subdirs[:] = []          # 绕回来了，这一枝不用再往下走
+            continue
+        seen.add(real)
         if "xsb_aircraft.txt" in files:
             packages.append(directory)
             subdirs[:] = []          # 包里面不会再套包，别往下走

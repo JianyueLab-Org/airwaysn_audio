@@ -2355,6 +2355,39 @@ class CslParsingTest(unittest.TestCase):
             f.write("OBJ8_AIRCRAFT X\n")
         self.assertEqual(cslmatch.find_packages(root), [inner])
 
+    def test_a_linked_csl_folder_is_still_scanned(self):
+        # os.walk 默认不进符号链接，而 Windows 的目录联接从 Python 3.8 起就算
+        # 符号链接。CSL 包动辄几个 GB，"放在另一块盘、原地留个链接"是这边最
+        # 常见的安置方式——跳过它就一个包都扫不到，现象只是他机不显示。
+        # msfs/aimatch.py 的 find_aircraft_cfgs 是同一个坑，同一个修法。
+        elsewhere = os.path.join(self.directory, "elsewhere", "BB_Airbus")
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, "xsb_aircraft.txt"), "w") as f:
+            f.write("OBJ8_AIRCRAFT X\n")
+
+        plugins = os.path.join(self.directory, "plugins")
+        os.makedirs(plugins)
+        try:
+            os.symlink(os.path.join(self.directory, "elsewhere"),
+                       os.path.join(plugins, "CSL"), target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这个环境不让建符号链接")
+
+        found = cslmatch.find_packages(plugins)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].endswith("BB_Airbus"))
+
+    def test_a_symlink_loop_does_not_hang_the_scan(self):
+        # 跟着链接走就得自己防环，否则扫盘永远回不来
+        tree = os.path.join(self.directory, "csl")
+        os.makedirs(tree)
+        try:
+            os.symlink(self.directory, os.path.join(tree, "back"),
+                       target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这个环境不让建符号链接")
+        self.assertEqual(cslmatch.find_packages(self.directory), [])
+
 
 class ModelMatchingTest(unittest.TestCase):
     """匹配的退化链。最重要的一条：永远要有结果。"""

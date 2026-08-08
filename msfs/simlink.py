@@ -221,12 +221,36 @@ class SimLink:
             if result is NO_DATA:
                 # 连接好好的，只是还没进飞行（在菜单里就是这样）。以前这里
                 # 也走重开，日志里每隔几秒一条 "SIM OPEN"，白白反复建连接。
-                self._state(False, t("sim.no_data"))
+                self._report_no_data()
                 self._sleep(POLL_INTERVAL)
                 continue
 
             self._state(True, t("sim.link_up"))
             self._sleep(POLL_INTERVAL)
+
+    def _report_no_data(self):
+        """一轮没读到位置，不等于连接断了。
+
+        `_poll()` 每 0.2 秒串行读二十几个 SimVar，模拟器一次帧卡顿、天气流送、
+        自动存档，都够让经纬度那一次读超时。以前这里一轮读不到就翻状态，实飞
+        日志里因此刷出 21 次「MSFS 没有数据（是否已进入飞行？）」——飞机在天上、
+        也在网上（那段时间 FSD 一直在线），每次 0～2 秒就恢复，纯粹是虚惊，而
+        文案还把人往「是不是没进飞行」上引。
+
+        判据改成和 `connected` 属性同一条（`STALE_AFTER`）。这两处本来就该一致：
+        位置包那边也是这么发的——`snapshot()` 返回 `self.values` 里上一轮的值，
+        不看 `last_update`，所以短暂的空档对网上没有任何影响，没有理由让界面
+        先慌。
+
+        宽限只挡「已连上 → 断开」这一个方向：`last_update` 初值是 0，在主菜单里
+        从没读到过位置时立刻就报，不会让人对着一个假的「已连接」等三秒。
+        """
+        idle = time.time() - self.last_update
+        if idle < STALE_AFTER:
+            log.debug("no position this round, %.1f s into the %.0f s grace",
+                      idle, STALE_AFTER)
+            return
+        self._state(False, t("sim.no_data"))
 
     def _sleep(self, seconds):
         """可被 stop() 打断的等待。"""
