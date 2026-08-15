@@ -256,6 +256,18 @@ TEXT = {
     "settings.mic_volume":  {"zh": "麦克风音量", "en": "Microphone volume"},
     "settings.speaker_volume": {"zh": "扬声器音量", "en": "Speaker volume"},
     "settings.system_default": {"zh": "系统默认", "en": "System default"},
+    "settings.message_sound": {"zh": "收到管制消息时播放提示音",
+                               "en": "Play a sound for incoming ATC messages"},
+    "settings.message_sound_tip": {
+        "zh": "私聊给你的消息一定会响；频率上的消息默认只有点到你呼号的才响。"
+              "提示音走上面选的那块扬声器，不是系统默认设备。",
+        "en": "A message addressed to you always chimes; a message on the "
+              "frequency chimes only when it names your callsign. The chime "
+              "plays on the speaker selected above, not the system default."},
+    "settings.message_sound_all": {"zh": "频率上的每条消息都提示",
+                                   "en": "Chime for every message on the frequency"},
+    "settings.message_sound_volume": {"zh": "提示音音量", "en": "Alert volume"},
+    "settings.message_sound_test": {"zh": "试听", "en": "Test"},
     "settings.language":    {"zh": "语言", "en": "Language"},
     "settings.language_note": {"zh": "切换语言后重开窗口生效",
                                "en": "Reopen the window for a language change to apply"},

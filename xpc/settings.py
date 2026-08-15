@@ -46,6 +46,12 @@ DEFAULTS = {
     "output_device_index": None,
     "mic_volume": 100,
     "speaker_volume": 100,
+    # 收到管制消息时响一声。默认开：飞行员盯着的是窗外，消息区多一行没人看得见。
+    # message_sound_all 打开的话频率上每条消息都响；默认只有私聊、以及正文里
+    # 点到自己呼号的那种才响（见 chime.wants_alert）。
+    "message_sound": True,
+    "message_sound_all": False,
+    "message_sound_volume": 100,
     "connect_fsd": True,
     "connect_voice": True,
     "flight_plan": {},
@@ -106,6 +112,7 @@ class Settings:
         # 开着而用户不知道）；0 是滑条上真实可取的值，只有 None/坏值才回默认
         self.mic_volume = _clamp_volume(self.mic_volume)
         self.speaker_volume = _clamp_volume(self.speaker_volume)
+        self.message_sound_volume = _clamp_volume(self.message_sound_volume)
         # 绑定表从 JSON 变成 ptt.Binding。老配置里没有 ptt_bindings，就拿
         # ptt_key + joystick_ptt 升上来——升不上来的话，用户原来设的 PTT 会在
         # 升级之后悄悄失效，而界面上一切正常，只是没人听得见。

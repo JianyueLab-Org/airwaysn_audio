@@ -89,6 +89,8 @@ python -m unittest test_xpc -v           # PBH, position packets, RREF, traffic,
 python -m unittest test_i18n             # 两种语言都齐；ptt.py 里不能有界面文字
 python -m unittest test_ptt
 python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
+python -m unittest test_xpc.WantsAlertTest      # 消息提示音：哪条该响
+python -m unittest test_xpc.ChimePlayTest       # 设备回退、连响抑制、开不出来也不炸
 python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
 python -m unittest test_xpc.PluginInstallTest   # 插件安装：目录识别、新旧判定、协议号
 python smoke_gui.py
@@ -375,6 +377,7 @@ The X-Plane pilot client, laid out like xPilot: three independent links, none of
 | `traffic.py` | `src/aircrafts/` | Other aircraft: sample history, interpolation, model-match state |
 | `cslmatch.py` | `src/aircrafts/` (model matching) | CSL package parsing and the type→model fallback chain |
 | `bridge.py` | — | UDP transport to the X-Plane plugin |
+| `chime.py` | `src/audio/AFV` notification | The message chime: synthesised tones, played on the client's own output device |
 | `plugin/PI_XpcTraffic.py` | `xpilot` XPL plugin | Runs *inside* X-Plane (XPPython3): draws traffic, feeds TCAS |
 | `gui.py` | `Resources/Views/` | Connect bar, messages, nearby-ATC list, radio bar |
 
@@ -392,6 +395,15 @@ Other things worth knowing:
 - **`#AP` carries the password**, so `_redact()` masks it before anything reaches the log — users paste logs into chat.
 - Position reports drop to one every 5 s when parked on the ground, and the transponder mode character (`S`/`N`/`Y`) is driven by X-Plane's `transponder_mode` dataref, with `Y` held for 8 s after IDENT.
 - FSD and voice failures are isolated in `gui.py`: `on_fsd_status('error')` clears only `self.fsd`, so losing the network connection does not drop the frequency you are listening to.
+
+**An incoming ATC message rings, and the chime synthesises itself.** `chime.py` (a byte-identical copy in `msfs/`, pinned by `SharedCopyTest`) plays two short tones from `on_text_message`, because a pilot is looking out of the window and one more line in the message pane is invisible. Four decisions, each of which the obvious version gets wrong:
+
+- **It plays on the output device the client is configured with** (`settings.output_device_index`), not the system default. A pilot's headset and their system default output are routinely different devices, and a chime that comes out of the desk speakers is a chime nobody hears. That is also why it is not `QSoundEffect` — the mechanism `can-atc/src/can_atc/audio.py` uses — which follows the system default and would pull Qt's multimedia plugins into both specs.
+- **The waveform is generated at runtime, so there is no wav asset to bundle and no spec to change.** `opus.dll` and `SimConnect.dll` are both "the file did not travel with the build, the app still starts, the feature is silently dead"; a notification sound is not worth a third one. `pyaudio` is imported lazily (`_pyaudio()`), so the module imports on a machine with no PortAudio and the tests hand it a fake.
+- **Not every message rings, and the rule is a pure function.** `wants_alert()` holds all of it so it can be tested without Qt: a private message (the recipient is your own callsign) always rings; a frequency message (`@xxxxx`) only when the body names your callsign — with a boundary check, so `CCA150` is *not* rung by an instruction addressed to `CCA1501`; a broadcast rings; your own message never does. `message_sound_all` turns the frequency half into every message for people who want that. A busy frequency that rings on every line is a feature people switch off on the first day.
+- **Failure is one INFO line and nothing else.** The FSD receive thread calls `play()` directly, so an exception escaping it would be a disconnect. A burst of messages collapses to one chime (nothing overlaps, and `MIN_INTERVAL` is 1 s), a device that will not open at the chosen rate falls back through 44.1/22.05 kHz and then to the default device, and volume 0 opens nothing at all.
+
+Settings are `message_sound` / `message_sound_all` / `message_sound_volume`, on the audio tab next to the two existing volume sliders, with a 试听 button that plays through **the device currently selected in the dialog** rather than the saved one — the person clicking it has just changed headsets.
 
 ### Rendering other aircraft
 
@@ -438,7 +450,7 @@ The bridge is UDP with one JSON object per datagram, fragmented over `seq`/`part
 
 ## MSFS for CAN (`msfs/`)
 
-The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.py`, `mumblecompat.py`, `ptt.py` and `theme.py` are **byte-identical copies** of the `xpc/` versions (`SharedCopyTest` fails if they drift); `fsdpilot.py`, `applog.py` and `i18n.py` are deliberate forks — different simulator id, different log file name, and the handful of strings that name the simulator — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
+The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.py`, `mumblecompat.py`, `ptt.py`, `theme.py`, `update.py` and `chime.py` are **byte-identical copies** of the `xpc/` versions (`SharedCopyTest` fails if they drift); `fsdpilot.py`, `applog.py` and `i18n.py` are deliberate forks — different simulator id, different log file name, and the handful of strings that name the simulator — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
 
 | Module | Replaces | Role |
 |---|---|---|

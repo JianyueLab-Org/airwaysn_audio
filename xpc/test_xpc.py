@@ -6,6 +6,7 @@
 必须能被 can-fsd 原样解回来，RREF 回包必须按 X-Plane 的格式解析。
 """
 
+import array
 import inspect
 import json
 import os
@@ -2857,6 +2858,259 @@ class PluginInstallTest(unittest.TestCase):
                                return_value=[os.path.join(self.tmp, "没有")]):
             self.assertEqual(xpinstall.find_installs(), [])
             self.assertEqual(xpinstall.inspect().state, xpinstall.NO_ROOT)
+
+
+class ChimeStream:
+    def __init__(self, device, rate, refuse=()):
+        self.device = device
+        self.rate = rate
+        self.written = b""
+        self.closed = False
+        if (device, rate) in refuse:
+            raise OSError("Invalid sample rate")
+
+    def write(self, data):
+        self.written += data
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class ChimePyAudio:
+    """够 chime.py 用的一小块 PortAudio。
+
+    `refuse` 里的 (设备, 采样率) 组合开不出来，用来演蓝牙耳机只吃 44.1 kHz
+    和"客户端起来之后耳机被拔了"这两种。
+    """
+
+    paInt16 = 8
+
+    def __init__(self, refuse=()):
+        self.refuse = set(refuse)
+        self.opened = []
+        self.terminated = 0
+        module = self
+
+        class _PyAudio:
+            def open(self_inner, format=None, channels=None, rate=None,
+                     output=None, output_device_index=None, **kwargs):
+                stream = ChimeStream(output_device_index, rate, module.refuse)
+                module.opened.append(stream)
+                return stream
+
+            def terminate(self_inner):
+                module.terminated += 1
+
+        self.PyAudio = _PyAudio
+
+
+class ChimeSettings:
+    def __init__(self, **kwargs):
+        self.output_device_index = None
+        self.message_sound = True
+        self.message_sound_all = False
+        self.message_sound_volume = 100
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class ChimeWaveformTest(unittest.TestCase):
+    """合成出来的那两声。"""
+
+    def setUp(self):
+        import chime
+        self.chime = chime
+        chime._CACHE.clear()
+
+    def test_it_is_16_bit_mono_and_about_the_right_length(self):
+        data = self.chime.waveform(48000)
+        expected = sum(int(48000 * seconds) for _, seconds in self.chime.TONES)
+        expected += 2 * int(48000 * self.chime.GAP)
+        self.assertEqual(len(data), expected * 2)      # 每个样点 2 字节
+
+    def test_both_ends_are_silent(self):
+        """两头不淡进淡出的话，每次提示音都会带一声"啪"。"""
+        import array
+        samples = array.array("h")
+        samples.frombytes(self.chime.waveform(48000))
+        self.assertEqual(samples[0], 0)
+        self.assertEqual(samples[-1], 0)
+        self.assertGreater(max(abs(s) for s in samples), 1000)
+
+    def test_it_never_clips(self):
+        samples = array.array("h")
+        samples.frombytes(self.chime.waveform(48000, volume=200))
+        self.assertLess(max(abs(s) for s in samples), 32768)
+
+    def test_volume_scales_it(self):
+        loud = array.array("h")
+        loud.frombytes(self.chime.waveform(48000, 100))
+        quiet = array.array("h")
+        quiet.frombytes(self.chime.waveform(48000, 25))
+        self.assertLess(max(abs(s) for s in quiet), max(abs(s) for s in loud))
+
+    def test_a_bad_volume_falls_back_instead_of_raising(self):
+        """配置文件是手写得动的，坏值不能让提示音变成一次崩溃。"""
+        self.assertEqual(self.chime.waveform(48000, None),
+                         self.chime.waveform(48000, 100))
+
+    def test_the_sample_rate_is_followed(self):
+        """退到 44.1 kHz 的时候波形也要跟着变，否则音调是歪的。"""
+        self.assertNotEqual(len(self.chime.waveform(44100)),
+                            len(self.chime.waveform(48000)))
+
+
+class WantsAlertTest(unittest.TestCase):
+    """哪条消息该响。响错比不响更招人烦，所以每一条都钉住。"""
+
+    def setUp(self):
+        import chime
+        self.wants = chime.wants_alert
+
+    def test_a_private_message_always_chimes(self):
+        self.assertTrue(self.wants("CCA1501", "ZSPD_TWR", "CCA1501",
+                                   "contact ground 121.8"))
+
+    def test_a_frequency_message_naming_me_chimes(self):
+        self.assertTrue(self.wants("CCA1501", "ZSPD_APP", "@28500",
+                                   "CCA1501 descend to 3000 m"))
+
+    def test_a_frequency_message_for_somebody_else_stays_quiet(self):
+        self.assertFalse(self.wants("CCA1501", "ZSPD_APP", "@28500",
+                                    "CES2345 turn left heading 090"))
+
+    def test_a_longer_callsign_does_not_count_as_a_mention(self):
+        """呼号 CCA150 不该被发给 CCA1501 的指令点到——那是另一架飞机。"""
+        self.assertFalse(self.wants("CCA150", "ZSPD_APP", "@28500",
+                                    "CCA1501, descend"))
+
+    def test_the_mention_is_case_insensitive(self):
+        self.assertTrue(self.wants("CCA1501", "ZSPD_APP", "@28500",
+                                   "cca1501 cleared to land"))
+
+    def test_punctuation_around_the_callsign_still_counts(self):
+        self.assertTrue(self.wants("CCA1501", "ZSPD_APP", "@28500",
+                                   "(CCA1501), radar contact"))
+
+    def test_every_message_option_chimes_for_the_whole_frequency(self):
+        self.assertTrue(self.wants("CCA1501", "CES2345", "@28500",
+                                   "request pushback", every_message=True))
+
+    def test_a_broadcast_chimes(self):
+        self.assertTrue(self.wants("CCA1501", "SERVER", "*",
+                                   "the network is going down in 10 minutes"))
+
+    def test_my_own_message_never_chimes(self):
+        self.assertFalse(self.wants("CCA1501", "CCA1501", "@28500", "roger"))
+
+    def test_no_callsign_yet_does_not_crash(self):
+        """还没连上就收到东西时，判断也得给出个答案而不是抛。"""
+        self.assertFalse(self.wants("", "ZSPD_APP", "@28500", "CCA1501 descend"))
+        self.assertTrue(self.wants(None, "ZSPD_TWR", "CCA1501", "hello"))
+
+
+class ChimePlayTest(unittest.TestCase):
+    """真的去开设备的那半边，全程用假 PortAudio。"""
+
+    def setUp(self):
+        import chime
+        self.chime = chime
+        self.fake = ChimePyAudio()
+        self._saved = chime._pyaudio
+        chime._pyaudio = lambda: self.fake
+        self.addCleanup(setattr, chime, "_pyaudio", self._saved)
+
+    def play(self, player, **kwargs):
+        started = player.play(**kwargs)
+        player.wait(2.0)
+        return started
+
+    def test_it_writes_the_waveform_to_the_chosen_device(self):
+        player = self.chime.Chime(ChimeSettings(output_device_index=3))
+        self.assertTrue(self.play(player))
+        self.assertEqual(len(self.fake.opened), 1)
+        stream = self.fake.opened[0]
+        self.assertEqual(stream.device, 3)
+        self.assertEqual(stream.written, self.chime.waveform(stream.rate, 100))
+        self.assertTrue(stream.closed)
+        self.assertEqual(self.fake.terminated, 1)
+
+    def test_the_switch_turns_it_off(self):
+        player = self.chime.Chime(ChimeSettings(message_sound=False))
+        self.assertFalse(self.play(player))
+        self.assertEqual(self.fake.opened, [])
+
+    def test_zero_volume_opens_nothing(self):
+        """音量拉到 0 就别去碰声卡了——开一次设备是有代价的。"""
+        player = self.chime.Chime(ChimeSettings(message_sound_volume=0))
+        self.assertFalse(self.play(player))
+        self.assertEqual(self.fake.opened, [])
+
+    def test_a_burst_of_messages_only_chimes_once(self):
+        """五条消息一起到，用户要的是"有消息"，不是连响五声。"""
+        player = self.chime.Chime(ChimeSettings())
+        for _ in range(5):
+            player.play()
+        player.wait(2.0)
+        self.assertEqual(len(self.fake.opened), 1)
+
+    def test_it_chimes_again_once_the_interval_has_passed(self):
+        player = self.chime.Chime(ChimeSettings(), min_interval=0.0)
+        for _ in range(3):
+            self.play(player)
+        self.assertEqual(len(self.fake.opened), 3)
+
+    def test_the_preview_ignores_both_the_switch_and_the_interval(self):
+        """设置里点"试听"是用户自己按的：连点两下第二下没反应就像按钮坏了。"""
+        player = self.chime.Chime(ChimeSettings(message_sound=False))
+        self.assertTrue(self.play(player, force=True))
+        self.assertTrue(self.play(player, force=True))
+        self.assertEqual(len(self.fake.opened), 2)
+
+    def test_an_unsupported_rate_falls_back(self):
+        """蓝牙耳机常常只吃 44.1 kHz。"""
+        self.fake.refuse = {(7, 48000)}
+        player = self.chime.Chime(ChimeSettings(output_device_index=7))
+        self.assertTrue(self.play(player))
+        self.assertEqual(self.fake.opened[-1].rate, 44100)
+
+    def test_a_dead_device_falls_back_to_the_default_one(self):
+        """耳机在客户端起来之后被拔了：响在别处也好过一声不响。"""
+        self.fake.refuse = {(7, rate) for rate in self.chime.FALLBACK_RATES}
+        player = self.chime.Chime(ChimeSettings(output_device_index=7))
+        self.assertTrue(self.play(player))
+        self.assertIsNone(self.fake.opened[-1].device)
+
+    def test_no_output_device_at_all_is_survivable(self):
+        """一台机器上根本没有输出设备时，收消息本身不能跟着炸。"""
+        self.fake.refuse = {(None, rate) for rate in self.chime.FALLBACK_RATES}
+        player = self.chime.Chime(ChimeSettings())
+        self.play(player)
+        self.assertEqual(self.fake.opened, [])
+        # 开不出来也必须把 PyAudio 收掉，否则每条消息漏一个 PortAudio 实例
+        self.assertEqual(self.fake.terminated, 1)
+
+    def test_a_broken_pyaudio_never_reaches_the_caller(self):
+        """FSD 的收包线程会直接调到 play()，这里抛出去就是掉线。"""
+        def explode():
+            raise RuntimeError("no PortAudio here")
+        self.chime._pyaudio = explode
+        player = self.chime.Chime(ChimeSettings())
+        self.assertTrue(self.play(player))      # 派出去了，只是没响成
+
+    def test_it_recovers_after_a_failure(self):
+        """一次失败不能把提示音永久卡在"正在放"上。"""
+        def explode():
+            raise RuntimeError("nope")
+        self.chime._pyaudio = explode
+        player = self.chime.Chime(ChimeSettings(), min_interval=0.0)
+        self.play(player)
+        self.chime._pyaudio = lambda: self.fake
+        self.play(player)
+        self.assertEqual(len(self.fake.opened), 1)
 
 
 if __name__ == "__main__":

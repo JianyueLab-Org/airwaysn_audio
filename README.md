@@ -30,7 +30,7 @@ COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同�
 每个组件都是**从自己的目录独立运行**的——图标路径和配置文件都按当前目录解析。
 组件之间靠**复制**共享代码，不是 import（`mumblecompat.py`、`applog.py`、
 `voice.py` 等都有多份副本）。改公共逻辑要逐个核对副本，`xpc` 和 `msfs` 的
-`voice.py`、`traffic.py` 必须逐字节一致，有测试盯着。
+`voice.py`、`traffic.py`、`chime.py` 必须逐字节一致，有测试盯着。
 
 ---
 
