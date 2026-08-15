@@ -50,6 +50,7 @@ import aimatch
 import chime
 import fsdpilot
 import i18n
+import observer
 import ptt
 import theme
 import traffic as traffic_module
@@ -165,6 +166,8 @@ class MsfsWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        # 配置里记着上次是观察员的话，界面一起来就该是那副样子
+        self._apply_observer_ui()
 
         self.sim.start()
         self.timer = QTimer(self)
@@ -202,9 +205,10 @@ class MsfsWindow(QMainWindow):
         menu = self.menuBar()
 
         file_menu = menu.addMenu(t("menu.file"))
-        plan_action = QAction(t("menu.flight_plan"), self)
-        plan_action.triggered.connect(self.open_flight_plan)
-        file_menu.addAction(plan_action)
+        # 存下来：观察员模式里飞行计划没有通道可走，要能禁掉
+        self.plan_action = QAction(t("menu.flight_plan"), self)
+        self.plan_action.triggered.connect(self.open_flight_plan)
+        file_menu.addAction(self.plan_action)
         settings_action = QAction(t("menu.settings"), self)
         settings_action.triggered.connect(self.open_settings)
         file_menu.addAction(settings_action)
@@ -261,6 +265,23 @@ class MsfsWindow(QMainWindow):
         for i, label in enumerate((self.sim_label, self.fsd_label, self.voice_label)):
             label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
             grid.addWidget(label, 1, i * 3, 1, 3)
+
+        # 观察员开关放在连接栏里，不放设置里：它决定这一次连接会不会在网络上
+        # 多出一架飞机，是每次点"连接"之前都该看一眼的东西。
+        # **信号要在 setChecked 之后再接**——反过来的话，配置里存着"开"的人
+        # 一启动就会在这里触发一次 _apply_observer_ui()，而那时候消息区和
+        # 无线电栏的控件都还没建出来。
+        self.observer_check = CheckBox(t("connect.observer"))
+        self.observer_check.setChecked(
+            bool(getattr(self.settings, "observer_mode", False)))
+        self.observer_check.setToolTip(t("connect.observer_tip"))
+        self.observer_check.toggled.connect(self.on_observer_toggled)
+        grid.addWidget(self.observer_check, 2, 0, 1, 3)
+
+        observer_hint = CaptionLabel(t("connect.observer_hint"))
+        observer_hint.setStyleSheet(f"color: {theme.IDLE_COLOR};")
+        observer_hint.setWordWrap(True)
+        grid.addWidget(observer_hint, 2, 3, 1, 6)
         return card.body(grid)
 
     def _build_messages(self):
@@ -279,11 +300,11 @@ class MsfsWindow(QMainWindow):
         self.message_input = LineEdit()
         self.message_input.setPlaceholderText(t("messages.body_hint"))
         self.message_input.returnPressed.connect(self.send_message)
-        send = PushButton(FluentIcon.SEND, t("messages.send"))
-        send.clicked.connect(self.send_message)
+        self.send_button = PushButton(FluentIcon.SEND, t("messages.send"))
+        self.send_button.clicked.connect(self.send_message)
         row.addWidget(self.recipient_input)
         row.addWidget(self.message_input)
-        row.addWidget(send)
+        row.addWidget(self.send_button)
         layout.addLayout(row)
         return card.body(layout)
 
@@ -312,6 +333,21 @@ class MsfsWindow(QMainWindow):
         self.com1_label = BodyLabel(t("radio.com1_none"))
         self.com1_label.setFont(QFont(theme.MONO_FONT, 15, QFont.Weight.Bold))
         layout.addWidget(self.com1_label)
+
+        # 手输频率**只在观察员模式下出现**。正常连着 FSD 的飞行员要是能把语音
+        # 频率和座舱里的 COM1 分开设，迟早会出现"管制以为你在 121.8、你人在别
+        # 的频道"这种事，那比听不见更糟。
+        self.frequency_input = LineEdit()
+        self.frequency_input.setPlaceholderText(t("radio.manual_hint"))
+        self.frequency_input.setToolTip(t("radio.manual_tip"))
+        self.frequency_input.setMaximumWidth(190)
+        self.frequency_input.setText(
+            getattr(self.settings, "observer_frequency", "") or "")
+        # 只接 editingFinished：回车和失焦都会到这里，再接一个 returnPressed
+        # 就变成回车时跑两遍，消息区里每次都多一行。
+        self.frequency_input.editingFinished.connect(self.apply_manual_frequency)
+        self.frequency_input.setVisible(False)
+        layout.addWidget(self.frequency_input)
 
         self.channel_label = CaptionLabel("")
         self.channel_label.setStyleSheet(f"color: {theme.IDLE_COLOR};")
@@ -374,14 +410,18 @@ class MsfsWindow(QMainWindow):
         cid = self.cid_input.text().strip()
         password = self.password_input.text()
 
-        problem = fsdpilot.callsign_problem(callsign)
-        if problem:
-            QMessageBox.warning(self, t("dialog.callsign_bad"), problem)
-            return
+        # 观察员不上 FSD，呼号是给 FSD 用的，这里没有理由拦他
+        watching = self.observer_mode()
+        if not watching:
+            problem = fsdpilot.callsign_problem(callsign)
+            if problem:
+                QMessageBox.warning(self, t("dialog.callsign_bad"), problem)
+                return
         if not cid or not password:
             QMessageBox.warning(self, t("dialog.missing"), t("dialog.missing_body"))
             return
-        if not self.sim.connected:
+        # 观察员本来就常常不开模拟器（他就是个话务员），这一句问了也白问
+        if not watching and not self.sim.connected:
             answer = QMessageBox.question(
                 self, t("dialog.no_sim"), t("dialog.no_sim_body"),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -399,7 +439,9 @@ class MsfsWindow(QMainWindow):
         self.connect_button.setEnabled(False)
         self.connect_button.setText(t("connect.connecting"))
 
-        if self.settings.connect_fsd:
+        # 观察员**永远不连 FSD**：网络上只能有机长那一架飞机。这里不看
+        # connect_fsd，那个开关管的是普通连接。
+        if self.settings.connect_fsd and not watching:
             self.fsd = fsdpilot.FSDPilot(
                 host=self.settings.fsd_host, port=self.settings.fsd_port,
                 callsign=callsign, cid=cid, password=password,
@@ -412,7 +454,9 @@ class MsfsWindow(QMainWindow):
                 traffic=self.traffic)
             self.fsd.start()
 
-        if self.settings.connect_voice:
+        # 观察员只有语音这一条链路，connect_voice 关着也要连——否则点了"连接"
+        # 之后什么都不会发生，界面上却写着已连接。
+        if self.settings.connect_voice or watching:
             self.voice = voice_module.Voice(
                 host=self.settings.mumble_host, username=cid, password=password,
                 settings=self.settings,
@@ -425,6 +469,14 @@ class MsfsWindow(QMainWindow):
         self.ptt_watcher.start()
         self.connect_button.setEnabled(True)
         self.connect_button.setText(t("connect.disconnect"))
+
+        if watching:
+            self.add_message(t("msg.observer_on"), theme.ACTIVE_COLOR)
+            self.fsd_label.setText(t("net.observer"))
+            # 一个频率都没有的话现在就说：语音会连上但停在根频道，PTT 那道根
+            # 频道保护会拒发，表现出来是"连上了却没人听得见"。
+            if self._sync_frequency() is None:
+                self.add_message(t("msg.observer_no_frequency"), theme.MUTED_COLOR)
 
     def disconnect_all(self):
         self.ptt_watcher.stop()
@@ -454,22 +506,108 @@ class MsfsWindow(QMainWindow):
     def tick(self):
         """每 0.5 秒：把模拟器的数据分发到 FSD 和语音。"""
         snapshot = self.sim.snapshot()
-        if not snapshot:
+        if snapshot:
+            self.snapshot = snapshot
+
+            com1 = snapshot.get("com1")
+            self.com1_label.setText(t("radio.com1", frequency=f"{com1:.3f}") if com1
+                                    else t("radio.com1_none"))
+            self.position_label.setText(
+                f"{snapshot['latitude']:.4f} {snapshot['longitude']:.4f}  "
+                f"{snapshot['altitude']} ft  {snapshot['groundspeed']} kt  "
+                f"{snapshot['heading']:03.0f}°  A{snapshot['squawk']:04d}")
+
+            if self.fsd:
+                self.fsd.update_position(snapshot)
+
+        # 语音频率每一拍都要跟一次，而且**不能挂在"这轮读到了模拟器数据"下面**：
+        # 观察员多半根本没开模拟器，上面整段一次都不会跑，手输的频率就永远送不
+        # 出去，而界面上什么都不缺。
+        self._sync_frequency(snapshot or {})
+
+    def _sync_frequency(self, snapshot=None):
+        """算出语音这一刻该待在哪个频率上，送过去，并把它返回。
+
+        谁说了算全在 observer.frequency_for 里（纯函数，单测在 test_xpc.py）：
+        观察员手输的压过 COM1，非观察员一律跟着座舱走。
+        """
+        snapshot = snapshot if snapshot is not None else (self.snapshot or {})
+        target = observer.frequency_for(
+            com1=snapshot.get("com1"),
+            com1_power=snapshot.get("com1_power", True),
+            manual=getattr(self.settings, "observer_frequency", ""),
+            observer=self.observer_mode())
+        if self.voice and target:
+            self.voice.set_frequency(target)
+        return target
+
+    # ---------- 观察员模式 ----------
+    def observer_mode(self):
+        """界面上那个勾说了算；配置里那份只是记住上次的选择。"""
+        return bool(self.observer_check.isChecked())
+
+    def on_observer_toggled(self, checked):
+        """切换观察员模式。连着的时候不许切。
+
+        这个勾决定的是"这次连接连不连 FSD"，连上之后再动，界面说的和真实
+        连接就对不上了——看着像观察员，网络上那架飞机还在。
+        """
+        if self.fsd or self.voice:
+            self.observer_check.blockSignals(True)
+            self.observer_check.setChecked(not checked)
+            self.observer_check.blockSignals(False)
+            QMessageBox.information(self, t("dialog.observer"),
+                                    t("dialog.observer_busy"))
             return
-        self.snapshot = snapshot
+        self.settings.observer_mode = bool(checked)
+        self.settings.save()
+        self._apply_observer_ui()
+        self.add_message(t("msg.observer_on") if checked else t("msg.observer_off"),
+                         theme.ACTIVE_COLOR)
 
-        com1 = snapshot.get("com1")
-        self.com1_label.setText(t("radio.com1", frequency=f"{com1:.3f}") if com1
-                                else t("radio.com1_none"))
-        self.position_label.setText(
-            f"{snapshot['latitude']:.4f} {snapshot['longitude']:.4f}  "
-            f"{snapshot['altitude']} ft  {snapshot['groundspeed']} kt  "
-            f"{snapshot['heading']:03.0f}°  A{snapshot['squawk']:04d}")
+    def _apply_observer_ui(self):
+        """把这个模式下没有通道的东西禁掉，并把手输频率露出来。
 
-        if self.fsd:
-            self.fsd.update_position(snapshot)
-        if self.voice and com1 and snapshot.get("com1_power", True):
-            self.voice.set_frequency(com1)
+        不是为了好看：观察员不连 FSD，发消息、IDENT、飞行计划都没地方去，
+        留着能点只会让人以为是坏了。
+        """
+        watching = self.observer_mode()
+        self.callsign_input.setEnabled(not watching)
+        self.aircraft_input.setEnabled(not watching)
+        self.recipient_input.setEnabled(not watching)
+        self.message_input.setEnabled(not watching)
+        self.send_button.setEnabled(not watching)
+        self.plan_action.setEnabled(not watching)
+        self.frequency_input.setVisible(watching)
+        if watching:
+            self.ident_button.setEnabled(False)
+            self.controller_list.clear()
+            self.fsd_label.setText(t("net.observer"))
+        elif not self.fsd:
+            self.fsd_label.setText(t("net.disconnected"))
+
+    def apply_manual_frequency(self):
+        """无线电栏里手输的频率。清空 = 回到跟随 COM1。
+
+        editingFinished 在回车和失焦时都会来，所以这里先比一遍：值没变就什么
+        都不做，否则光是点进点出输入框就会往消息区刷行。
+        """
+        text = self.frequency_input.text().strip()
+        value = observer.parse_frequency(text)
+        if text and value is None:
+            self.add_message(t("msg.bad_frequency", value=text), theme.MUTED_COLOR)
+            return
+        wanted = observer.format_frequency(value)
+        if wanted == (getattr(self.settings, "observer_frequency", "") or ""):
+            self.frequency_input.setText(wanted)
+            return
+        self.settings.observer_frequency = wanted
+        self.settings.save()
+        self.frequency_input.setText(wanted)
+        self.add_message(
+            t("msg.manual_frequency", frequency=wanted) if wanted
+            else t("msg.follow_com1"), theme.ACTIVE_COLOR)
+        self._sync_frequency()
 
     def traffic_tick(self):
         """每 0.2 秒：把他机插值到当下放进模拟器。和 tick() 分开是为了平滑。"""

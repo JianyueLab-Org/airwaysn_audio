@@ -62,6 +62,23 @@ TEXT = {
     "connect.password":     {"zh": "密码", "en": "Password"},
     "connect.aircraft":     {"zh": "机型", "en": "Aircraft"},
     "connect.aircraft_hint": {"zh": "如 B738", "en": "e.g. B738"},
+    "connect.observer":     {"zh": "观察员模式（双人机组）",
+                             "en": "Observer mode (two-crew)"},
+    "connect.observer_hint": {
+        "zh": "右座用：只连语音，不在网络上产生第二架飞机。两个人要用各自的账号。",
+        "en": "For the right seat: voice only, no second aircraft on the network. "
+              "Each person signs in with their own account."},
+    "connect.observer_tip": {
+        "zh": "双人机组时给副驾用。这个模式下不连 FSD：网络上只有机长那一架飞机，"
+              "你和他在同一个频率上，听得见也说得出。代价是收不到管制的文字消息"
+              "——那是发给机长呼号的。频率跟着你自己的 COM1 走，没开模拟器就在"
+              "无线电栏里手输一个。",
+        "en": "For the second crew member. This mode never connects to FSD: only the "
+              "flying pilot's aircraft is on the network, and you sit on the same "
+              "frequency, hearing and transmitting normally. The cost is that ATC text "
+              "messages do not reach you — they are addressed to the other callsign. "
+              "The frequency follows your own COM1, or you type one into the radio bar "
+              "when no simulator is running."},
     "connect.connect":      {"zh": "连接", "en": "Connect"},
     "connect.connecting":   {"zh": "连接中…", "en": "Connecting…"},
     "connect.disconnect":   {"zh": "断开", "en": "Disconnect"},
@@ -77,6 +94,8 @@ TEXT = {
     "sim.no_data":          {"zh": "MSFS 没有数据（是否已进入飞行？）",
                              "en": "No data from MSFS (are you in a flight?)"},
     "net.disconnected":     {"zh": "网络：未连接", "en": "Network: not connected"},
+    "net.observer":         {"zh": "网络：观察员模式（不上网络）",
+                             "en": "Network: observer mode (not connected)"},
     "net.online":           {"zh": "网络：已上线", "en": "Network: online"},
     "net.reconnecting":     {"zh": "网络：重连中", "en": "Network: reconnecting"},
     "net.offline":          {"zh": "网络：已下线", "en": "Network: offline"},
@@ -106,6 +125,12 @@ TEXT = {
     "radio.title":          {"zh": "无线电", "en": "Radio"},
     "radio.com1_none":      {"zh": "COM1  ---.---", "en": "COM1  ---.---"},
     "radio.com1":           {"zh": "COM1  {frequency}", "en": "COM1  {frequency}"},
+    "radio.manual_hint":    {"zh": "频率，留空跟随 COM1",
+                             "en": "Frequency — empty follows COM1"},
+    "radio.manual_tip":     {"zh": "观察员模式专用：手输一个频率，语音就待在那里。"
+                                   "清空则回到跟随座舱 COM1。",
+                             "en": "Observer mode only: type a frequency and voice stays "
+                                   "there. Clear it to follow the cockpit's COM1 again."},
     "radio.traffic":        {"zh": "他机 {count}", "en": "Traffic {count}"},
     "radio.position_none":  {"zh": "位置 --", "en": "Position --"},
     "radio.ident":          {"zh": "IDENT", "en": "IDENT"},
@@ -124,6 +149,22 @@ TEXT = {
                              "en": "{sender} → {recipient}: {body}"},
     "msg.sent":             {"zh": "我 → {recipient}: {body}",
                              "en": "me → {recipient}: {body}"},
+    "msg.observer_on":      {"zh": "观察员模式：只连语音，网络上不会出现这架飞机",
+                             "en": "Observer mode: voice only, this aircraft is not on "
+                                   "the network"},
+    "msg.observer_off":     {"zh": "已退出观察员模式：下次连接会正常上网络",
+                             "en": "Observer mode off: the next connection joins the "
+                                   "network normally"},
+    "msg.observer_no_frequency": {
+        "zh": "还没有频率：在无线电栏里输入一个，或者开着模拟器跟 COM1 走",
+        "en": "No frequency yet: type one into the radio bar, or start the simulator "
+              "and follow COM1"},
+    "msg.manual_frequency": {"zh": "手动频率 {frequency}",
+                             "en": "Manual frequency {frequency}"},
+    "msg.follow_com1":      {"zh": "频率改回跟随 COM1", "en": "Following COM1 again"},
+    "msg.bad_frequency":    {"zh": "频率 {value} 读不出来，写成 121.800 这样",
+                             "en": "Cannot read the frequency {value} — write it like "
+                                   "121.800"},
     "msg.disconnected":     {"zh": "已断开", "en": "Disconnected"},
     "msg.not_connected":    {"zh": "尚未连接到网络，消息没有发出去",
                              "en": "Not connected to the network — the message was "
@@ -149,6 +190,10 @@ TEXT = {
                              "en": "No data from MSFS yet. Without a position your "
                                    "aircraft cannot be reported to the network.\n\n"
                                    "Connect anyway?"},
+    "dialog.observer":      {"zh": "观察员模式", "en": "Observer mode"},
+    "dialog.observer_busy": {"zh": "连接期间不能切换观察员模式。先断开，再改。",
+                             "en": "Observer mode cannot be switched while connected. "
+                                   "Disconnect first."},
     "dialog.audio":         {"zh": "音频设备", "en": "Audio device"},
     "dialog.audio_failed":  {"zh": "重开音频设备失败：{error}",
                              "en": "Could not reopen the audio device: {error}"},

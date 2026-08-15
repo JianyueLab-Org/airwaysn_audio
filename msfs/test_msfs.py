@@ -1105,7 +1105,7 @@ class SharedCopyTest(unittest.TestCase):
     """
 
     SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
-              "theme.py", "update.py", "chime.py")
+              "theme.py", "update.py", "chime.py", "observer.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))

@@ -91,6 +91,7 @@ python -m unittest test_ptt
 python -m unittest test_xpc.PbhTest      # the one that must match can-fsd exactly
 python -m unittest test_xpc.WantsAlertTest      # 消息提示音：哪条该响
 python -m unittest test_xpc.ChimePlayTest       # 设备回退、连响抑制、开不出来也不炸
+python -m unittest test_xpc.ObserverFrequencyTest  # 观察员：手输频率和 COM1 谁说了算
 python -m unittest test_xpc.ModelMatchingTest   # CSL fallback chain
 python -m unittest test_xpc.PluginInstallTest   # 插件安装：目录识别、新旧判定、协议号
 python smoke_gui.py
@@ -378,6 +379,7 @@ The X-Plane pilot client, laid out like xPilot: three independent links, none of
 | `cslmatch.py` | `src/aircrafts/` (model matching) | CSL package parsing and the type→model fallback chain |
 | `bridge.py` | — | UDP transport to the X-Plane plugin |
 | `chime.py` | `src/audio/AFV` notification | The message chime: synthesised tones, played on the client's own output device |
+| `observer.py` | — | Observer mode: whether a frequency is typed or follows COM1, and the parsing behind it |
 | `plugin/PI_XpcTraffic.py` | `xpilot` XPL plugin | Runs *inside* X-Plane (XPPython3): draws traffic, feeds TCAS |
 | `gui.py` | `Resources/Views/` | Connect bar, messages, nearby-ATC list, radio bar |
 
@@ -404,6 +406,17 @@ Other things worth knowing:
 - **Failure is one INFO line and nothing else.** The FSD receive thread calls `play()` directly, so an exception escaping it would be a disconnect. A burst of messages collapses to one chime (nothing overlaps, and `MIN_INTERVAL` is 1 s), a device that will not open at the chosen rate falls back through 44.1/22.05 kHz and then to the default device, and volume 0 opens nothing at all.
 
 Settings are `message_sound` / `message_sound_all` / `message_sound_volume`, on the audio tab next to the two existing volume sliders, with a 试听 button that plays through **the device currently selected in the dialog** rather than the saved one — the person clicking it has just changed headsets.
+
+**Observer mode is for the second seat of a two-person crew, and it is defined by what it does *not* connect to.** An aircraft can only have one position on the network, so the right-seat member's client (`observer_mode`, the checkbox in the connect bar) **never opens the FSD connection at all** — voice only, in the same `FREQ_*` channel as the flying pilot. It does not consult `connect_fsd`; that switch governs an ordinary connection. Conversely it connects voice even when `connect_voice` is off, because otherwise pressing 连接 would do nothing while the UI claimed success. The rules live in `observer.py` as pure functions so they can be tested without Qt.
+
+Four consequences, all deliberate:
+
+- **No second aircraft and no duplicate-callsign kick**, which is the whole point. The callsign box is disabled, because a callsign is an FSD concept and this mode has no FSD.
+- **ATC text messages do not arrive.** They are addressed to the flying pilot's callsign and can-fsd delivers them to that one connection (`sendDirect` in `internal/fsd/handler.go`). The observer hears and transmits normally; they just cannot read. This is the cost of the design and is written down in `observer.py` so it is not re-investigated as a bug later. 发送消息, IDENT and 飞行计划 are disabled for the same reason — leaving them clickable reads as broken.
+- **The frequency can be typed.** The second crew member often runs no simulator at all (they are the radio operator), so there is no COM1 to follow; the radio bar grows a frequency box whose rule is *empty = follow COM1, anything else wins*. One control instead of a manual/auto switch, and no question about which one is in charge. `parse_frequency()` accepts `121.8`, `121.800` and the six-digit `121800` that people copy out of the Mumble channel name, quantises to kHz and only then range-checks 118.000–136.975.
+- **That box exists only in observer mode.** A pilot who could point voice at a frequency other than the one in the cockpit would eventually be on a different channel from the one ATC thinks they are on, which is worse than hearing nothing. `frequency_for()` takes `observer` as a parameter and ignores `manual` entirely when it is false; `ObserverFrequencyTest` pins that.
+
+Two more things it gets right because the obvious version does not: the frequency is re-evaluated **every tick regardless of whether the simulator produced a snapshot** (the old `if not snapshot: return` meant an observer with no simulator never had their typed frequency applied), and the checkbox refuses to move while connected — flipping it mid-session would leave the UI describing a connection that is not the one that is open. Both crew members must sign in with **their own accounts**: `server/login.py` kicks the previous session when the same name logs in again, so a shared account just takes turns dropping each other.
 
 ### Rendering other aircraft
 
@@ -450,7 +463,7 @@ The bridge is UDP with one JSON object per datagram, fragmented over `seq`/`part
 
 ## MSFS for CAN (`msfs/`)
 
-The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.py`, `mumblecompat.py`, `ptt.py`, `theme.py`, `update.py` and `chime.py` are **byte-identical copies** of the `xpc/` versions (`SharedCopyTest` fails if they drift); `fsdpilot.py`, `applog.py` and `i18n.py` are deliberate forks — different simulator id, different log file name, and the handful of strings that name the simulator — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
+The same client as `xpc/`, for Microsoft Flight Simulator. `voice.py`, `traffic.py`, `mumblecompat.py`, `ptt.py`, `theme.py`, `update.py`, `chime.py` and `observer.py` are **byte-identical copies** of the `xpc/` versions (`SharedCopyTest` fails if they drift); `fsdpilot.py`, `applog.py` and `i18n.py` are deliberate forks — different simulator id, different log file name, and the handful of strings that name the simulator — everything that is not the simulator is shared by duplication, matching how the rest of the repo works. Only two modules differ:
 
 | Module | Replaces | Role |
 |---|---|---|

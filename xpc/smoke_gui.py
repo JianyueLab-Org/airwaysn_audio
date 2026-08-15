@@ -269,6 +269,107 @@ def main():
         window.traffic_tick()      # 没有模型也不该炸，TCAS 还是要送
     check("没装模型也能跑", survives_without_models)
 
+    print("观察员模式：")
+
+    class FakeVoice:
+        """够冒烟测试用的语音替身。真的连 Mumble 是不行的：这里没有网络，
+        也不该真的登录一个账号。"""
+
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.frequencies = []
+            self.stopped = False
+            FakeVoice.instances.append(self)
+
+        def start(self):
+            pass
+
+        def stop(self, *args, **kwargs):
+            self.stopped = True
+
+        def set_frequency(self, value):
+            self.frequencies.append(value)
+
+        def set_transmitting(self, value):
+            pass
+
+    # PTT 监听器在这一段里会被真的启动（connect_all 的最后一行）。CI 上装的是
+    # 真 pynput，一个全局键盘钩子不该因为跑冒烟测试而被挂起来。
+    window.ptt_watcher.start = lambda: None
+    window.ptt_watcher.stop = lambda: None
+
+    def observer_disables_the_fsd_half():
+        window.observer_check.setChecked(True)
+        assert not window.callsign_input.isEnabled(), "呼号该禁掉：观察员不上 FSD"
+        assert not window.message_input.isEnabled(), "发消息没有通道，该禁掉"
+        assert not window.send_button.isEnabled(), "发送按钮该禁掉"
+        assert not window.plan_action.isEnabled(), "飞行计划没有通道，该禁掉"
+        # 窗口没 show()，isVisible() 恒为假，只能看有没有被显式藏起来
+        assert not window.frequency_input.isHidden(), "手输频率该露出来"
+    check("打开后禁掉用不上的东西", observer_disables_the_fsd_half)
+
+    def connects_voice_only():
+        FakeVoice.instances.clear()
+        real_voice = gui.voice_module.Voice
+        gui.voice_module.Voice = FakeVoice
+        try:
+            _dialogs.clear()
+            window.callsign_input.setText("")      # 观察员不需要呼号
+            window.cid_input.setText("1234")
+            window.password_input.setText("pw")
+            window.connect_all()
+            assert not _dialogs, f"不该有任何拦截: {_dialogs}"
+            assert window.fsd is None, "观察员绝不能连 FSD——那会多出一架飞机"
+            assert window.voice is not None, "观察员必须连上语音"
+        finally:
+            gui.voice_module.Voice = real_voice
+    check("只连语音，不连 FSD", connects_voice_only)
+
+    def typed_frequency_beats_com1():
+        voice = window.voice
+        window.frequency_input.setText("121.800")
+        window.apply_manual_frequency()
+        voice.frequencies.clear()
+        window.tick()                       # 模拟器替身的 COM1 是 121.500
+        assert 121.8 in voice.frequencies, voice.frequencies
+    check("手输频率压过 COM1", typed_frequency_beats_com1)
+
+    def clearing_it_follows_com1_again():
+        voice = window.voice
+        window.frequency_input.setText("")
+        window.apply_manual_frequency()
+        voice.frequencies.clear()
+        window.tick()
+        assert 121.5 in voice.frequencies, voice.frequencies
+    check("清空后回到跟随 COM1", clearing_it_follows_com1_again)
+
+    def a_bad_frequency_is_refused():
+        voice = window.voice
+        window.frequency_input.setText("呃")
+        window.apply_manual_frequency()
+        assert window.settings.observer_frequency == "", "读不出来的不该存下去"
+        voice.frequencies.clear()
+        window.tick()
+        assert 121.5 in voice.frequencies, "读不出来就还是跟着 COM1"
+    check("读不出来的频率不生效", a_bad_frequency_is_refused)
+
+    def cannot_toggle_while_connected():
+        _dialogs.clear()
+        window.observer_check.setChecked(False)
+        assert _dialogs, "连着的时候切换应当被拦下并提示"
+        assert window.observer_check.isChecked(), "开关应当被弹回原样"
+    check("连着时不能切换", cannot_toggle_while_connected)
+
+    def leaving_observer_mode_restores_everything():
+        window.disconnect_all()
+        window.observer_check.setChecked(False)
+        assert window.callsign_input.isEnabled(), "退出后呼号要能再填"
+        assert window.message_input.isEnabled(), "退出后要能再发消息"
+        assert window.plan_action.isEnabled(), "退出后飞行计划要能再开"
+        assert window.frequency_input.isHidden(), "手输频率只属于观察员模式"
+    check("退出后恢复原样", leaving_observer_mode_restores_everything)
+
     print("对话框：")
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)

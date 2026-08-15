@@ -3113,5 +3113,131 @@ class ChimePlayTest(unittest.TestCase):
         self.assertEqual(len(self.fake.opened), 1)
 
 
+class FrequencyParsingTest(unittest.TestCase):
+    """观察员手输的频率。读错一个数字，人就守在别的频道上。"""
+
+    def setUp(self):
+        import observer
+        self.parse = observer.parse_frequency
+
+    def test_the_usual_ways_of_writing_it(self):
+        for text in ("121.8", "121.800", " 121.800 ", "121.80"):
+            with self.subTest(text=text):
+                self.assertEqual(self.parse(text), 121.8)
+
+    def test_six_digit_kilohertz(self):
+        """有人会照着 Mumble 频道名 FREQ_121800 抄。"""
+        self.assertEqual(self.parse("121800"), 121.8)
+        self.assertEqual(self.parse("118000"), 118.0)
+
+    def test_a_number_works_too(self):
+        self.assertEqual(self.parse(121.8), 121.8)
+
+    def test_empty_means_no_frequency(self):
+        for text in ("", "   ", None):
+            with self.subTest(text=text):
+                self.assertIsNone(self.parse(text))
+
+    def test_junk_is_refused_rather_than_guessed(self):
+        for text in ("abc", "121.8.9", "1e400", "--"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.parse(text))
+
+    def test_outside_the_vhf_band_is_refused(self):
+        for text in ("99.0", "137.000", "0", "1218"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.parse(text))
+
+    def test_the_edges_are_included(self):
+        self.assertEqual(self.parse("118.000"), 118.0)
+        self.assertEqual(self.parse("136.975"), 136.975)
+
+    def test_it_quantises_before_judging_the_range(self):
+        """频道名只到千赫：多打一位不该作废，但也别因此放进带外的频率。"""
+        self.assertEqual(self.parse("136.9754"), 136.975)
+        self.assertIsNone(self.parse("137.0004"))
+
+    def test_a_bool_is_not_a_frequency(self):
+        """True 在 Python 里是 1，别让它变成一个频率。"""
+        self.assertIsNone(self.parse(True))
+
+    def test_infinity_and_nan_do_not_slip_through(self):
+        for text in ("inf", "-inf", "nan"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.parse(text))
+
+
+class ObserverFrequencyTest(unittest.TestCase):
+    """谁说了算：手输的还是座舱里的 COM1。"""
+
+    def setUp(self):
+        import observer
+        self.pick = observer.frequency_for
+
+    def test_a_normal_pilot_follows_com1(self):
+        self.assertEqual(self.pick(com1=118.0, manual="121.800"), 118.0)
+
+    def test_a_normal_pilot_never_gets_a_manual_frequency(self):
+        """这是安全规矩，不是遗漏。
+
+        飞行员要是能把语音频率和座舱 COM1 分开设，就会出现"管制以为你在
+        121.8、你人在别的频道"这种事——比听不见更糟。
+        """
+        self.assertEqual(self.pick(com1=118.0, manual="121.800", observer=False),
+                         118.0)
+        self.assertIsNone(self.pick(com1=None, manual="121.800", observer=False))
+
+    def test_an_observer_prefers_what_was_typed(self):
+        self.assertEqual(self.pick(com1=118.0, manual="121.800", observer=True),
+                         121.8)
+
+    def test_an_observer_without_a_simulator(self):
+        """副驾常常根本没开模拟器——这才是手输存在的理由。"""
+        self.assertEqual(self.pick(com1=None, manual="121.800", observer=True),
+                         121.8)
+
+    def test_clearing_it_goes_back_to_following_com1(self):
+        """空 = 跟随。省掉一个"手动/自动"开关，也省掉谁说了算的疑问。"""
+        self.assertEqual(self.pick(com1=118.0, manual="", observer=True), 118.0)
+        self.assertEqual(self.pick(com1=118.0, manual=None, observer=True), 118.0)
+
+    def test_junk_in_the_box_falls_back_to_com1(self):
+        self.assertEqual(self.pick(com1=118.0, manual="呃", observer=True), 118.0)
+
+    def test_a_powered_down_radio_has_no_frequency(self):
+        self.assertIsNone(self.pick(com1=118.0, com1_power=False))
+
+    def test_an_observer_typing_one_ignores_the_cockpit_radio_switch(self):
+        """他多半根本没在用那台电台。"""
+        self.assertEqual(
+            self.pick(com1=118.0, com1_power=False, manual="121.800", observer=True),
+            121.8)
+
+    def test_nothing_at_all_is_no_frequency(self):
+        self.assertIsNone(self.pick())
+        self.assertIsNone(self.pick(observer=True))
+
+
+class ObserverFormatTest(unittest.TestCase):
+
+    def setUp(self):
+        import observer
+        self.format = observer.format_frequency
+
+    def test_it_writes_three_decimals(self):
+        self.assertEqual(self.format(121.8), "121.800")
+        self.assertEqual(self.format("121.8"), "121.800")
+
+    def test_nothing_becomes_an_empty_string(self):
+        """配置里存空串就是"跟随 COM1"，不能存成 "None"。"""
+        self.assertEqual(self.format(None), "")
+        self.assertEqual(self.format(""), "")
+        self.assertEqual(self.format("呃"), "")
+
+    def test_it_round_trips_through_the_parser(self):
+        import observer
+        self.assertEqual(observer.parse_frequency(self.format(121.8)), 121.8)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
