@@ -54,6 +54,10 @@ DEFAULTS = {
     "message_sound_volume": 100,
     "connect_fsd": True,
     "connect_voice": True,
+    # 观察员模式（双人机组的右座）：只连语音，不连 FSD，网络上不会多一架
+    # 飞机。observer_frequency 是手输的频率，留空就跟着 COM1 走。见 observer.py。
+    "observer_mode": False,
+    "observer_frequency": "",
     "flight_plan": {},
     # 他机注入。package_roots 是 MSFS 的包目录，留空则自动探测。
     "render_traffic": True,
