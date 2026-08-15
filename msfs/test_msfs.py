@@ -1099,11 +1099,13 @@ class SharedCopyTest(unittest.TestCase):
     模拟器编号，后者写不同的日志文件名。`i18n.py` 也是有意分开的：键名一样，
     文案里提到模拟器的那几条不一样。
 
-    `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。
+    `ptt.py` 和 `theme.py` 是后加的共享件，同样一处都不能自己改。`chime.py`
+    也一样：提示音的判定和播放只在 xpc/test_xpc.py 里测，两份不一致的话
+    这边就成了没人测过的代码。
     """
 
     SHARED = ("voice.py", "traffic.py", "mumblecompat.py", "ptt.py",
-              "theme.py", "update.py")
+              "theme.py", "update.py", "chime.py")
 
     def test_shared_files_are_byte_identical_to_xpc(self):
         here = os.path.dirname(os.path.abspath(__file__))

@@ -47,6 +47,20 @@ QMessageBox.question = staticmethod(_question)
 import update
 update.check = lambda *args, **kwargs: None
 
+# 提示音会真的去开一次输出设备。跑冒烟测试的机器上多半没有声卡（CI 上肯定
+# 没有），而且它本来也不该出声。换成记一笔——顺便把"哪条消息该响"这件事
+# 一起验了，判定本身的单元测试在 xpc/test_xpc.py 里。
+import chime
+_chimes = []
+
+
+def _fake_chime(self, force=False):
+    _chimes.append(force)
+    return True
+
+
+chime.Chime.play = _fake_chime
+
 import gui
 import i18n
 import simlink
@@ -130,6 +144,27 @@ def main():
         "ZSPD_TWR", "CCA1501", "contact ground 121.8"))
     check("收到频率消息", lambda: window.on_text_message(
         "CES2345", "@28500", "request pushback"))
+
+    # 呼号钉死，别跟着开发机上真实的配置走
+    window.settings.callsign = "CCA1501"
+
+    def chimes_for_a_message_to_me():
+        _chimes.clear()
+        window.on_text_message("ZSPD_TWR", "CCA1501", "contact ground 121.8")
+        assert _chimes, "私聊给自己的消息应当响一声"
+    check("私聊消息响提示音", chimes_for_a_message_to_me)
+
+    def chimes_when_the_frequency_names_me():
+        _chimes.clear()
+        window.on_text_message("ZSPD_APP", "@28500", "CCA1501 descend 3000 m")
+        assert _chimes, "频率上点到自己的消息应当响"
+    check("频率上点名响提示音", chimes_when_the_frequency_names_me)
+
+    def stays_quiet_for_somebody_else():
+        _chimes.clear()
+        window.on_text_message("CES2345", "@28500", "request pushback")
+        assert not _chimes, "频率上别人的消息不该响"
+    check("频率上别人的消息不响", stays_quiet_for_somebody_else)
 
     def refuses_to_send_offline():
         window.message_input.setText("hello")
@@ -316,6 +351,12 @@ def main():
     settings_dialog = gui.SettingsDialog(window.settings, window)
     check("建立设置对话框", lambda: settings_dialog)
     check("设置可应用", lambda: settings_dialog.apply())
+
+    def preview_button_plays_one():
+        _chimes.clear()
+        settings_dialog._preview_chime()
+        assert _chimes == [True], "试听应当无视开关和最短间隔直接放一声"
+    check("试听提示音", preview_button_plays_one)
 
     plan_dialog = gui.FlightPlanDialog(window.settings, window)
     check("建立飞行计划对话框", lambda: plan_dialog)

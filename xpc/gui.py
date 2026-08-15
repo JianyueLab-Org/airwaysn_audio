@@ -44,6 +44,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CheckBox, ComboBox,
                             StrongBodyLabel, TextEdit)
 
 import bridge
+import chime
 import cslmatch
 import fsdpilot
 import i18n
@@ -144,6 +145,9 @@ class XpcWindow(QMainWindow):
         # 键盘 / 摇杆 / 鼠标侧键三合一。连上之后才开始监听。
         self.ptt_watcher = ptt.PttWatcher(self.settings.ptt_bindings,
                                           on_change=self.on_ptt_change)
+        # 收到管制消息时的提示音。拿的就是这一份 settings，所以设置里改完
+        # 立刻生效，不用重建。
+        self.chime = chime.Chime(self.settings)
 
         self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         self.resize(980, 660)
@@ -612,6 +616,13 @@ class XpcWindow(QMainWindow):
         else:
             self.add_message(t("msg.text", sender=sender, body=body),
                              theme.ACTIVE_COLOR)
+        # 提示音。人在看窗外，多出来的这一行谁也看不见。该不该响全在
+        # chime.wants_alert 里（纯函数，单测在 test_xpc.py），这里只管放。
+        # 呼号以正在连着的那条 FSD 为准：设置里存的那份可能是上一次连的。
+        callsign = self.fsd.callsign if self.fsd else self.settings.callsign
+        if chime.wants_alert(callsign, sender, recipient, body,
+                             every_message=self.chime.every_message()):
+            self.chime.play()
 
     def on_controllers(self, controllers):
         self.controller_list.clear()
@@ -959,6 +970,33 @@ class SettingsDialog(QDialog):
         form.addRow(BodyLabel(t("settings.mic_volume")), self.mic_slider)
         form.addRow(BodyLabel(t("settings.speaker_volume")), self.speaker_slider)
 
+        # ---- 消息提示音 ----
+        self.alert_check = CheckBox(t("settings.message_sound"))
+        self.alert_check.setChecked(bool(getattr(self.settings,
+                                                 "message_sound", True)))
+        self.alert_check.setToolTip(t("settings.message_sound_tip"))
+        alert_row = QHBoxLayout()
+        alert_row.addWidget(self.alert_check)
+        alert_row.addStretch()
+        self.alert_test = PushButton(FluentIcon.VOLUME,
+                                     t("settings.message_sound_test"))
+        self.alert_test.setToolTip(t("settings.message_sound_tip"))
+        self.alert_test.clicked.connect(self._preview_chime)
+        alert_row.addWidget(self.alert_test)
+        form.addRow(alert_row)
+
+        self.alert_all_check = CheckBox(t("settings.message_sound_all"))
+        self.alert_all_check.setChecked(bool(getattr(self.settings,
+                                                     "message_sound_all", False)))
+        form.addRow(self.alert_all_check)
+
+        self.alert_slider = Slider(Qt.Orientation.Horizontal)
+        self.alert_slider.setRange(0, 200)
+        self.alert_slider.setValue(int(getattr(self.settings,
+                                               "message_sound_volume", 100)))
+        form.addRow(BodyLabel(t("settings.message_sound_volume")),
+                    self.alert_slider)
+
         self.language_box = ComboBox()
         for code, name in i18n.available().items():
             self.language_box.addItem(name, userData=code)
@@ -983,6 +1021,16 @@ class SettingsDialog(QDialog):
 
         outer.addStretch()
         return page
+
+    def _preview_chime(self):
+        """试听。
+
+        用**对话框里当前选的**扬声器和音量，不是已经存下来的那份——来点这一下
+        的人多半正是刚换了耳机。点了没声音就说明设备选错了，这正是这个按钮
+        存在的意义。
+        """
+        chime.preview(output_device_index=self.output_box.currentData(),
+                      volume=self.alert_slider.value())
 
     def _network_tab(self):
         page = QWidget()
@@ -1191,6 +1239,9 @@ class SettingsDialog(QDialog):
         self.settings.output_device_index = self.output_box.currentData()
         self.settings.mic_volume = self.mic_slider.value()
         self.settings.speaker_volume = self.speaker_slider.value()
+        self.settings.message_sound = self.alert_check.isChecked()
+        self.settings.message_sound_all = self.alert_all_check.isChecked()
+        self.settings.message_sound_volume = self.alert_slider.value()
         self.settings.ptt_bindings = list(self.ptt_list.bindings)
         self.settings.debug = self.debug_check.isChecked()
         self.settings.language = self.language_box.currentData()
