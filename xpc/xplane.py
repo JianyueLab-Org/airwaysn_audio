@@ -84,6 +84,12 @@ NAME_TO_INDEX = {name: index for index, name in INDEX_TO_NAME.items()}
 METRES_PER_FOOT = 0.3048
 KNOTS_PER_MPS = 1.9438444924406
 
+# snapshot 里 xpdr_mode 的两个取值。fsdpilot 拿 >= 2 判在线，见 xpdr_mode()。
+XPDR_ONLINE = 2
+XPDR_STANDBY = 1
+# 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
+PARKED_SPEED_KT = 1
+
 # 标准大气压，高度表拨到这个值时"指示高度"就是气压高度。
 STANDARD_PRESSURE_INHG = 29.92
 # 高度表窗口能拨到的范围。超出这个范围的值一定是没读到（0）或者读错了，
@@ -111,6 +117,35 @@ def pressure_delta(indicated_ft, baro_inhg, true_altitude_ft):
     pressure_altitude = (indicated_ft
                          + (STANDARD_PRESSURE_INHG - baro_inhg) * 1000.0)
     return int(round(pressure_altitude - true_altitude_ft))
+
+
+def xpdr_mode(raw_mode, on_ground, groundspeed_kt):
+    """transponder_mode dataref -> 位置包要的应答机模式。
+
+    dataref 的取值是 0 关 1 待机 2 开 3 测试/C，所以 >= 2 算在线。读不到（这一
+    轮 RREF 还没推过来）当在线：默认值原来写的是 0，也就是"关"，等于在拿不准的
+    时候主动把自己从管制端的标牌上抹掉，方向反了。
+
+    待机和关只在飞机**确实停着**的时候才当真。冷舱的飞机不该在雷达上是个亮着
+    的 C 模式目标，而冷舱恰恰就是"停在机坪上没动"这一种情况——按这条线判，那
+    个意图一点没丢。一架已经在滑行或者已经离地的飞机还报待机，对管制没有任何
+    好处：待机在 FSD 位置包里是包头的 `@S`，EuroScope 收到就当成一个没有 C 模式
+    的目标，标牌上的**高度和地速会一起空掉**。
+
+    和 msfs/simlink.py 的 xpdr_mode() 是同一条规则的两份实现——两个客户端的
+    snapshot() 逐字段一致是刻意的，这一项也不例外。
+    """
+    if raw_mode is None:
+        return XPDR_ONLINE
+    try:
+        raw_mode = int(raw_mode)
+    except (TypeError, ValueError):
+        return XPDR_ONLINE
+    if raw_mode >= 2:
+        return XPDR_ONLINE
+    if on_ground and groundspeed_kt < PARKED_SPEED_KT:
+        return XPDR_STANDBY
+    return XPDR_ONLINE
 
 
 class XPlaneLink:
@@ -348,6 +383,8 @@ class XPlaneLink:
 
         elevation = raw.get("elevation", 0.0)
         altitude = int(round(elevation / METRES_PER_FOOT))
+        groundspeed = int(round(raw.get("groundspeed", 0.0) * KNOTS_PER_MPS))
+        on_ground = bool(raw.get("on_ground", 0))
         return {
             "latitude": raw.get("latitude", 0.0),
             "longitude": raw.get("longitude", 0.0),
@@ -355,16 +392,17 @@ class XPlaneLink:
             "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
                                              raw.get("baro_setting"), altitude),
             "agl": int(round(raw.get("agl", 0.0) / METRES_PER_FOOT)),
-            "groundspeed": int(round(raw.get("groundspeed", 0.0) * KNOTS_PER_MPS)),
+            "groundspeed": groundspeed,
             "pitch": raw.get("pitch", 0.0),
             "bank": raw.get("bank", 0.0),
             "heading": raw.get("heading_true", 0.0) % 360.0,
             "squawk": int(raw.get("squawk", 2000)),
-            "xpdr_mode": int(raw.get("xpdr_mode", 0)),
+            # 待机只在飞机确实停着的时候当真，理由见 xpdr_mode()。
+            "xpdr_mode": xpdr_mode(raw.get("xpdr_mode"), on_ground, groundspeed),
             "com1": self._frequency(raw.get("com1"), raw.get("com1_legacy")),
             "com2": self._frequency(raw.get("com2"), raw.get("com2_legacy")),
             "com1_power": bool(raw.get("com1_power", 1)),
-            "on_ground": bool(raw.get("on_ground", 0)),
+            "on_ground": on_ground,
         }
 
     @staticmethod
