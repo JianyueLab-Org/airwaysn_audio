@@ -219,8 +219,10 @@ class FSDPilot:
             self._position = snapshot
             if snapshot:
                 self._squawk = snapshot.get("squawk", self._squawk)
-                mode = snapshot.get("xpdr_mode", 0)
-                # X-Plane 的 transponder_mode：0 关，1 待机，2 开，3 测试/C
+                # xplane.xpdr_mode() 已经判过了，这里只有 2（在线）和 1（待机）
+                # 两个值。取不到就当在线——拿不准的时候少报一个待机，总好过让
+                # 管制端的标牌上高度和地速一起空掉。
+                mode = snapshot.get("xpdr_mode", 2)
                 self._xpdr_mode = XPDR_MODE_C if mode >= 2 else XPDR_STANDBY
 
     def ident(self, seconds=8.0):

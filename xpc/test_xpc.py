@@ -1970,6 +1970,56 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(self.link.connected)
 
 
+class TransponderModeTest(unittest.TestCase):
+    """待机会在管制端把高度和地速一起抹掉，所以只在飞机确实停着时才当真。
+
+    位置包的包头带应答机模式，待机是 `@S`。EuroScope 收到 `@S` 就当这是个没有
+    C 模式的目标，标牌上的高度和地速一起空掉——管制员看到的现象是"有的飞机读
+    不到速度"。和 msfs/simlink.py 的 xpdr_mode() 是同一条规则。
+    """
+
+    def test_online_modes_report_mode_c(self):
+        """dataref 的 2（开）和 3（测试/C）都算在线。"""
+        for mode in (2, 3):
+            self.assertEqual(xplane.xpdr_mode(mode, False, 450),
+                             xplane.XPDR_ONLINE, f"mode={mode}")
+
+    def test_a_parked_cold_aircraft_stays_on_standby(self):
+        """冷舱停机坪的飞机不该在雷达上是个亮着的 C 模式目标。"""
+        for mode in (0, 1):
+            self.assertEqual(xplane.xpdr_mode(mode, True, 0),
+                             xplane.XPDR_STANDBY, f"mode={mode}")
+
+    def test_an_airborne_aircraft_is_never_believed_on_standby(self):
+        self.assertEqual(xplane.xpdr_mode(1, False, 450), xplane.XPDR_ONLINE)
+
+    def test_a_taxiing_aircraft_is_not_believed_either(self):
+        self.assertEqual(xplane.xpdr_mode(1, True, 15), xplane.XPDR_ONLINE)
+
+    def test_a_missing_dataref_reports_online(self):
+        """这一轮 RREF 还没推过来时的默认值原来是 0（关），方向反了。"""
+        self.assertEqual(xplane.xpdr_mode(None, True, 0), xplane.XPDR_ONLINE)
+
+    def test_snapshot_reports_online_for_an_airborne_standby(self):
+        link = xplane.XPlaneLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "elevation": 10668.0,
+                       "groundspeed": 231.5, "on_ground": 0.0, "xpdr_mode": 1.0}
+        self.assertEqual(link.snapshot()["xpdr_mode"], xplane.XPDR_ONLINE)
+
+    def test_snapshot_still_reports_standby_on_the_stand(self):
+        link = xplane.XPlaneLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "elevation": 6.0,
+                       "groundspeed": 0.0, "on_ground": 1.0, "xpdr_mode": 1.0}
+        self.assertEqual(link.snapshot()["xpdr_mode"], xplane.XPDR_STANDBY)
+
+    def test_snapshot_without_the_dataref_reports_online(self):
+        """位置已经有了、应答机 dataref 还没到，不能把自己从标牌上抹掉。"""
+        link = xplane.XPlaneLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "elevation": 10668.0,
+                       "groundspeed": 231.5, "on_ground": 0.0}
+        self.assertEqual(link.snapshot()["xpdr_mode"], xplane.XPDR_ONLINE)
+
+
 class UnpackPbhTest(unittest.TestCase):
     """还原别人的姿态。判定标准仍然是 can-fsd 那份转写，不是我们自己的编码。"""
 

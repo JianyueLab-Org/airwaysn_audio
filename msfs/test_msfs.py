@@ -232,6 +232,53 @@ class PressureAltitudeTest(unittest.TestCase):
         self.assertEqual(snapshot["pressure_delta"], 0)
 
 
+class TransponderModeTest(unittest.TestCase):
+    """待机会在管制端把高度和地速一起抹掉，所以只在飞机确实停着时才当真。
+
+    位置包的包头带应答机模式，待机是 `@S`。EuroScope 收到 `@S` 就当这是个没有
+    C 模式的目标，标牌上的高度和地速一起空掉——管制员看到的现象是"有的飞机读
+    不到速度"。而很多默认机和非精细机根本没把应答机旋钮接到 TRANSPONDER STATE
+    上，那个 SimVar 从头到尾停在 1（待机），于是这些飞机全程没有高度和地速。
+    """
+
+    def test_online_states_report_mode_c(self):
+        """3 开 / 4 高度(C) / 5 地面都是真的在线。"""
+        for state in (3, 4, 5):
+            self.assertEqual(simlink.xpdr_mode(state, False, 450),
+                             simlink.XPDR_ONLINE, f"state={state}")
+
+    def test_a_parked_cold_aircraft_stays_on_standby(self):
+        """冷舱停机坪的飞机不该在雷达上是个亮着的 C 模式目标。"""
+        for state in (0, 1, 2):
+            self.assertEqual(simlink.xpdr_mode(state, True, 0),
+                             simlink.XPDR_STANDBY, f"state={state}")
+
+    def test_an_airborne_aircraft_is_never_believed_on_standby(self):
+        """这就是回归本身：在飞的飞机报待机，几乎都是机模没接线。"""
+        self.assertEqual(simlink.xpdr_mode(1, False, 450), simlink.XPDR_ONLINE)
+
+    def test_a_taxiing_aircraft_is_not_believed_either(self):
+        """已经在动了就不算"停着"，地面管制同样要看地速。"""
+        self.assertEqual(simlink.xpdr_mode(1, True, 15), simlink.XPDR_ONLINE)
+
+    def test_an_unreadable_simvar_reports_online(self):
+        """老机模没有这个 SimVar，沿用旧行为当在线。"""
+        self.assertEqual(simlink.xpdr_mode(None, True, 0), simlink.XPDR_ONLINE)
+        self.assertEqual(simlink.xpdr_mode("", False, 450), simlink.XPDR_ONLINE)
+
+    def test_snapshot_reports_online_for_an_airborne_standby(self):
+        link = simlink.SimLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "altitude": 34000.0,
+                       "groundspeed": 450.0, "on_ground": 0, "xpdr_state": 1}
+        self.assertEqual(link.snapshot()["xpdr_mode"], simlink.XPDR_ONLINE)
+
+    def test_snapshot_still_reports_standby_on_the_stand(self):
+        link = simlink.SimLink()
+        link.values = {"latitude": 31.0, "longitude": 121.0, "altitude": 20.0,
+                       "groundspeed": 0.0, "on_ground": 1, "xpdr_state": 1}
+        self.assertEqual(link.snapshot()["xpdr_mode"], simlink.XPDR_STANDBY)
+
+
 class PollResultTest(unittest.TestCase):
     """在主菜单里读不到位置是常态，不该把 SimConnect 连接推倒重来。
 

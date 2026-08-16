@@ -36,6 +36,12 @@ RETRY_INTERVAL = 3.0        # 连不上时隔多久再试
 STALE_AFTER = 3.0           # 超过这么久取不到数据就认为断了
 POLL_INTERVAL = 0.2         # 取数据的间隔，和位置包的 5 Hz 对齐
 
+# snapshot 里 xpdr_mode 的两个取值。fsdpilot 拿 >= 2 判在线，见 xpdr_mode()。
+XPDR_ONLINE = 2
+XPDR_STANDBY = 1
+# 判"停着"的地速门槛（节）。和 fsdpilot 降低位置包频率用的是同一条线。
+PARKED_SPEED_KT = 1
+
 # SimVar 名字 -> 我们内部的键。值都通过 AircraftRequests.get() 取。
 # 名字必须和 SimConnect 的 SimVar 完全一致，写错了 get() 返回 None。
 # 单位不是猜的：Python-SimConnect 的 RequestList.py 为每个 SimVar 写死了请求
@@ -124,6 +130,36 @@ def bcd_to_squawk(raw):
             return 2000
         digits = digits * 10 + digit
     return digits
+
+
+def xpdr_mode(state, on_ground, groundspeed_kt):
+    """TRANSPONDER STATE -> 位置包要的应答机模式。
+
+    SimVar 的取值是 0 关 1 待机 2 测试 3 开 4 高度(C) 5 地面，所以 >= 3 才是
+    真的在线。读不到（老机模没有这个 SimVar）沿用旧行为当在线。
+
+    待机和关只在飞机**确实停着**的时候才当真。冷舱的飞机不该在雷达上是个亮着
+    的 C 模式目标，而冷舱恰恰就是"停在机坪上没动"这一种情况——按这条线判，那
+    个意图一点没丢。反过来，一架已经在滑行或者已经离地的飞机还报待机，几乎都
+    是机模压根没把应答机旋钮接到这个 SimVar 上、它就一直停在 1 造成的；很多
+    默认机和非精细机都是这样，它们从头到尾都是待机。
+
+    这个区别在管制端不是小事。待机在 FSD 位置包里是包头的 `@S`，EuroScope 收到
+    就当成一个没有 C 模式的目标，标牌上的**高度和地速会一起空掉**——管制员看到
+    的现象就是"有的飞机读不到速度"。宁可让一架真按了待机的飞机多报一个 C 模式，
+    也不能让一架在飞的飞机从标牌上消失。
+    """
+    if state is None:
+        return XPDR_ONLINE
+    try:
+        state = int(state)
+    except (TypeError, ValueError):
+        return XPDR_ONLINE
+    if state >= 3:
+        return XPDR_ONLINE
+    if on_ground and groundspeed_kt < PARKED_SPEED_KT:
+        return XPDR_STANDBY
+    return XPDR_ONLINE
 
 
 class SimLink:
@@ -302,6 +338,8 @@ class SimLink:
             return None
 
         altitude = int(round(raw.get("altitude", 0.0)))
+        groundspeed = int(round(raw.get("groundspeed", 0.0)))
+        on_ground = bool(raw.get("on_ground", 0))
         return {
             # 经纬度已经是度。以前这里又 math.degrees 了一次，31.14 变成
             # 1784.2，服务端每个位置包都回 "Invalid latitude/longitude"，
@@ -312,20 +350,17 @@ class SimLink:
             "pressure_delta": pressure_delta(raw.get("indicated_altitude"),
                                              raw.get("baro_setting"), altitude),
             "agl": int(round(raw.get("agl", 0.0))),
-            "groundspeed": int(round(raw.get("groundspeed", 0.0))),
+            "groundspeed": groundspeed,
             "pitch": -math.degrees(raw.get("pitch", 0.0)),
             "bank": -math.degrees(raw.get("bank", 0.0)),
             "heading": math.degrees(raw.get("heading", 0.0)) % 360.0,
             "squawk": bcd_to_squawk(raw.get("squawk", 0x2000)),
-            # TRANSPONDER STATE >= 3（开/高度/地面）按在线报，其余按待机；
-            # 读不到（老机模）沿用旧行为当在线。冷舱的飞机不该在雷达上是个
-            # 亮着的 C 模式目标。
-            "xpdr_mode": (2 if raw.get("xpdr_state") is None
-                          or raw.get("xpdr_state", 4) >= 3 else 1),
+            # 待机只在飞机确实停着的时候当真，理由见 xpdr_mode()。
+            "xpdr_mode": xpdr_mode(raw.get("xpdr_state"), on_ground, groundspeed),
             "com1": self._frequency(raw.get("com1")),
             "com2": self._frequency(raw.get("com2")),
             "com1_power": True,
-            "on_ground": bool(raw.get("on_ground", 0)),
+            "on_ground": on_ground,
             # 下面这些是报给别人做动画用的
             "gear_down": bool(raw.get("gear", 1)),
             "flaps": max(0.0, min(1.0, raw.get("flaps", 0.0) / 100.0)),
