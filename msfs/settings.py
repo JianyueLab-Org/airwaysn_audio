@@ -21,8 +21,12 @@ FSD_PORT = 6809
 # 语音服务器的旧域名。mumble_host 是存进配置文件的，所以光换上面那个默认值
 # 只对全新安装有效——老用户的 json 里还是旧域名，等旧域名停掉那天他们看到的
 # 是"连不上语音服务器"，而设置界面上那一行看着完全正常。读配置时换掉。
-# 只认这一个旧值：用户自己填的别的地址是有意为之，不能动。
-OLD_MUMBLE_HOSTS = {"hjdczy.top"}
+# 只认这几个旧值：用户自己填的别的地址是有意为之，不能动。
+OLD_MUMBLE_HOSTS = {"hjdczy.top", "audio.airwaysn.org"}
+
+# FSD 服务端同理，而且这一条现在就在发生：airwaysn.org 整个域已经不解析了，
+# 老配置里的 fsd_host 不换掉就是连不上，报出来还是一个超时，看不出是域名的事。
+OLD_FSD_HOSTS = {"fsd.airwaysn.org"}
 
 DEFAULTS = {
     "cid": "",
@@ -107,6 +111,10 @@ class Settings:
             log.info("the voice server was renamed, using %s instead of %s",
                      MUMBLE_HOST, self.mumble_host)
             self.mumble_host = MUMBLE_HOST
+        if (self.fsd_host or "").strip().lower() in OLD_FSD_HOSTS:
+            log.info("the FSD server was renamed, using %s instead of %s",
+                     FSD_HOST, self.fsd_host)
+            self.fsd_host = FSD_HOST
         # 音量存坏了会让整条音频链路失灵，夹一下
         # `or 100` 会把用户特意拉到 0 的静音在重启后悄悄变回 100（麦克风
         # 开着而用户不知道）；0 是滑条上真实可取的值，只有 None/坏值才回默认

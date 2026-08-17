@@ -530,7 +530,7 @@ In both FSD clients the ninth `$ID` field (challenge) is deliberately omitted so
 
 No authorisation is shared: can-fsd checks the `division` roster before a controller may staff a position, but the voice server has no equivalent — any account that authenticates can join any `FREQ_*` channel.
 
-Naming has drifted across the three: can-web now calls the network **Cerulean Aviation Network (formerly AirwaySN)** and can-fsd takes its network name from `config.json`'s `version`, while this repo still hardcodes `airwaysn.org`, `data.airwaysn.org` and `audio.airwaysn.org` (the Mumble host, renamed from `hjdczy.top`).
+The naming has caught up: the network is **Cerulean Aviation Network (formerly AirwaySN)**, can-fsd takes its own name from `config.json`'s `version`, and this repo now hardcodes `ceruleanavi.net`, `data.ceruleanavi.net`, `fsd.ceruleanavi.net` and `audio.ceruleanavi.net` (the Mumble host, renamed from `hjdczy.top` and then from `audio.airwaysn.org`). **`airwaysn.org` no longer resolves at all**, which is why the rename could not stop at the defaults: `mumble_host`, `fsd_host`, `datafeed_url` and `config_url` are all *written back into the settings file*, so an existing install keeps using the dead domain and reports it as a connection timeout with every line in the settings dialog looking perfectly normal. `OLD_MUMBLE_HOSTS`/`OLD_FSD_HOSTS` in `xpc/settings.py` and `msfs/settings.py`, and `OLD_FSD_HOSTS`/`OLD_DATAFEED_URLS`/`OLD_CONFIG_URLS` in `atis/settings.py`, rewrite exactly those old values on load and leave anything else alone — a member who pointed a client at a test server or an intranet mirror meant it.
 
 ## Reference docs
 

@@ -908,13 +908,42 @@ class SettingsTest(unittest.TestCase):
 
     def test_migrates_the_voice_host_away(self):
         # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
-        # 语音服务器换过域名，新旧两个都得认：旧的还留在老配置里，新的是
-        # 同一个人下次还会填错的那个。
-        for host in ("hjdczy.top", "audio.ceruleanavi.net"):
+        # 语音服务器换过两次域名，三个都得认：前两个还留在老配置里，最后
+        # 一个是同一个人下次还会填错的那个。
+        for host in ("hjdczy.top", "audio.airwaysn.org", "audio.ceruleanavi.net"):
             with self.subTest(host=host):
                 self.write({"fsd_host": host})
                 self.assertEqual(self.module.Settings().fsd_host,
                                  "fsd.ceruleanavi.net")
+
+    def test_migrates_the_dead_domain(self):
+        """airwaysn.org 停用后，老配置里存下来的地址要换到新域名。
+
+        这三个字段都是**写回配置文件**的，所以只改模块里的默认值对老用户
+        没有任何作用——他们的 json 里还是 airwaysn.org，而那个域已经不解析，
+        通播会一边"设置看着正常"一边什么都取不到。
+        """
+        self.write({
+            "fsd_host": "fsd.airwaysn.org",
+            "datafeed_url": "https://data.airwaysn.org/v1/data.json",
+            "config_url": "https://airwaysn.org/api/v1/atis/config",
+        })
+        settings = self.module.Settings()
+        self.assertEqual(settings.fsd_host, "fsd.ceruleanavi.net")
+        self.assertEqual(settings.datafeed_url,
+                         "https://data.ceruleanavi.net/v1/data.json")
+        self.assertEqual(settings.config_url,
+                         "https://ceruleanavi.net/api/v1/atis/config")
+
+    def test_keeps_a_deliberate_url_override(self):
+        # 自己指到内网镜像或测试服是有意为之，不能替他改掉
+        self.write({"datafeed_url": "http://127.0.0.1:20350/v1/data.json",
+                    "config_url": "http://127.0.0.1:4321/api/v1/atis/config"})
+        settings = self.module.Settings()
+        self.assertEqual(settings.datafeed_url,
+                         "http://127.0.0.1:20350/v1/data.json")
+        self.assertEqual(settings.config_url,
+                         "http://127.0.0.1:4321/api/v1/atis/config")
 
     def test_keeps_a_deliberate_override(self):
         self.write({"fsd_host": "127.0.0.1", "fsd_port": 16809})
