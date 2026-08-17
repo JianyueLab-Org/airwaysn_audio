@@ -2,7 +2,7 @@
 
 1. **本人此刻在管什么席位** —— 管制员在 EuroScope 那边上了席位之后，语音这边
    不该再手动敲一遍频率。按 CID 在 `controllers[]` 里找自己，把频率捡回来。
-2. **CID 到呼号的对照表** —— Mumble 的用户名就是纯数字的 ASN 号（server/login.py
+2. **CID 到呼号的对照表** —— Mumble 的用户名就是纯数字的 CAN 号（server/login.py
    就是这么发 id 的），所以语音层报上来的"谁在说话"是个数字。"最后通话: 1005"
    对管制员没有任何意义，要显示成 "CES2345"。
 
@@ -21,12 +21,12 @@ import radiostack
 
 log = logging.getLogger("datafeed")
 
-DEFAULT_DATAFEED_URL = "https://data.airwaysn.org/v1/data.json"
+DEFAULT_DATAFEED_URL = "https://data.ceruleanavi.net/v1/data.json"
 
 # 数据源前面挡着 Cloudflare，非浏览器形态的 User-Agent 一律 403
-# （"airwaysn-controller"、"python-urllib/x.y" 都被拒）。带上 Mozilla 前缀才放行，
+# （"can-controller"、"python-urllib/x.y" 都被拒）。带上 Mozilla 前缀才放行，
 # 后面仍然标明自己是谁。
-_USER_AGENT = "Mozilla/5.0 (compatible; AirwaysnController/1.0)"
+_USER_AGENT = "Mozilla/5.0 (compatible; CanController/1.0)"
 
 FACILITY_OBSERVER = 0
 # can-fsd 用这个频率表示"没设频率"。拿它去拼 FREQ_ 频道会得到一个谁也不在的

@@ -46,7 +46,7 @@ DEV = True
 DEV_BUILD = 1
 
 # CI 用它把算出来的版本号传进打包过程（gui.spec 会调 freeze()）。
-VERSION_ENV = "AIRWAYSN_VERSION"
+VERSION_ENV = "CAN_VERSION"
 
 BUILDINFO_NAME = "buildinfo.json"
 
@@ -164,7 +164,7 @@ def full():
 def freeze(target_dir, source_dir=None):
     """打包时把版本号和当前 git 状态写进 target_dir/buildinfo.json。
 
-    给 gui.spec 调用。版本号优先取环境变量 AIRWAYSN_VERSION——CI 推到 main
+    给 gui.spec 调用。版本号优先取环境变量 CAN_VERSION——CI 推到 main
     之后会算出下一个补丁号（v2.1.xxx 里的 xxx）并从那里传进来；本地打包没设
     这个变量，就用 VERSION。
 

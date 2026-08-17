@@ -1120,14 +1120,14 @@ class VoiceHostTest(unittest.TestCase):
             json.dump(data, f)
 
     def test_default_voice_host(self):
-        self.assertEqual(self.module.MUMBLE_HOST, "audio.airwaysn.org")
+        self.assertEqual(self.module.MUMBLE_HOST, "audio.ceruleanavi.net")
         self.assertEqual(self.module.Settings(self.path).mumble_host,
-                         "audio.airwaysn.org")
+                         "audio.ceruleanavi.net")
 
     def test_migrates_the_old_domain(self):
         self.write({"mumble_host": "hjdczy.top"})
         self.assertEqual(self.module.Settings(self.path).mumble_host,
-                         "audio.airwaysn.org")
+                         "audio.ceruleanavi.net")
 
     def test_keeps_a_deliberate_override(self):
         # 自己指了别的服务器（测试服、局域网）是有意为之，不能替他改掉

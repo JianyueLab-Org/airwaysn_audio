@@ -13,7 +13,7 @@ import urllib.request
 log = logging.getLogger("weather")
 
 DEFAULT_METAR_URL = "https://metar.vatsim.net/metar.php?id="
-_USER_AGENT = "airwaysn-atis"
+_USER_AGENT = "can-atis"
 
 # 气象源在 CDN 后面，偶发一次连接/TLS 抖动是常事。默认自动重试一次：一次抖动
 # 不该让这个席位整整一个刷新周期（默认 300 秒）都没有天气。

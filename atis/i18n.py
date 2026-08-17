@@ -128,8 +128,8 @@ TEXT = {
                              "en": "Stop broadcasting on this position first"},
 
     # ---------- 从网络取配置 ----------
-    "netconfig.fetching":   {"zh": "正在从 airwaysn 取通播配置…",
-                             "en": "Fetching the ATIS configuration from airwaysn…"},
+    "netconfig.fetching":   {"zh": "正在从 can 取通播配置…",
+                             "en": "Fetching the ATIS configuration from can…"},
     "netconfig.failed":     {"zh": "取配置失败", "en": "Could not fetch the configuration"},
     "netconfig.header":     {"zh": "网络配置 {label}，共 {count} 个席位",
                              "en": "Network configuration {label}, {count} position(s)"},
@@ -242,9 +242,9 @@ TEXT = {
     # 包大小是可有可无的一段，所以单独成键——括号的写法两种语言不一样，
     # 写死在 body 的参数里会让英文界面出现一对中文全角括号。
     "update.size":          {"zh": "（{size}）", "en": " ({size})"},
-    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+    "update.detail":        {"zh": "下载走的是 can 自己的服务器，不直接连 GitHub。\n"
                                    "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
-                             "en": "The download comes from airwaysn's own server, not "
+                             "en": "The download comes from can's own server, not "
                                    "from GitHub.\nUnzip it over the old folder — your "
                                    "settings are not in there."},
     "update.download":      {"zh": "下载", "en": "Download"},
@@ -252,10 +252,10 @@ TEXT = {
     "update.skip":          {"zh": "跳过这个版本", "en": "Skip this version"},
     "update.later":         {"zh": "以后再说", "en": "Later"},
     "update.check":         {"zh": "检查更新", "en": "Check for updates"},
-    "update.check_tip":     {"zh": "看看有没有新版本。下载走 airwaysn 自己的服务器，"
+    "update.check_tip":     {"zh": "看看有没有新版本。下载走 can 自己的服务器，"
                                    "不直接连 GitHub",
                              "en": "See whether a newer version is out. The download "
-                                   "comes from airwaysn's own server, not from GitHub"},
+                                   "comes from can's own server, not from GitHub"},
     "update.current":       {"zh": "已经是最新版本（{version}）。",
                              "en": "You are on the latest version ({version})."},
     # 值班时不弹模态框，只在状态栏挂一句，理由见 gui.py
@@ -479,7 +479,7 @@ def system_language():
     """猜系统语言，第一次启动时用。猜不出来就用默认。"""
     try:
         # 环境变量优先，方便测试和命令行覆盖
-        for name in ("AIRWAYSN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
+        for name in ("CAN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
             value = os.environ.get(name)
             if value:
                 code = value.split(".")[0].split("_")[0].lower()

@@ -1,8 +1,8 @@
 """从 can-web 取全网通播配置，并进本地。
 
-    GET https://airwaysn.org/api/v1/atis/config
+    GET https://ceruleanavi.net/api/v1/atis/config
 
-**这才是"从网上取配置"，和「取在线席位」不是一回事。** 数据源（data.airwaysn.org
+**这才是"从网上取配置"，和「取在线席位」不是一回事。** 数据源（data.ceruleanavi.net
 的 `atis[]`）给的是此刻谁在播，只有机场和频率，是运行状态；这个接口给的是配置
 本身——席位、频率、跑道构型预设、模板、中文播报用词。以前网络上确实没有这种
 东西，每个人都得把同样的模板和中文跑道词手打一遍，改了也传不到别人那里。
@@ -39,11 +39,11 @@ from profile import Station
 
 log = logging.getLogger("netconfig")
 
-DEFAULT_CONFIG_URL = "https://airwaysn.org/api/v1/atis/config"
+DEFAULT_CONFIG_URL = "https://ceruleanavi.net/api/v1/atis/config"
 
-# 和 datafeed.py 同一个原因：airwaysn.org 前面挡着 Cloudflare，
+# 和 datafeed.py 同一个原因：ceruleanavi.net 前面挡着 Cloudflare，
 # 非浏览器形态的 User-Agent 会被 403。带 Mozilla 前缀放行，后面照实说自己是谁。
-_USER_AGENT = "Mozilla/5.0 (compatible; AirwaysnATIS/1.0)"
+_USER_AGENT = "Mozilla/5.0 (compatible; CanATIS/1.0)"
 
 
 class NetConfigError(Exception):

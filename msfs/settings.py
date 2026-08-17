@@ -14,8 +14,8 @@ log = logging.getLogger("settings")
 
 SETTINGS_FILE = "msfs_settings.json"
 
-MUMBLE_HOST = "audio.airwaysn.org"
-FSD_HOST = "fsd.airwaysn.org"
+MUMBLE_HOST = "audio.ceruleanavi.net"
+FSD_HOST = "fsd.ceruleanavi.net"
 FSD_PORT = 6809
 
 # 语音服务器的旧域名。mumble_host 是存进配置文件的，所以光换上面那个默认值
@@ -63,7 +63,7 @@ DEFAULTS = {
     "render_traffic": True,
     "package_roots": [],
     "traffic_range_nm": 60,
-    # 更新检查。启动时问一次 airwaysn 有没有新版；查到了也只是弹一句，
+    # 更新检查。启动时问一次 can 有没有新版；查到了也只是弹一句，
     # 装不装由用户决定。skipped_version 记住"这一版我不要"，免得每次
     # 启动再问一遍——那和自动更新一样烦人，只是烦得更频繁。
     "update_check": True,

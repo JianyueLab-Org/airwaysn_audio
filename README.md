@@ -1,6 +1,6 @@
 # airwaysn_audio
 
-Cerulean Aviation Network（原 AirwaySN）的**语音层**。基于 Mumble：飞行员的模拟器
+Cerulean Aviation Network（原 Cerulean Aviation Network）的**语音层**。基于 Mumble：飞行员的模拟器
 COM1 频率决定他坐在哪个 Mumble 频道，管制员用一个电台栈同时守听/发话多个频率，
 情报通播由服务端的机器人把合成语音播到各自的频率上。
 
@@ -151,12 +151,12 @@ docker compose pull && docker compose up -d             # 升级
 本地不用 compose 也行：
 
 ```bash
-docker build -t airwaysn-audio-server .
-docker run -d --name airwaysn-server --restart unless-stopped \
+docker build -t can-audio-server .
+docker run -d --name can-server --restart unless-stopped \
   -p 64738:64738/tcp -p 64738:64738/udp \
-  -v airwaysn-mumble:/var/lib/mumble-server \
+  -v can-mumble:/var/lib/mumble-server \
   -e MUMBLE_SUPERUSER_PASSWORD=换成你自己的 \
-  airwaysn-audio-server
+  can-audio-server
 ```
 
 **CI 里那步冒烟不是走过场**：这个镜像的失败模式全是"构建成功、运行时才发现"

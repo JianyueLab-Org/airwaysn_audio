@@ -177,7 +177,7 @@ class SystemLanguageTest(unittest.TestCase):
 
     def setUp(self):
         self._env = {k: os.environ.get(k)
-                     for k in ("AIRWAYSN_LANG", "LANGUAGE", "LC_ALL", "LANG")}
+                     for k in ("CAN_LANG", "LANGUAGE", "LC_ALL", "LANG")}
 
     def tearDown(self):
         for key, value in self._env.items():
@@ -187,11 +187,11 @@ class SystemLanguageTest(unittest.TestCase):
                 os.environ[key] = value
 
     def test_environment_wins(self):
-        os.environ["AIRWAYSN_LANG"] = "en"
+        os.environ["CAN_LANG"] = "en"
         self.assertEqual(i18n.system_language(), "en")
 
     def test_locale_style_values_are_understood(self):
-        os.environ["AIRWAYSN_LANG"] = "zh_CN.UTF-8"
+        os.environ["CAN_LANG"] = "zh_CN.UTF-8"
         self.assertEqual(i18n.system_language(), "zh")
 
     def test_an_unsupported_locale_is_never_returned_verbatim(self):
@@ -200,7 +200,7 @@ class SystemLanguageTest(unittest.TestCase):
         往下退到系统语言是对的——环境说法语、系统是英语时，英语比中文更接近
         用户想要的，所以这里不断言一定是 DEFAULT，只断言结果必须是支持的语言。
         """
-        for key in ("AIRWAYSN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
+        for key in ("CAN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
             os.environ[key] = "fr_FR.UTF-8"
         result = i18n.system_language()
         self.assertNotEqual(result, "fr")

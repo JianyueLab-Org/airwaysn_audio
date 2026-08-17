@@ -1,9 +1,9 @@
 """查有没有新版。查到了也只是**告诉用户**，更不更新由他决定。
 
-    GET https://airwaysn.org/api/v1/clients/latest?client=xpc-for-can&version=2.0.1
+    GET https://ceruleanavi.net/api/v1/clients/latest?client=xpc-for-can&version=2.0.1
 
 为什么不直接问 GitHub：大陆连 github.com 很不稳，60 MB 的包经常下到一半就断，
-而 airwaysn.org 是成员本来就连得上的（通播配置就是从那儿取的）。所以查询和
+而 ceruleanavi.net 是成员本来就连得上的（通播配置就是从那儿取的）。所以查询和
 下载都走自己的服务器——服务端那个 `/api/v1/clients/download/…` 是把 GitHub 的
 资产中转出来，不是另存一份。
 
@@ -28,11 +28,11 @@ import urllib.request
 
 log = logging.getLogger("update")
 
-DEFAULT_UPDATE_URL = "https://airwaysn.org/api/v1/clients/latest"
+DEFAULT_UPDATE_URL = "https://ceruleanavi.net/api/v1/clients/latest"
 
-# 和 datafeed.py / netconfig.py 同一个原因：airwaysn.org 前面挡着 Cloudflare。
+# 和 datafeed.py / netconfig.py 同一个原因：ceruleanavi.net 前面挡着 Cloudflare。
 # 实测 /api/* 不会被挑战（HTML 页面会），但 UA 还是照着已有的写法来。
-_USER_AGENT = "Mozilla/5.0 (compatible; AirwaysnClient/1.0)"
+_USER_AGENT = "Mozilla/5.0 (compatible; CanClient/1.0)"
 
 
 class Update:

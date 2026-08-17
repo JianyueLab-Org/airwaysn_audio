@@ -1,14 +1,14 @@
-# Airwaysn 语音服务端：Mumble/Murmur + Ice 认证器（server/login.py）。
+# Can 语音服务端：Mumble/Murmur + Ice 认证器（server/login.py）。
 #
-#   docker build -t airwaysn-audio-server .
-#   docker run -d --name airwaysn-server --restart unless-stopped \
+#   docker build -t can-audio-server .
+#   docker run -d --name can-server --restart unless-stopped \
 #     -p 64738:64738/tcp -p 64738:64738/udp \
-#     -v airwaysn-mumble:/var/lib/mumble-server \
+#     -v can-mumble:/var/lib/mumble-server \
 #     -e MUMBLE_SUPERUSER_PASSWORD=换成你自己的 \
-#     airwaysn-audio-server
+#     can-audio-server
 #
-#   docker logs -f airwaysn-server
-#   docker exec airwaysn-server python3 fix_acl.py --apply    # 头一次要跑
+#   docker logs -f can-server
+#   docker exec can-server python3 fix_acl.py --apply    # 头一次要跑
 #
 # 四件和直觉相反的事，都写在这里免得下次再踩：
 #
@@ -71,7 +71,7 @@ RUN if [ "$WITH_ATIS" = "1" ]; then \
             pymumble numpy edge-tts tabulate; \
     fi
 
-# 探路径 + 校验版本，结果写进 /etc/airwaysn/paths.env 给 start.sh 用。
+# 探路径 + 校验版本，结果写进 /etc/can/paths.env 给 start.sh 用。
 #
 # 三处都不能写死：1.5 的 ini 在 /etc/mumble/mumble-server.ini，1.3 在
 # /etc/mumble-server.ini；slice 文件的位置和名字也随版本变（1.5 起 Murmur.ice
@@ -81,7 +81,7 @@ RUN if [ "$WITH_ATIS" = "1" ]; then \
 # usage，从那里 grep 数字什么都可能抓到。注意 dpkg 版本可能带 epoch（1:1.5.735）
 # 和 debian 后缀（-2build1），grep 只取中间的语义版本。
 RUN set -eu; \
-    mkdir -p /etc/airwaysn /app/server; \
+    mkdir -p /etc/can /app/server; \
     ver="$(dpkg-query -W -f '${Version}' mumble-server 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"; \
     if [ -z "$ver" ]; then \
         echo "读不出 mumble-server 的版本号（不是 dpkg 装的？），跳过版本校验" >&2; \
@@ -108,7 +108,7 @@ RUN set -eu; \
     [ -n "$slice" ] || { echo "找不到 Mumble 的 Ice slice 文件" >&2; exit 1; }; \
     inc=""; [ -d /usr/share/ice/slice ] && inc="-I/usr/share/ice/slice"; \
     slice2py $inc --output-dir /app/server "$slice"; \
-    printf 'MUMBLE_INI=%s\nMUMBLE_VERSION=%s\n' "$ini" "$ver" > /etc/airwaysn/paths.env; \
+    printf 'MUMBLE_INI=%s\nMUMBLE_VERSION=%s\n' "$ini" "$ver" > /etc/can/paths.env; \
     echo "ini=$ini slice=$slice version=$ver"
 
 # 改 ini：Ice 只听回环，日志走 stdout（logfile 留空 Murmur 就往控制台打，否则
@@ -124,7 +124,7 @@ RUN set -eu; \
 # 先把所有 ice= 行删干净（重复的 key QSettings 取最后一个），再插到第 1 行，
 # 那里一定在任何节之前。
 RUN set -eu; \
-    . /etc/airwaysn/paths.env; \
+    . /etc/can/paths.env; \
     sed -i '/^#\?ice=/d; /^#\?logfile=/d' "$MUMBLE_INI"; \
     awk 'BEGIN { print "ice=\"tcp -h 127.0.0.1 -p 6502\""; print "logfile=" } { print }' \
         "$MUMBLE_INI" > "$MUMBLE_INI.new"; \

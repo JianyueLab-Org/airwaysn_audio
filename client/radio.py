@@ -26,7 +26,7 @@ import pygame  # pygame导入必须在设置环境变量之后
 log = logging.getLogger("无线电")
 
 # 配置服务器信息
-SERVER_HOST = "audio.airwaysn.org"  # Mumble服务器地址
+SERVER_HOST = "audio.ceruleanavi.net"  # Mumble服务器地址
 USERNAME = ""    # 用户名
 PASSWORD = ""             # 密码（如果需要）
 

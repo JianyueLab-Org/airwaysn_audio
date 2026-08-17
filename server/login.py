@@ -1,5 +1,5 @@
 # 处理mumble的登录逻辑
-# https://airwaysn.org/api/v1/public/auth
+# https://ceruleanavi.net/api/v1/public/auth
 # json:{ "cid":"1000", "password": "1234"}
 # 正确返回200，错误返回400
 #
@@ -35,7 +35,7 @@ SERVER_ID = 1
 # 整台服务器的语音认证全部瘫痪，而进程看起来完全正常。
 HTTP_TIMEOUT = 10
 # 网络层面的失败重试一次。注意只重试连不上/超时，不重试接口明确回的 4xx：
-# can-web 那边按 ASN 对认证失败限流，把明确的拒绝再打一遍等于自己锁自己。
+# can-web 那边按 CAN 对认证失败限流，把明确的拒绝再打一遍等于自己锁自己。
 HTTP_RETRIES = 1
 HTTP_RETRY_DELAY = 0.5
 
@@ -72,7 +72,7 @@ def user_id_for(name):
     通播账号给出的答案不一样（一个 118000，一个 -2），而这种不一致不会有任何
     报错，只会让按名字配的权限静默落空。
 
-    普通用户：id 就是 ASN 号，所以 Mumble 用户名必须是纯数字。
+    普通用户：id 就是 CAN 号，所以 Mumble 用户名必须是纯数字。
     通播账号：id 是频率那六位，这样同一个人在不同频率上开的多个通播不会互相
     顶掉（同名踢人是按名字判的，名字里带着频率）。代价是不同 cid 在**同一个**
     频率上开通播会拿到同一个 id——这个取舍是全网约定的一部分，见 CLAUDE.md。
@@ -201,7 +201,7 @@ class AuthenticatorI(MumbleIce.ServerAuthenticator):
         """用户 id → 名字。
 
         **通播账号这条路是还不回去的**，不是没写：id 取的是频率六位，cid 那
-        一截在 authenticate 里就丢了，118000 既可能是 ASN 118000 也可能是
+        一截在 authenticate 里就丢了，118000 既可能是 CAN 118000 也可能是
         118.000 上的某个通播。这里只能给出数字本身。Murmur 拿它做的是显示和
         ACL 反查，当前部署（根 ACL 只用 all 组）碰不到这条路。真要能反查，
         得先改 id 的算法，而那个算法是全网约定，见 CLAUDE.md。
@@ -254,10 +254,10 @@ class ServerCallbackI(MumbleIce.ServerCallback):
         pass
 
 
-url = "https://airwaysn.org/api/v1/public/auth"
+url = "https://ceruleanavi.net/api/v1/public/auth"
 
 # 上游接口的三种结果。"验证不了"必须和"密码不对"分开：前者再试一次就好，
-# 后者再试多少遍都一样，而且会被 can-web 按 ASN 计进限流。
+# 后者再试多少遍都一样，而且会被 can-web 按 CAN 计进限流。
 VERIFY_OK = "ok"
 VERIFY_REJECTED = "rejected"
 VERIFY_UNREACHABLE = "unreachable"
@@ -317,7 +317,7 @@ def login_ATIS(name, password):
     """ATIS 登录，用户名形如 DDDD_atisDDDDDD。
 
     **这条路径不能去掉**，哪怕服务端一台通播机都不跑：管制员手里的桌面通播
-    客户端（atis/，打包成 airwaysn-atis）登录用的就是 `{自己的cid}_atis{频率}`，
+    客户端（atis/，打包成 can-atis）登录用的就是 `{自己的cid}_atis{频率}`，
     走的正是这里。cid 部分照常拿去上游接口验，和普通用户一样。
 
     以前这里还有一条保留账号的旁路，给 server/ATIS/ 那队服务端通播机免验证用。

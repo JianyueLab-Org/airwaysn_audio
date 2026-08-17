@@ -161,7 +161,7 @@ jobs:
         working-directory: ${{ matrix.component }}
         env:
           # version.freeze() 读它，写进 buildinfo.json；界面和日志显示的就是它
-          AIRWAYSN_VERSION: ${{ needs.version.outputs.number }}
+          CAN_VERSION: ${{ needs.version.outputs.number }}
         # 必须在组件目录里跑：spec 里 favicon.ico、opus.dll 都是相对路径
         run: pyinstaller gui.spec --noconfirm --clean
 

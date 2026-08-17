@@ -157,7 +157,7 @@ class RenderedAircraft:
 class PythonInterface:
     def XPluginStart(self):
         self.Name = "XPC for CAN Traffic"
-        self.Sig = "org.airwaysn.xpc.traffic"
+        self.Sig = "org.can.xpc.traffic"
         self.Desc = "把 Cerulean 网络上的其他飞机画进 X-Plane，并送进 TCAS"
 
         self.socket = None

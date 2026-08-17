@@ -816,7 +816,7 @@ class MsfsWindow(QMainWindow):
             voice = self.voice
             self.voice = None
             # 也要真的收掉。只把引用置空的话，PyAudio 还占着麦克风、pymumble
-            # 还在后台重连，而服务端 login.py 对认证失败按 ASN ID 限流。
+            # 还在后台重连，而服务端 login.py 对认证失败按 CAN ID 限流。
             if voice:
                 threading.Thread(target=voice.stop, daemon=True).start()
             self.connect_button.setText(

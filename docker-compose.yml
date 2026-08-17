@@ -22,7 +22,7 @@ services:
     # 服务器上那等于要有完整仓库、还要慢慢 apt 一遍——而且悄无声息，你以为
     # 部的是 CI 出的那个镜像。always 把它拧回"拉"，--build 仍然可以显式压过。
     pull_policy: always
-    container_name: airwaysn-server
+    container_name: can-server
     # login.py 察觉和 Murmur 的链路断了会主动退出，start.sh 跟着整个退出，
     # 全靠这一行把它拉起来重新注册认证器。见 server/start.sh 开头的说明。
     restart: unless-stopped
@@ -53,7 +53,7 @@ services:
   # 用的是另一个镜像（WITH_ATIS=1 才装 pymumble / numpy / edge-tts / ffmpeg /
   # libopus0），只能本地构建，GHCR 上那个不带这些。
   #
-  # 它连的是公网上的 audio.airwaysn.org（mumble.py 里写死的），不是上面那个容器，
+  # 它连的是公网上的 audio.ceruleanavi.net（mumble.py 里写死的），不是上面那个容器，
   # 所以两者没有启动顺序关系。
   atis:
     profiles: [atis]
@@ -61,8 +61,8 @@ services:
       context: .
       args:
         WITH_ATIS: "1"
-    image: airwaysn-atis-bots:local
-    container_name: airwaysn-atis
+    image: can-atis-bots:local
+    container_name: can-atis
     restart: unless-stopped
     working_dir: /app/server/ATIS
     command: ["python3", "-u", "mumble.py"]

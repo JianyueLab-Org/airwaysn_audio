@@ -52,8 +52,8 @@ from settings import Settings, SettingsDialog
 
 log = logging.getLogger("gui")
 
-# 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.airwaysn.org:6809）。
-SERVER = "audio.airwaysn.org"
+# 语音（Mumble）服务器。FSD 是另一台，地址在设置里（fsd.ceruleanavi.net:6809）。
+SERVER = "audio.ceruleanavi.net"
 
 # 外观在 theme.py 里，四个客户端共用一份——它们多半并排开着，长得不一样会很跳。
 # 这里只把用到的名字取出来，**不要在这个文件里再写死任何 #rrggbb**。
@@ -383,7 +383,7 @@ class AtisWindow(QMainWindow):
         config_button = PushButton(t("main.net_config"))
         config_button.setIcon(FluentIcon.CLOUD_DOWNLOAD)
         config_button.setToolTip(
-            '从 airwaysn 取全网通播配置：席位、频率、跑道构型预设、模板和中文'
+            '从 can 取全网通播配置：席位、频率、跑道构型预设、模板和中文'
             '播报用词。本地已有的席位默认不动，可以选择用网络版覆盖。')
         config_button.clicked.connect(self.update_from_network)
         buttons_layout.addWidget(config_button)

@@ -49,7 +49,7 @@ class Settings:
         self.compact = False
         # 界面语言。空字符串表示"还没选过"，第一次启动跟系统走
         self.language = ""
-        # 更新检查：启动时问一次 airwaysn 有没有新版，装不装由用户决定。
+        # 更新检查：启动时问一次 can 有没有新版，装不装由用户决定。
         # skipped_version 记住"这一版我不要"，免得每次启动再问一遍。
         self.update_check = True
         self.skipped_version = ""

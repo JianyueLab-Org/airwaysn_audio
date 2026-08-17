@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 的电台栈**（于是 "应该有两部电台" 在你存过频率时必然失败），跑完还会把它清空。
 # gui.resource_path 走的是 __file__，applog 这里也没启动，所以换目录是安全的。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.chdir(tempfile.mkdtemp(prefix="airwaysn-smoke-"))
+os.chdir(tempfile.mkdtemp(prefix="can-smoke-"))
 
 # pymumble 需要本机的 opus 原生库来编解码音频。这里不碰音频，缺库时放个替身
 # 让导入过去；pymumble 本身仍然是真的。
@@ -326,7 +326,7 @@ def main():
     def resolves_cid_to_callsign():
         """语音层报上来的是纯数字 CID，界面上要显示成呼号。"""
         khz = sorted(r.frequency_khz for r in window.stack)[0]
-        window.on_voice_rx(khz, True, "2001")          # Mumble 用户名 = ASN 号
+        window.on_voice_rx(khz, True, "2001")          # Mumble 用户名 = CAN 号
         window.on_datafeed(feed(pilots=[
             {"cid": "2001", "callsign": "CES2345", "name": "某人"}]))
         text = window.rows[khz].last_rx.text()
