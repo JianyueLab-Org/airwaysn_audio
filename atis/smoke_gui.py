@@ -13,14 +13,14 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 界面语言钉死，断言才有确定的结果。不钉的话，第一次启动是跟系统走的，在英文
 # 系统上跑这个脚本，所有比中文字面量的断言都会失败。
-os.environ.setdefault("AIRWAYSN_LANG", "zh")
+os.environ.setdefault("CAN_LANG", "zh")
 
 # 挪到临时目录再跑。Profile / Settings 的路径都是相对当前目录的裸文件名，直接在
 # atis 目录下跑的话，这个测试会**读到并写坏使用者真实的 atis_profile.json**——
 # "添加两个席位" 在你已经配过席位时必然失败（呼号重复），跑完还会把它覆盖掉。
 # airports.py 和图标走的都是 __file__ / sys._MEIPASS，所以换目录是安全的。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.chdir(tempfile.mkdtemp(prefix="airwaysn-atis-smoke-"))
+os.chdir(tempfile.mkdtemp(prefix="can-atis-smoke-"))
 
 # pymumble 需要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
 try:
@@ -266,7 +266,7 @@ def main():
         original = netconfig.fetch
 
         def boom(url=None, timeout=15):
-            raise netconfig.NetConfigError("连不上 airwaysn（测试）")
+            raise netconfig.NetConfigError("连不上 can（测试）")
         netconfig.fetch = boom
         try:
             window.update_from_network()

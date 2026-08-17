@@ -36,7 +36,7 @@ TEXT = {
     "app.name":             {"zh": "Audio for CAN", "en": "Audio for CAN"},
 
     # ---------- 登录 ----------
-    "login.username":       {"zh": "用户名（ASN 号）", "en": "Username (ASN ID)"},
+    "login.username":       {"zh": "用户名（CAN 号）", "en": "Username (CAN ID)"},
     "login.password":       {"zh": "密码", "en": "Password"},
     "login.connect":        {"zh": "连接", "en": "Connect"},
     "login.connecting":     {"zh": "正在连接…", "en": "Connecting…"},
@@ -129,9 +129,9 @@ TEXT = {
     # 包大小是可有可无的一段，所以单独成键——括号的写法两种语言不一样，
     # 写死在 body 的参数里会让英文界面出现一对中文全角括号。
     "update.size":          {"zh": "（{size}）", "en": " ({size})"},
-    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+    "update.detail":        {"zh": "下载走的是 can 自己的服务器，不直接连 GitHub。\n"
                                    "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
-                             "en": "The download comes from airwaysn's own server, not "
+                             "en": "The download comes from can's own server, not "
                                    "from GitHub.\nUnzip it over the old folder — your "
                                    "settings are not in there."},
     "update.download":      {"zh": "下载", "en": "Download"},
@@ -290,7 +290,7 @@ def system_language():
     """猜系统语言，第一次启动时用。猜不出来就用默认。"""
     try:
         # 环境变量优先，方便测试和命令行覆盖
-        for name in ("AIRWAYSN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
+        for name in ("CAN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
             value = os.environ.get(name)
             if value:
                 code = value.split(".")[0].split("_")[0].lower()

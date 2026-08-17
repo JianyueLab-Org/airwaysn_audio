@@ -33,7 +33,7 @@ import pygame
 log = logging.getLogger("无线电")
 
 # ---------- 配置 ----------
-SERVER_HOST = "audio.airwaysn.org"
+SERVER_HOST = "audio.ceruleanavi.net"
 USERNAME = ""
 PASSWORD = ""
 # ---------- 音频采样率候选列表 ----------

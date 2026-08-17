@@ -903,18 +903,18 @@ class SettingsTest(unittest.TestCase):
             json.dump(data, f)
 
     def test_default_fsd_host(self):
-        self.assertEqual(self.module.Settings().fsd_host, "fsd.airwaysn.org")
+        self.assertEqual(self.module.Settings().fsd_host, "fsd.ceruleanavi.net")
         self.assertEqual(self.module.Settings().fsd_port, 6809)
 
     def test_migrates_the_voice_host_away(self):
         # 早期版本把语音服务器的地址填成了 FSD 地址，那台机器上没有 FSD。
         # 语音服务器换过域名，新旧两个都得认：旧的还留在老配置里，新的是
         # 同一个人下次还会填错的那个。
-        for host in ("hjdczy.top", "audio.airwaysn.org"):
+        for host in ("hjdczy.top", "audio.ceruleanavi.net"):
             with self.subTest(host=host):
                 self.write({"fsd_host": host})
                 self.assertEqual(self.module.Settings().fsd_host,
-                                 "fsd.airwaysn.org")
+                                 "fsd.ceruleanavi.net")
 
     def test_keeps_a_deliberate_override(self):
         self.write({"fsd_host": "127.0.0.1", "fsd_port": 16809})
@@ -1528,7 +1528,7 @@ class AtisStationsFromFeedTest(unittest.TestCase):
         """拿不到数据时给空列表。
 
         **data=None 不是"没有数据"，是"你自己去取"** —— atis_stations 会调
-        fetch()，也就是真的去连 data.airwaysn.org。这条断言原来直接写
+        fetch()，也就是真的去连 data.ceruleanavi.net。这条断言原来直接写
         data=None，于是网络上只要有人在播通播，它就拿回真实席位而不是空列表，
         CI 随机红一次（实测抓到的是 ZBSJ_ATIS 127.650）。测的本来就是"取不到
         数据"这条路，把 fetch 换成替身才是它的本意。
@@ -1980,7 +1980,7 @@ class ReconnectLimitTest(unittest.TestCase):
     """掉线之后最多重连三次，都失败就**这个席位**停播。
 
     以前是 `reconnect=True` 一路无限重试。通播这边尤其糟：所有席位都用同一个
-    保留账号（默认 900），而服务端 `login.py` 对认证失败按 ASN ID 限流——一个
+    保留账号（默认 900），而服务端 `login.py` 对认证失败按 CAN ID 限流——一个
     席位的僵尸连接足以把这台机器上其它席位的语音一起锁死。
 
     停播只停这一个席位：同一个客户端上的其它席位各有自己的连接。

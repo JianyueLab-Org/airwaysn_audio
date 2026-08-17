@@ -58,7 +58,7 @@ TEXT = {
     "connect.title":        {"zh": "连接", "en": "Connection"},
     "connect.callsign":     {"zh": "呼号", "en": "Callsign"},
     "connect.callsign_hint": {"zh": "如 CCA1501", "en": "e.g. CCA1501"},
-    "connect.cid":          {"zh": "ASN ID", "en": "ASN ID"},
+    "connect.cid":          {"zh": "CAN ID", "en": "CAN ID"},
     "connect.password":     {"zh": "密码", "en": "Password"},
     "connect.aircraft":     {"zh": "机型", "en": "Aircraft"},
     "connect.aircraft_hint": {"zh": "如 B738", "en": "e.g. B738"},
@@ -182,8 +182,8 @@ TEXT = {
     # ---------- 弹框 ----------
     "dialog.callsign_bad":  {"zh": "呼号不可用", "en": "Callsign not usable"},
     "dialog.missing":       {"zh": "缺少信息", "en": "Missing information"},
-    "dialog.missing_body":  {"zh": "请填写 ASN ID 和密码。",
-                             "en": "Enter your ASN ID and password."},
+    "dialog.missing_body":  {"zh": "请填写 CAN ID 和密码。",
+                             "en": "Enter your CAN ID and password."},
     "dialog.no_sim":        {"zh": "MSFS 未连接", "en": "MSFS not connected"},
     "dialog.no_sim_body":   {"zh": "还没有从 MSFS 收到数据。没有位置就无法把飞机"
                                    "报到网络上。\n\n仍然继续连接吗？",
@@ -221,9 +221,9 @@ TEXT = {
     # 包大小是可有可无的一段，所以单独成键——括号的写法两种语言不一样，
     # 写死在 body 的参数里会让英文界面出现一对中文全角括号。
     "update.size":          {"zh": "（{size}）", "en": " ({size})"},
-    "update.detail":        {"zh": "下载走的是 airwaysn 自己的服务器，不直接连 GitHub。\n"
+    "update.detail":        {"zh": "下载走的是 can 自己的服务器，不直接连 GitHub。\n"
                                    "下载完解压覆盖原来那个文件夹即可——设置不在里面。",
-                             "en": "The download comes from airwaysn's own server, not "
+                             "en": "The download comes from can's own server, not "
                                    "from GitHub.\nUnzip it over the old folder — your "
                                    "settings are not in there."},
     "update.download":      {"zh": "下载", "en": "Download"},
@@ -231,10 +231,10 @@ TEXT = {
     "update.skip":          {"zh": "跳过这个版本", "en": "Skip this version"},
     "update.later":         {"zh": "以后再说", "en": "Later"},
     "update.check":         {"zh": "检查更新", "en": "Check for updates"},
-    "update.check_tip":     {"zh": "看看有没有新版本。下载走 airwaysn 自己的服务器，"
+    "update.check_tip":     {"zh": "看看有没有新版本。下载走 can 自己的服务器，"
                                    "不直接连 GitHub",
                              "en": "See whether a newer version is out. The download "
-                                   "comes from airwaysn's own server, not from GitHub"},
+                                   "comes from can's own server, not from GitHub"},
     "update.current":       {"zh": "已经是最新版本（{version}）。",
                              "en": "You are on the latest version ({version})."},
     "msg.update_available": {"zh": "[更新] 有新版 {version}（已跳过）",
@@ -478,7 +478,7 @@ def system_language():
     """猜系统语言，第一次启动时用。猜不出来就用默认。"""
     try:
         # 环境变量优先，方便测试和命令行覆盖
-        for name in ("AIRWAYSN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
+        for name in ("CAN_LANG", "LANGUAGE", "LC_ALL", "LANG"):
             value = os.environ.get(name)
             if value:
                 code = value.split(".")[0].split("_")[0].lower()

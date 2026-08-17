@@ -661,7 +661,7 @@ class ReconnectTest(unittest.TestCase):
 class SyncStormTest(unittest.TestCase):
     """一阵栈变化不能变成一场建频道风暴。
 
-    真实日志（airwaysn-controller.log，13 小时）里的样子：建频道 202 次、
+    真实日志（can-controller.log，13 小时）里的样子：建频道 202 次、
     「已经不在了」180 次、进频道请求 40 次没有生效，其中 93 次建频道和上一次
     落在**同一秒**，最密的一分钟建了 34 次，服务器开始用 ChannelName（重名）
     回拒——而管制员那一晚一直留在根频道，听不到也发不出，界面全是绿的。
@@ -857,7 +857,7 @@ class ReconnectLimitTest(unittest.TestCase):
     """掉线之后最多重连三次，都失败就整个下线。
 
     以前是 `reconnect=True` 一路无限重试。后果不是"多试几次"：服务端
-    `login.py` 对认证失败**按 ASN ID 限流**，一个在后台不停重连的僵尸足以把这个
+    `login.py` 对认证失败**按 CAN ID 限流**，一个在后台不停重连的僵尸足以把这个
     账号的语音锁死——管制员把密码改对了也连不上，直到重启客户端。而界面那边只
     有一句"连接已断开"，没人能说清此刻到底还在不在连。
     """

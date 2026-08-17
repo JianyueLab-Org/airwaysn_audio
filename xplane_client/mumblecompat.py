@@ -163,7 +163,7 @@ def patch_send():
         log.warning("could not patch the pymumble send path: %s", e)
         return False
 
-    if getattr(Mumble.connect, "_airwaysn_guarded", False):
+    if getattr(Mumble.connect, "_can_guarded", False):
         return False
 
     original = Mumble.connect
@@ -177,7 +177,7 @@ def patch_send():
             log.warning("could not guard the control socket: %s", e)
         return state
 
-    connect._airwaysn_guarded = True
+    connect._can_guarded = True
     Mumble.connect = connect
     log.info("patched pymumble so a full send buffer no longer looks like a "
              "lost connection")

@@ -146,7 +146,7 @@ class RetryTest(UpstreamTestCase):
     def test_a_rejection_is_never_retried(self):
         """接口明确说不行就别再打了。
 
-        can-web 按 ASN 对认证失败限流，把明确的拒绝重发一遍等于自己把这个
+        can-web 按 CAN 对认证失败限流，把明确的拒绝重发一遍等于自己把这个
         账号往锁死里推——密码本来就错，重试也不会变对。
         """
         fake = self.upstream(Response(400, '{"error":"bad"}'))
@@ -283,7 +283,7 @@ class AuthenticateTest(UpstreamTestCase):
     def test_a_normal_atis_client_still_authenticates(self):
         """管制员手里的桌面通播客户端不能被误伤。
 
-        airwaysn-atis 登录用的是 `{自己的cid}_atis{频率}`，走的正是 login_ATIS。
+        can-atis 登录用的是 `{自己的cid}_atis{频率}`，走的正是 login_ATIS。
         清理保留账号那条旁路时，很容易顺手把整条 _atis 路径一起删掉——那样管制员
         的通播客户端会直接登不上，而这是个还在用的功能。
         """

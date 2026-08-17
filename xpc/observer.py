@@ -18,7 +18,7 @@
 
 **为什么不用 ATC 观察员（`#AA` + facility 0）那条路**：can-fsd 认这种登录，
 但它是 `IsATC`，会进 `/v1/data.json` 的 `controllers` 数组
-（`internal/api/datafeed.go` 的 `BuildDatafeed`），于是 radar.airwaysn.org
+（`internal/api/datafeed.go` 的 `BuildDatafeed`），于是 radar.ceruleanavi.net
 和每个飞行员端的"附近管制"列表里都会多出一个其实是别人副驾的席位。多收几条
 频率文字换全网管制列表被污染，不值。
 

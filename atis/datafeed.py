@@ -17,12 +17,12 @@ import urllib.request
 
 log = logging.getLogger("datafeed")
 
-DEFAULT_DATAFEED_URL = "https://data.airwaysn.org/v1/data.json"
+DEFAULT_DATAFEED_URL = "https://data.ceruleanavi.net/v1/data.json"
 
 # 数据源前面挡着 Cloudflare，非浏览器形态的 User-Agent 一律 403
-# （"airwaysn-atis"、"python-requests/x.y" 都被拒）。带上 Mozilla 前缀才放行，
+# （"can-atis"、"python-requests/x.y" 都被拒）。带上 Mozilla 前缀才放行，
 # 后面仍然标明自己是谁。
-_USER_AGENT = "Mozilla/5.0 (compatible; AirwaysnATIS/1.0)"
+_USER_AGENT = "Mozilla/5.0 (compatible; CanATIS/1.0)"
 
 
 def fetch(url=None, timeout=15):
@@ -78,7 +78,7 @@ _SUFFIXES = (("_D_ATIS", "departure"), ("_A_ATIS", "arrival"),
 def atis_stations(url=None, data=None):
     """数据源上此刻在线的通播席位，[(ICAO, 呼号, 频率, 类型)]。
 
-    **这不是"从 airwaysn 取配置"。** 配置在 can-web 的 `/api/v1/atis/config`，
+    **这不是"从 can 取配置"。** 配置在 can-web 的 `/api/v1/atis/config`，
     由 `netconfig.py` 取（席位、频率、跑道构型预设、模板、中文用词）。这里读的
     是 can-fsd 数据源里的 `atis[]`，那是**此刻在线的运行状态**：只有机场和
     频率，没有模板也没有预设。

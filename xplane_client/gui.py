@@ -222,7 +222,7 @@ class RadioGUI(QMainWindow):
         except Exception as e:
             log.error("Pygame初始化失败: %s", e)
 
-        self.setWindowTitle(f"无线电-Airwaysn (X-Plane) {version.full()}")
+        self.setWindowTitle(f"无线电-Can (X-Plane) {version.full()}")
         self.setMinimumSize(300, 200)
 
         self.stacked_widget = QStackedWidget()
@@ -379,7 +379,7 @@ class RadioGUI(QMainWindow):
             log.info("X-Plane 已发现 @ %s:%s，初始频率 %.3f MHz", addr[0], addr[1], freq)
 
             self.radio_client = MumbleRadioClient(
-                "audio.airwaysn.org", username, password, settings=self.settings,
+                "audio.ceruleanavi.net", username, password, settings=self.settings,
             )
             # 手动设置 X-Plane 地址和初始频率（避免重复发现）
             self.radio_client.xplane._addr = addr

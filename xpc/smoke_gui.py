@@ -13,7 +13,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 界面语言钉死，断言才有确定的结果。不钉的话，第一次启动是跟系统走的，在英文
 # 系统上跑这个脚本，所有比中文字面量的断言都会失败。
-os.environ.setdefault("AIRWAYSN_LANG", "zh")
+os.environ.setdefault("CAN_LANG", "zh")
 
 # pymumble 要本机的 opus 原生库。这里不碰音频，缺库时放个替身让导入过去。
 try:
@@ -490,7 +490,7 @@ def main():
         _shown.clear()
         window.on_update_found(update.Update(
             version="2.9.9", notes="https://example/notes",
-            download="https://airwaysn.org/api/v1/clients/download/xpc-for-can",
+            download="https://ceruleanavi.net/api/v1/clients/download/xpc-for-can",
             size=59057038))
         assert _shown, "有新版却没有弹提示"
         assert "2.9.9" in _shown[0], _shown[0]

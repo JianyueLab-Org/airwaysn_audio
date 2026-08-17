@@ -6,11 +6,11 @@ atisdata = None
 
 # 数据源前面挡着 Cloudflare，非浏览器形态的 User-Agent 一律 403——requests 的
 # 默认 UA（python-requests/x.y）就在被拒之列，不带这个头取不到任何数据。
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AirwaysnATIS/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CanATIS/1.0)"}
 
 
-def get_airwaysn_data():
-    url = "https://data.airwaysn.org/v1/data.json"
+def get_can_data():
+    url = "https://data.ceruleanavi.net/v1/data.json"
     try:
         response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
@@ -40,6 +40,6 @@ def display_atis_table(data):
     return table_data
 
 if __name__ == "__main__":
-    data = get_airwaysn_data()
+    data = get_can_data()
     if data:
         display_atis_table(data)

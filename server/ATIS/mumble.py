@@ -83,7 +83,7 @@ class ATISBroadcaster(threading.Thread):
                 print("跳过创建频道 FREQ_199998")
                 return False
                 
-            self.mumble = pymumble.Mumble("audio.airwaysn.org", self.user, password=self.password, reconnect=True)
+            self.mumble = pymumble.Mumble("audio.ceruleanavi.net", self.user, password=self.password, reconnect=True)
             self.mumble.set_receive_sound(True)
             self.mumble.start()
 
@@ -456,7 +456,7 @@ class ATISManager:
         """更新ATIS信息的循环"""
         while not self._stop_flag:
             try:
-                data = request.get_airwaysn_data()
+                data = request.get_can_data()
                 if data and 'atis' in data:
                     current_atis = {atis['callsign']: atis for atis in data['atis']}
                     

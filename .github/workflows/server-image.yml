@@ -46,7 +46,7 @@ concurrency:
 
 env:
   # 冒烟用的本地标签，只在 runner 的 daemon 里存在，不推
-  CI_TAG: airwaysn-server:ci
+  CI_TAG: can-server:ci
   PYTHONUTF8: '1'        # runner 上跑的是中文 print，见 release.yml 里的说明
 
 jobs:
@@ -135,7 +135,7 @@ jobs:
 
           echo "::group::ini 里的节，以及 Ice 相关的行"
           docker run --rm --entrypoint sh ${{ env.CI_TAG }} -c \
-            '. /etc/airwaysn/paths.env; echo "ini=$MUMBLE_INI"; grep -nE "^\[|^#?ice" "$MUMBLE_INI" || echo "(一行都没有)"'
+            '. /etc/can/paths.env; echo "ini=$MUMBLE_INI"; grep -nE "^\[|^#?ice" "$MUMBLE_INI" || echo "(一行都没有)"'
           echo "::endgroup::"
 
       - name: 冒烟：容器真的能起来并且认证器注册上了

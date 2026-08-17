@@ -30,9 +30,9 @@ esac
 
 # ini 的位置由构建时探出来写在这里：1.5 是 /etc/mumble/mumble-server.ini，
 # 1.3 是 /etc/mumble-server.ini。不在容器里跑就退回默认值。
-if [ -f /etc/airwaysn/paths.env ]; then
+if [ -f /etc/can/paths.env ]; then
     # shellcheck disable=SC1091
-    . /etc/airwaysn/paths.env
+    . /etc/can/paths.env
 fi
 MUMBLE_INI="${MUMBLE_INI:-/etc/mumble/mumble-server.ini}"
 

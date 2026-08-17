@@ -1123,7 +1123,7 @@ class ReconnectLimitTest(unittest.TestCase):
     """连上过之后掉线，最多重连三次，然后整个下线。
 
     以前是 `reconnect=True` 一路无限重试。后果不是"多试几次"：服务端
-    `login.py` 对认证失败**按 ASN ID 限流**，一个在后台不停重连的僵尸足以把这个
+    `login.py` 对认证失败**按 CAN ID 限流**，一个在后台不停重连的僵尸足以把这个
     账号的语音锁死——用户把密码改对了也连不上，直到重启客户端。界面那边同样
     糟：最后一次状态停在"已断开"，连接其实还在挣扎，谁也说不清当前状态。
 
@@ -1550,8 +1550,8 @@ class FsdReconnectLimitTest(unittest.TestCase):
 class UpdateCheckTest(unittest.TestCase):
     """查有没有新版。查到了也只是告诉用户，更不更新是他的事。
 
-    走的是 airwaysn 而不是 GitHub：大陆连 github.com 很不稳，60 MB 的包经常
-    下到一半就断，而 airwaysn.org 是成员本来就连得上的。
+    走的是 can 而不是 GitHub：大陆连 github.com 很不稳，60 MB 的包经常
+    下到一半就断，而 ceruleanavi.net 是成员本来就连得上的。
     """
 
     def setUp(self):
@@ -1575,7 +1575,7 @@ class UpdateCheckTest(unittest.TestCase):
                 "name": "xpc-for-can",
                 "version": version,
                 "size": 59057038,
-                "download": "https://airwaysn.org/api/v1/clients/download/"
+                "download": "https://ceruleanavi.net/api/v1/clients/download/"
                             "xpc-for-can?v=v" + version,
             },
         }
@@ -1606,7 +1606,7 @@ class UpdateCheckTest(unittest.TestCase):
             found = self.update.check("xpc-for-can", "2.0.1")
         self.assertIsNotNone(found)
         self.assertEqual(found.version, "2.0.2")
-        self.assertIn("airwaysn.org", found.download,
+        self.assertIn("ceruleanavi.net", found.download,
                       "下载必须走自己的服务器，不能把用户丢给 GitHub")
         self.assertEqual(found.size_label, "56.3 MB")
 
@@ -1700,14 +1700,14 @@ class VoiceHostTest(unittest.TestCase):
             json.dump(data, f)
 
     def test_default_voice_host(self):
-        self.assertEqual(self.module.MUMBLE_HOST, "audio.airwaysn.org")
+        self.assertEqual(self.module.MUMBLE_HOST, "audio.ceruleanavi.net")
         self.assertEqual(self.module.Settings(self.path).mumble_host,
-                         "audio.airwaysn.org")
+                         "audio.ceruleanavi.net")
 
     def test_migrates_the_old_domain(self):
         self.write({"mumble_host": "hjdczy.top"})
         self.assertEqual(self.module.Settings(self.path).mumble_host,
-                         "audio.airwaysn.org")
+                         "audio.ceruleanavi.net")
 
     def test_keeps_a_deliberate_override(self):
         # 自己指了别的服务器（测试服、局域网）是有意为之，不能替他改掉

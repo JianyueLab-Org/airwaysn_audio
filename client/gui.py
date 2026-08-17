@@ -216,7 +216,7 @@ class RadioGUI(QMainWindow):
             log.debug("pygame状态: get_init=%s display=%s joystick=%s",
                        pygame.get_init(), pygame.display.get_init(), pygame.joystick.get_init())
             
-        self.setWindowTitle(f"无线电-Airwaysn {version.full()}")
+        self.setWindowTitle(f"无线电-Can {version.full()}")
         self.setMinimumSize(300, 200)
         
         self.stacked_widget = QStackedWidget()
@@ -393,7 +393,7 @@ class RadioGUI(QMainWindow):
             except Exception as e:
                 log.error("写入账号到设置失败: %s", e)
 
-            self.radio_client = MumbleRadioClient("audio.airwaysn.org", username, password, settings=self.settings)
+            self.radio_client = MumbleRadioClient("audio.ceruleanavi.net", username, password, settings=self.settings)
             log.info("MumbleRadioClient 初始化完成")
             
             # Mumble 连接回调：同步更新 radio_client 的独立连接标记

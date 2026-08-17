@@ -392,7 +392,7 @@ class CompatPatchTest(unittest.TestCase):
     def test_the_send_path_is_guarded(self):
         """发送缓冲满了不该被当成掉线——通播是持续在发音频的。"""
         from pymumble_py3.mumble import Mumble
-        self.assertTrue(getattr(Mumble.connect, "_airwaysn_guarded", False))
+        self.assertTrue(getattr(Mumble.connect, "_can_guarded", False))
 
     # 所有带 mumblecompat.py 的组件。这里列全而不是只比 xpc 一份：原来只钉了
     # server/ATIS ↔ xpc，于是两个 legacy 飞行员端悄悄停在了老版本上——只有

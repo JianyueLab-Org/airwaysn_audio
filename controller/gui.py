@@ -47,7 +47,7 @@ from voice import VoiceClient
 
 log = logging.getLogger("gui")
 
-SERVER = "audio.airwaysn.org"
+SERVER = "audio.ceruleanavi.net"
 
 # 数据源多久查一次：上了席位之后自动把频率捡回来，同时刷新 CID→呼号 对照表。
 # 席位不会秒变，60 秒足够及时，也不至于把数据源打太狠。
@@ -420,7 +420,7 @@ class ControllerWindow(QMainWindow):
         self.rows = {}
         self.stack = RadioStack(on_change=self.on_stack_changed)
 
-        # CID → 呼号。Mumble 的用户名是纯数字的 ASN 号，靠这张表才能把
+        # CID → 呼号。Mumble 的用户名是纯数字的 CAN 号，靠这张表才能把
         # "最后通话: 1005" 显示成 "最后通话: CES2345"
         self.roster = {}
         self._user_removed = set()    # 用户自己删掉的，别再自动加回去跟他较劲
@@ -858,7 +858,7 @@ class ControllerWindow(QMainWindow):
         """把 Mumble 报上来的名字翻成呼号。
 
         语音层给的是 user["name"]，而按 server/login.py 的设计那就是纯数字的
-        ASN 号。查不到就原样返回——数据源没拉到、或者对方刚上线还没进数据源时，
+        CAN 号。查不到就原样返回——数据源没拉到、或者对方刚上线还没进数据源时，
         显示个数字也比显示空白强。
         """
         return self.roster.get(str(name), name)

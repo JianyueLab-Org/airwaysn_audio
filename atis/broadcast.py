@@ -142,7 +142,7 @@ class BoundedReconnect:
     """pymumble 的重连是无限的，这个混入给它一个上限。
 
     默认的 `reconnect=True` 会让 `run()` 一直重试到进程结束。对通播尤其糟：
-    服务端 `login.py` 对认证失败**按 ASN ID 限流**，而所有通播都用同一个保留
+    服务端 `login.py` 对认证失败**按 CAN ID 限流**，而所有通播都用同一个保留
     账号——一个席位的僵尸连接能把整台机器上其它席位的语音一起锁死。
 
     **必须挂在 connect() 上，不能去数 DISCONNECTED 回调。** pymumble 的
