@@ -26,13 +26,13 @@ import sys
 log = logging.getLogger("version")
 
 # 手工维护的**回退**值。真正发出去的版本号由 CI 决定：推到 main 之后，
-# 工作流数一遍已有的 v2.1.* 标签，取最大的那个 +1，写进 buildinfo.json。
+# 工作流数一遍已有的 v2.2.* 标签，取最大的那个 +1，写进 buildinfo.json。
 # 从源码跑时没有 buildinfo.json，就显示这个。
 #
 # 主次版本（2.1）是人的决定，改这里的同时**必须**把 release.yml 的 SERIES
 # 一起改成同一个系列：两边不一致的话，CI 会照旧在老系列里递增，而从源码跑
 # 的人看到的是新系列——同一份代码报两个版本号，还没有任何地方会报错。
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ---- Dev 测试版 ----
 # 测试版把 DEV 置 True：版本号显示成**下一个补丁号**加 (Dev Build N)。

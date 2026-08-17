@@ -1125,9 +1125,24 @@ class VoiceHostTest(unittest.TestCase):
                          "audio.ceruleanavi.net")
 
     def test_migrates_the_old_domain(self):
-        self.write({"mumble_host": "hjdczy.top"})
-        self.assertEqual(self.module.Settings(self.path).mumble_host,
-                         "audio.ceruleanavi.net")
+        # 两个旧域名都要认：hjdczy.top 是更早的那次改名，audio.airwaysn.org
+        # 是这一次的，而 airwaysn.org 整个域已经不解析了。
+        for host in ("hjdczy.top", "audio.airwaysn.org"):
+            with self.subTest(host=host):
+                self.write({"mumble_host": host})
+                self.assertEqual(self.module.Settings(self.path).mumble_host,
+                                 "audio.ceruleanavi.net")
+
+    def test_migrates_the_old_fsd_domain(self):
+        # fsd_host 同样是存进配置文件的，只改默认值对老用户没用：他们连不上，
+        # 而报出来的是超时，看不出是域名的事。
+        self.write({"fsd_host": "fsd.airwaysn.org"})
+        self.assertEqual(self.module.Settings(self.path).fsd_host,
+                         "fsd.ceruleanavi.net")
+
+    def test_keeps_a_deliberate_fsd_override(self):
+        self.write({"fsd_host": "127.0.0.1"})
+        self.assertEqual(self.module.Settings(self.path).fsd_host, "127.0.0.1")
 
     def test_keeps_a_deliberate_override(self):
         # 自己指了别的服务器（测试服、局域网）是有意为之，不能替他改掉

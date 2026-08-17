@@ -20,9 +20,18 @@ DEFAULT_FSD_HOST = "fsd.ceruleanavi.net"
 DEFAULT_FSD_PORT = 6809
 
 # 早期版本把 FSD 主机错填成了语音服务器的地址。那台机器上没有 FSD，
-# 留着只会一直连不上，所以读配置时直接换掉。语音服务器的新旧两个域名都要认：
-# 旧的还留在老配置里，新的是同一个人下次还会填错的那个。
-WRONG_FSD_HOSTS = {"hjdczy.top", "audio.ceruleanavi.net"}
+# 留着只会一直连不上，所以读配置时直接换掉。语音服务器历来的三个域名都要认：
+# 前两个还留在老配置里，最后一个是同一个人下次还会填错的那个。
+WRONG_FSD_HOSTS = {"hjdczy.top", "audio.airwaysn.org", "audio.ceruleanavi.net"}
+
+# 停用域名上的旧地址。这些是**存进配置文件**的，所以光换上面和 datafeed.py /
+# netconfig.py 里的默认值只对全新安装有效——老用户的 json 里还是 airwaysn.org，
+# 而那个域已经整个不解析了，通播于是取不到席位配置也取不到在线数据，界面上那
+# 几行却看着完全正常。读配置时按原值换掉；只认这几个旧值，用户自己指到别处
+# （内网镜像、测试服）是有意为之，不能动。
+OLD_FSD_HOSTS = {"fsd.airwaysn.org"}
+OLD_DATAFEED_URLS = {"https://data.airwaysn.org/v1/data.json"}
+OLD_CONFIG_URLS = {"https://airwaysn.org/api/v1/atis/config"}
 
 # 自动刷新天气的间隔（秒）
 DEFAULT_METAR_REFRESH = 300
@@ -96,14 +105,26 @@ class Settings:
                                 "using %s instead", self.fsd_host,
                                 DEFAULT_FSD_HOST)
                     self.fsd_host = DEFAULT_FSD_HOST
+                elif (self.fsd_host or "").strip().lower() in OLD_FSD_HOSTS:
+                    log.info("the FSD server was renamed, using %s instead of %s",
+                             DEFAULT_FSD_HOST, self.fsd_host)
+                    self.fsd_host = DEFAULT_FSD_HOST
                 self.fsd_port = int(data.get("fsd_port") or DEFAULT_FSD_PORT)
                 self.real_name = data.get("real_name", "")
                 self.connect_fsd = bool(data.get("connect_fsd", True))
                 self.rating = int(data.get("rating") or 0)
                 self.datafeed_url = (data.get("datafeed_url")
                                      or datafeed.DEFAULT_DATAFEED_URL)
+                if self.datafeed_url.strip() in OLD_DATAFEED_URLS:
+                    log.info("the datafeed moved, using %s instead of %s",
+                             datafeed.DEFAULT_DATAFEED_URL, self.datafeed_url)
+                    self.datafeed_url = datafeed.DEFAULT_DATAFEED_URL
                 self.config_url = (data.get("config_url")
                                    or netconfig.DEFAULT_CONFIG_URL)
+                if self.config_url.strip() in OLD_CONFIG_URLS:
+                    log.info("the configuration endpoint moved, using %s instead of %s",
+                             netconfig.DEFAULT_CONFIG_URL, self.config_url)
+                    self.config_url = netconfig.DEFAULT_CONFIG_URL
                 self.config_version = str(data.get("config_version") or "")
                 self.metar_refresh = clamp_refresh(
                     data.get("metar_refresh", DEFAULT_METAR_REFRESH))
